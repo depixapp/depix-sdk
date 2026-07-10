@@ -162,11 +162,25 @@ export class WithdrawContractError extends DepixSdkError {
  * "..."): every conversion outcome maps to one of these. PR4 (SideSwap) uses
  * SWAP_VALIDATION_FAILED (the fail-closed secondary check, G3 §5.1),
  * SWAP_LOW_BALANCE (dealer-side insufficient liquidity), SWAP_QUOTE_EXPIRED and
- * PEG_IN_ALREADY_PENDING (§5.2, one in-flight peg-in at a time). The remaining
- * codes (LOCKUP_INFLATED, LOCKUP_TREE_MISMATCH, INVOICE_HASH_MISMATCH,
- * INVOICE_NO_AMOUNT, TIMEOUT_OUT_OF_BOUNDS, CUSTODIAL_NOT_ACKNOWLEDGED,
- * AFFILIATE_ID_MISSING, GIFTCARDS_DISABLED, GIFTCARD_KYC_CATEGORY,
- * STABLECOIN_DEPS_MISSING) arrive with PR5/PR6.
+ * PEG_IN_ALREADY_PENDING (§5.2, one in-flight peg-in at a time).
+ *
+ * The Boltz PR5 subset:
+ *   LOCKUP_INFLATED       — Boltz's expectedAmount exceeds the invoice + bounded
+ *                           fee margin (assertLockupNotInflated, §5.3).
+ *   LOCKUP_TREE_MISMATCH  — the re-derived swap tree / lockup script does NOT
+ *                           match Boltz's response (verify-lockup, §5.3). It binds
+ *                           to the payment hash of the SUPPLIED invoice — an
+ *                           attacker-chosen payee still verifies, which is WHY
+ *                           the allowlist treats the Lightning payee as free.
+ *   INVOICE_HASH_MISMATCH — a reverse-swap invoice Boltz returned does not pay
+ *                           against OUR preimage hash (§5.3 receive).
+ *   INVOICE_NO_AMOUNT     — an amount-less / unparseable BOLT11 (no trusted
+ *                           ceiling to lock against, §5.3).
+ *   TIMEOUT_OUT_OF_BOUNDS — the refund timeout height is out of the sane bound
+ *                           (MAX_SUBMARINE_TIMEOUT_BLOCKS, §5.3).
+ * The remaining codes (CUSTODIAL_NOT_ACKNOWLEDGED, AFFILIATE_ID_MISSING,
+ * GIFTCARDS_DISABLED, GIFTCARD_KYC_CATEGORY, STABLECOIN_DEPS_MISSING) arrive
+ * with PR6.
  */
 export class ConversionError extends DepixSdkError {
   constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {
@@ -187,6 +201,24 @@ export class SideSwapError extends DepixSdkError {
   constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {
     super(code, message, options);
     this.name = "SideSwapError";
+  }
+}
+
+/**
+ * A network/HTTP error from the Boltz REST/WS API (api.boltz.exchange, §5.3).
+ * Distinct from ConversionError (whose list is closed and covers our OWN
+ * fail-closed guards) — a provider transport failure is not one of those codes,
+ * so it is its own DepixSdkError with the upstream status/body attached.
+ */
+export class BoltzApiError extends DepixSdkError {
+  readonly status?: number;
+  readonly body?: unknown;
+
+  constructor(message: string, init: { status?: number; body?: unknown; cause?: unknown } = {}) {
+    super("BOLTZ_API_ERROR", message, init.cause !== undefined ? { cause: init.cause } : undefined);
+    this.name = "BoltzApiError";
+    if (init.status !== undefined) this.status = init.status;
+    if (init.body !== undefined) this.body = init.body;
   }
 }
 

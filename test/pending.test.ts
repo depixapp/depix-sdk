@@ -59,7 +59,7 @@ describe("PendingWithdrawals store (§3.2.9 integrity)", () => {
     // Flip a byte in the stored ciphertext.
     const file = JSON.parse(await readFile(join(dataDir, PENDING_WITHDRAWALS_FILE), "utf8"));
     const ct = file.records[0].ct;
-    file.records[0].ct = ct.slice(0, -2) + (ct.endsWith("A") ? "B" : "A") + "=";
+    file.records[0].ct = (ct[0] === "A" ? "B" : "A") + ct.slice(1); // flip the FIRST b64 char — always changes byte 0 (a trailing-pad flip can be a no-op)
     await writeFile(join(dataDir, PENDING_WITHDRAWALS_FILE), JSON.stringify(file), "utf8");
 
     await expect(store.get("idem-1")).rejects.toSatisfy((err: unknown) =>
@@ -138,7 +138,7 @@ async function openWithSignedRecord(seedSignedHex: string | null, tamper = false
     if (tamper) {
       const file = JSON.parse(await readFile(join(dataDir, PENDING_WITHDRAWALS_FILE), "utf8"));
       const ct = file.records[0].ct;
-      file.records[0].ct = ct.slice(0, -2) + (ct.endsWith("A") ? "B" : "A") + "=";
+      file.records[0].ct = (ct[0] === "A" ? "B" : "A") + ct.slice(1); // flip the FIRST b64 char — always changes byte 0 (a trailing-pad flip can be a no-op)
       await writeFile(join(dataDir, PENDING_WITHDRAWALS_FILE), JSON.stringify(file), "utf8");
     }
   }

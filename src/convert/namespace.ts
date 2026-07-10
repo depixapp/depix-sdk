@@ -2,7 +2,8 @@
 // PR5 (Boltz) adds sibling sub-trees to the SAME `convert` object the same way.
 // Kept small and additive so a merge of the two PRs conflicts minimally.
 
-import { ConversionError } from "../errors.js";
+import { ConversionError, WalletError } from "../errors.js";
+import type { BoltzConvert } from "./boltz/convert.js";
 import type { ConvertWalletHooks } from "./hooks.js";
 import { PendingPegIn } from "./pending-pegin.js";
 import {
@@ -97,8 +98,17 @@ export class SideSwapNamespace {
 /** The `wallet.convert` object. PR5 adds `boltz` alongside `sideswap`. */
 export class ConvertNamespace {
   readonly sideswap: SideSwapNamespace;
+  // The Boltz Lightning sub-namespace (§5.3) — null on a view-only/wiped wallet
+  // (no seed to sign the L-BTC lockup). The wallet constructs the BoltzConvert
+  // (it needs the seed store + lockup signer) and injects it here; `.boltz`
+  // surfaces it, mirroring how `.sideswap` sits beside it.
+  private readonly boltzNamespace: BoltzConvert | null;
 
-  constructor(hooks: ConvertWalletHooks, options: ConvertNamespaceOptions = {}) {
+  constructor(
+    hooks: ConvertWalletHooks,
+    options: ConvertNamespaceOptions = {},
+    boltz: BoltzConvert | null = null
+  ) {
     const market = new SideSwapMarket({
       hooks,
       clientFactory: options.clientFactory,
@@ -108,5 +118,21 @@ export class ConvertNamespace {
     const pending = new PendingPegIn(hooks.dataDir, { now: options.now, logger: hooks.logger });
     const peg = new SideSwapPeg({ hooks, pending, clientFactory: options.clientFactory });
     this.sideswap = new SideSwapNamespace(market, peg);
+    this.boltzNamespace = boltz;
+  }
+
+  /**
+   * The Boltz Lightning sub-namespace: `wallet.convert.boltz.*` (§5.3) — LN
+   * send/receive + refund. Throws WALLET_NOT_FOUND on a view-only/wiped wallet
+   * (no seed to sign the lockup), the same gate the seed-bound flows use.
+   */
+  get boltz(): BoltzConvert {
+    if (!this.boltzNamespace) {
+      throw new WalletError(
+        "WALLET_NOT_FOUND",
+        "This wallet has no seed material (view-only/wiped) — Lightning conversions are unavailable."
+      );
+    }
+    return this.boltzNamespace;
   }
 }
