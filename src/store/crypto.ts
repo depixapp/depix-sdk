@@ -88,17 +88,67 @@ export async function deriveKey(passphrase: string, salt: Uint8Array): Promise<C
   return importAesKey(await deriveKeyBytes(passphrase, salt));
 }
 
+/**
+ * HKDF info label for the guardrails-state subkey (spec §4.5 / review hygiene).
+ * Same string as the state file's GCM AAD (state-crypto.ts) — one role, one label.
+ */
+export const GUARDRAIL_STATE_HKDF_INFO = "depix-sdk-guardrails-state-v1";
+
+/**
+ * Derive a per-ROLE AES-256-GCM subkey from the seed-store root key material via
+ * HKDF-SHA256 (review low, state-crypto.ts:14). The seed blob and the
+ * guardrails-state blob share a single passphrase / single Argon2 derivation
+ * (spec §4.5 "mesma chave do seed-store"), but HKDF domain-separates the
+ * KEYSTREAM so the two files never share raw AES-GCM key space — which matters
+ * now that the seed is re-encrypted with a FRESH IV on every guardrail write
+ * (§4.5 anti-replay), raising the historical IV-collision surface under a shared
+ * key. `info` binds the subkey to its role; an empty salt is fine for HKDF.
+ */
+export async function deriveStateSubkey(rootKeyBytes: Uint8Array): Promise<CryptoKey> {
+  const hkdfKey = await globalThis.crypto.subtle.importKey(
+    "raw",
+    rootKeyBytes as Uint8Array<ArrayBuffer>,
+    "HKDF",
+    false,
+    ["deriveKey"]
+  );
+  return globalThis.crypto.subtle.deriveKey(
+    {
+      name: "HKDF",
+      hash: "SHA-256",
+      salt: new Uint8Array(0) as Uint8Array<ArrayBuffer>,
+      info: new TextEncoder().encode(GUARDRAIL_STATE_HKDF_INFO) as Uint8Array<ArrayBuffer>
+    },
+    hkdfKey,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+/**
+ * Encrypt the mnemonic. The optional `aad` (spec §4.5) binds extra plaintext to
+ * the GCM tag WITHOUT encrypting it — used to anchor the guardrail marker/epoch
+ * to the seed so stripping/editing those fields breaks seed authentication.
+ */
 export async function encryptSeed(
   mnemonic: string,
   key: CryptoKey,
-  iv: Uint8Array
+  iv: Uint8Array,
+  aad?: Uint8Array
 ): Promise<Uint8Array> {
   if (typeof mnemonic !== "string" || !mnemonic) {
     throw new TypeError("mnemonic must be a non-empty string");
   }
   const plaintext = new TextEncoder().encode(mnemonic);
   const ciphertext = await globalThis.crypto.subtle.encrypt(
-    { name: "AES-GCM", iv: iv as Uint8Array<ArrayBuffer> },
+    aad
+      ? {
+          name: "AES-GCM",
+          iv: iv as Uint8Array<ArrayBuffer>,
+          additionalData: aad as Uint8Array<ArrayBuffer>
+        }
+      : { name: "AES-GCM", iv: iv as Uint8Array<ArrayBuffer> },
     key,
     plaintext
   );
@@ -108,11 +158,18 @@ export async function encryptSeed(
 export async function decryptSeed(
   ciphertext: Uint8Array,
   key: CryptoKey,
-  iv: Uint8Array
+  iv: Uint8Array,
+  aad?: Uint8Array
 ): Promise<string> {
   try {
     const plaintext = await globalThis.crypto.subtle.decrypt(
-      { name: "AES-GCM", iv: iv as Uint8Array<ArrayBuffer> },
+      aad
+        ? {
+            name: "AES-GCM",
+            iv: iv as Uint8Array<ArrayBuffer>,
+            additionalData: aad as Uint8Array<ArrayBuffer>
+          }
+        : { name: "AES-GCM", iv: iv as Uint8Array<ArrayBuffer> },
       key,
       ciphertext as Uint8Array<ArrayBuffer>
     );

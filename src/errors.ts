@@ -51,14 +51,17 @@ export interface GuardrailDetails extends ErrorDetails {
   limitCents?: number;
   attemptedCents?: number;
   usedCents?: number;
+  /** For GUARDRAIL_ALLOWLIST_BLOCKED: the destination class that was blocked (§4.3). */
+  class?: string;
 }
 
 /**
  * Guardrail choke-point errors (spec §4).
  *
- * Codes used in PR1: GUARDRAIL_PER_TX_LIMIT, GUARDRAIL_DAILY_LIMIT,
- * GUARDRAIL_INVALID_AMOUNT, QUOTES_UNAVAILABLE.
- * GUARDRAIL_ALLOWLIST_BLOCKED arrives with the allowlist in PR3 (§4.3).
+ * Codes: GUARDRAIL_PER_TX_LIMIT, GUARDRAIL_DAILY_LIMIT, GUARDRAIL_INVALID_AMOUNT,
+ * QUOTES_UNAVAILABLE, GUARDRAIL_ALLOWLIST_BLOCKED (§4.3 allowlist),
+ * GUARDRAIL_CONFIG_INVALID (§4.2 — a bad option/env limit or allowlist, thrown
+ * at open()/create()/restore(); 0/negative is never "disabled").
  */
 export class GuardrailError extends DepixSdkError {
   declare readonly details?: GuardrailDetails;

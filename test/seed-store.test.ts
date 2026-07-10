@@ -4,8 +4,10 @@ import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { base64 } from "@scure/base";
 import { acquireDirLock } from "../src/store/dir-lock.js";
 import { SeedStore } from "../src/store/seed-store.js";
+import { deriveKey } from "../src/store/crypto.js";
 import { isDepixSdkError } from "../src/errors.js";
 
 const PASSPHRASE = "correct-horse-battery-staple";
@@ -40,7 +42,7 @@ describe("SeedStore roundtrip", () => {
     const file = await store.read();
     expect(file).not.toBeNull();
     expect(file!.format).toBe("depix-sdk-wallet");
-    expect(file!.version).toBe(1);
+    expect(file!.version).toBe(2);
     expect(file!.network).toBe("mainnet");
     expect(file!.descriptor).toBe(DESCRIPTOR); // plaintext — view-only survives
     expect(file!.backupConfirmed).toBe(false);
@@ -75,6 +77,36 @@ describe("SeedStore roundtrip", () => {
     const store = new SeedStore(dataDir);
     await expect(store.decryptMnemonic(PASSPHRASE)).rejects.toSatisfy((err: unknown) =>
       isDepixSdkError(err, "WALLET_NOT_FOUND")
+    );
+  });
+
+  it("guardrail anchor defaults to {false,0}, advances monotonically, and stays seed-bound (§4.5)", async () => {
+    const store = await seededStore();
+    expect(await store.readGuardrailAnchor()).toEqual({ initialized: false, epoch: 0 });
+    // Advancing requires the seed root key (same key that encrypted the seed).
+    const file = (await store.read())!;
+    const key = await deriveKey(PASSPHRASE, base64.decode(file.salt!));
+
+    expect(await store.advanceGuardrailAnchor(key)).toBe(1);
+    expect(await store.advanceGuardrailAnchor(key)).toBe(2);
+    expect(await store.readGuardrailAnchor()).toEqual({ initialized: true, epoch: 2 });
+    // Persisted durably; a fresh handle still sees it.
+    expect((await new SeedStore(dataDir).read())!.guardrailEpoch).toBe(2);
+    // The seed still decrypts under the bumped anchor AAD (re-encryption worked).
+    expect(await store.decryptMnemonic(PASSPHRASE)).toBe(MNEMONIC);
+  });
+
+  it("tampering the plaintext anchor fields makes the seed un-decryptable (§4.5)", async () => {
+    const store = await seededStore();
+    const file = (await store.read())!;
+    const key = await deriveKey(PASSPHRASE, base64.decode(file.salt!));
+    await store.advanceGuardrailAnchor(key); // epoch=1, marker=true
+    // Strip the marker on disk (attacker with FS write, no passphrase).
+    const wallet = JSON.parse(await readFile(join(dataDir, "wallet.json"), "utf8"));
+    delete wallet.guardrailsStateInitialized;
+    await writeFile(join(dataDir, "wallet.json"), JSON.stringify(wallet), { mode: 0o600 });
+    await expect(store.decryptMnemonic(PASSPHRASE)).rejects.toSatisfy((err: unknown) =>
+      isDepixSdkError(err, "WRONG_PASSPHRASE")
     );
   });
 });
