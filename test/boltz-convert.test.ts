@@ -11,8 +11,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { DepixWallet } from "../src/wallet.js";
-import type { BoltzConvertDeps } from "../src/convert/boltz/convert.js";
+import { BoltzConvert, type BoltzConvertDeps, type BoltzWalletContext } from "../src/convert/boltz/convert.js";
 import type { BoltzClient } from "../src/convert/boltz/client.js";
+import type { Logger } from "../src/logger.js";
 import type {
   RefundDeps,
   RefundResult,
@@ -34,6 +35,9 @@ const LOCKUP_ADDRESS =
 
 const QUOTES: QuotesSource = { get: async () => ({ btcUsd: 100_000, usdBrl: 5 }) };
 const NO_QUOTES: QuotesSource = { get: async () => null };
+
+const SILENT_LOGGER: Logger = { debug() {}, info() {}, warn() {}, error() {} };
+const SALT_B64 = Buffer.from(new Uint8Array(16).fill(7)).toString("base64");
 
 /** Fake BoltzClient with just the surface the flows drive. */
 function fakeClient(over: Partial<Record<keyof BoltzClient, unknown>> = {}): BoltzClient {
@@ -158,6 +162,60 @@ describe("payLightningInvoice — quotes fail closed (G6)", () => {
     await expect(
       w.convert.boltz.payLightningInvoice({ invoice: TEST_INVOICE })
     ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "QUOTES_UNAVAILABLE"));
+  });
+});
+
+describe("payLightningInvoice — refund key survives a broadcast-stage lockup failure (§5.3)", () => {
+  // The swap record is the SOLE holder of `refundPrivateKeyHex`. If lockupLbtc
+  // fails AT/AFTER broadcast the L-BTC may already be locked to the Boltz Taproot
+  // address, so the record MUST survive for resume()/refund — dropping it would
+  // make a funded-but-unpaid lockup irrecoverable. The wallet flags a provably
+  // pre-broadcast failure with `nothingLocked`; only then may the caller roll back.
+  async function convertOver(lockupLbtc: BoltzWalletContext["lockupLbtc"]): Promise<{
+    convert: BoltzConvert;
+    store: BoltzSwapStore;
+  }> {
+    dataDir = await mkdtemp(join(tmpdir(), "depix-sdk-boltz-conv-"));
+    const store = new BoltzSwapStore({ dataDir, passphrase: PASSPHRASE, saltB64: SALT_B64 });
+    const ctx: BoltzWalletContext = {
+      store,
+      logger: SILENT_LOGGER,
+      lockupLbtc,
+      getReceiveAddress: async () => LOCKUP_ADDRESS
+    };
+    const convert = new BoltzConvert(ctx, { client: fakeClient(), verifyLockup: vi.fn(async () => {}) });
+    return { convert, store };
+  }
+
+  it("PRESERVES the record + refund key when lockupLbtc fails at/after broadcast (no `nothingLocked`)", async () => {
+    // Simulates syncEngine.broadcast() rejecting AFTER the tx propagated: an error
+    // with NO `nothingLocked` marker — the lockup may be live.
+    const broadcastErr = new Error("network reset after the node accepted the tx");
+    const { convert, store } = await convertOver(async () => {
+      throw broadcastErr;
+    });
+
+    await expect(convert.payLightningInvoice({ invoice: TEST_INVOICE })).rejects.toBe(broadcastErr);
+
+    const rec = (await store.get("sub-1")) as StoredSubmarineSwap | null;
+    expect(rec).not.toBeNull();
+    // The refund material is intact — resume()/refund can still recover the L-BTC.
+    expect(rec!.refundPrivateKeyHex).toBeTruthy();
+    expect(rec!.type).toBe("submarine");
+  });
+
+  it("ROLLS BACK the record only when the failure is provably pre-broadcast (`nothingLocked`)", async () => {
+    // Mirrors a guardrail/build failure the wallet tags as pre-broadcast.
+    const preBroadcastErr = Object.assign(new Error("guardrail blocked before signing"), {
+      nothingLocked: true
+    });
+    const { convert, store } = await convertOver(async () => {
+      throw preBroadcastErr;
+    });
+
+    await expect(convert.payLightningInvoice({ invoice: TEST_INVOICE })).rejects.toBe(preBroadcastErr);
+    // Nothing was locked → no orphan record for resume to act on.
+    expect(await store.get("sub-1")).toBeNull();
   });
 });
 

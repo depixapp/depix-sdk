@@ -179,9 +179,19 @@ export class BoltzConvert {
       });
       lockupTxid = res.txid;
     } catch (err) {
-      // Nothing was locked (guardrail/allowlist rejection or a build failure) →
-      // drop the record so resume never tries to refund a swap that never funded.
-      await this.ctx.store.remove(prepared.swapId).catch(() => {});
+      // Roll back the record ONLY when the wallet PROVES nothing was locked
+      // (pre-broadcast failure: guardrail/allowlist rejection, quotes-unavailable,
+      // build/sign failure — tagged `nothingLocked`). A broadcast-stage error can
+      // arrive AFTER the lockup tx propagated, so the L-BTC may be locked to the
+      // Boltz Taproot address while this record is its SOLE holder of
+      // `refundPrivateKeyHex`. In that case KEEP the record: resume() is a harmless
+      // no-op if nothing actually funded, but recovers the funds (refund) if it
+      // did — dropping the key would make a locked lockup irrecoverable (§5.3).
+      const nothingLocked =
+        err !== null && typeof err === "object" && (err as { nothingLocked?: boolean }).nothingLocked === true;
+      if (nothingLocked) {
+        await this.ctx.store.remove(prepared.swapId).catch(() => {});
+      }
       throw err;
     }
 

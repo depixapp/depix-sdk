@@ -123,13 +123,15 @@ export function assertLockupNotInflated(expectedAmount: number, invoiceSats: num
  * with the frontend). When known, the timeout must be strictly in the future and
  * within `maxTimeoutBlocks` — otherwise TIMEOUT_OUT_OF_BOUNDS (fail-closed).
  *
- * NOTE (divergence from frontend, flagged): the spec §5.3 pins
- * MAX_SUBMARINE_TIMEOUT_BLOCKS = 1500; the prod frontend uses 20160. This module
- * follows the spec value (source of truth) but exposes it as an overridable
- * argument so the effective bound is a one-line change if real Boltz timeouts
- * exceed it (surfaced in the PR for reconciliation).
+ * VALUE: reconciled to the PROD frontend LN-send path (wallet-ui.js
+ * onLightningPreview → MAX_SUBMARINE_TIMEOUT_BLOCKS = 20160, ≈14 days of Liquid
+ * blocks). The 1500 constant belongs to a DIFFERENT frontend path (gift-card
+ * payment, giftcard-payment.js) and would reject VALID Boltz submarine lockups
+ * whose real timeout exceeds +1500 blocks with TIMEOUT_OUT_OF_BOUNDS. Kept
+ * overridable (`maxTimeoutBlocks`) so the effective bound is still a one-line
+ * change if live Boltz timeouts move.
  */
-export const MAX_SUBMARINE_TIMEOUT_BLOCKS = 1500;
+export const MAX_SUBMARINE_TIMEOUT_BLOCKS = 20160;
 
 export function assertTimeoutInBounds(
   timeoutBlockHeight: unknown,

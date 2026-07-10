@@ -916,58 +916,79 @@ export class DepixWallet {
     }
 
     return this.opMutex.runExclusive(async () => {
-      // Choke point BEFORE anything is built/signed. L-BTC is valued via
-      // /api/quotes and fails CLOSED with QUOTES_UNAVAILABLE (§4.4/G6).
-      const brlCents = await this.valuator.valuate("LBTC", params.amountSats);
-      await this.guardrails.enforce({
-        kind: "boltz-submarine",
-        brlCents,
-        destinations: params.destinations
-      });
-
-      const wollet = await this.ensureWollet();
-      const network = mainnetNetwork();
-      let builder = new TxBuilder(network);
+      // Fail-safe signal for the Boltz caller (convert.ts): a lockup rollback is
+      // only safe when NOTHING hit the network. Everything up to `finalize` is
+      // provably pre-broadcast; `broadcast()` can reject AFTER the tx already
+      // propagated. We tag pre-broadcast errors as `nothingLocked` so the caller
+      // rolls back only then — a broadcast-stage error leaves the flag unset and
+      // the caller PRESERVES the refund record (§5.3).
+      let broadcastAttempted = false;
       try {
-        builder = builder.addLbtcRecipient(address, params.amountSats);
-      } catch (err) {
-        throw new WalletError("INVALID_ADDRESS", "Recipient rejected by the transaction builder", {
-          cause: err
+        // Choke point BEFORE anything is built/signed. L-BTC is valued via
+        // /api/quotes and fails CLOSED with QUOTES_UNAVAILABLE (§4.4/G6).
+        const brlCents = await this.valuator.valuate("LBTC", params.amountSats);
+        await this.guardrails.enforce({
+          kind: "boltz-submarine",
+          brlCents,
+          destinations: params.destinations
         });
-      }
 
-      let pset;
-      try {
-        pset = builder.finish(wollet);
-      } catch (err) {
-        throw await this.classifyFinishError(err, "LBTC", params.amountSats);
-      }
-
-      // Ephemeral signer, zeroed in finally (per-op auth §2.3).
-      let signed;
-      {
-        let mnemonic: InstanceType<typeof Mnemonic> | null = null;
-        let signer: InstanceType<typeof Signer> | null = null;
+        const wollet = await this.ensureWollet();
+        const network = mainnetNetwork();
+        let builder = new TxBuilder(network);
         try {
-          mnemonic = new Mnemonic(await this.decryptMnemonic());
-          signer = new Signer(mnemonic, network);
-          signed = signer.sign(pset);
-        } finally {
+          builder = builder.addLbtcRecipient(address, params.amountSats);
+        } catch (err) {
+          throw new WalletError("INVALID_ADDRESS", "Recipient rejected by the transaction builder", {
+            cause: err
+          });
+        }
+
+        let pset;
+        try {
+          pset = builder.finish(wollet);
+        } catch (err) {
+          throw await this.classifyFinishError(err, "LBTC", params.amountSats);
+        }
+
+        // Ephemeral signer, zeroed in finally (per-op auth §2.3).
+        let signed;
+        {
+          let mnemonic: InstanceType<typeof Mnemonic> | null = null;
+          let signer: InstanceType<typeof Signer> | null = null;
           try {
-            signer?.free();
-            mnemonic?.free();
-          } catch {
-            // best effort
+            mnemonic = new Mnemonic(await this.decryptMnemonic());
+            signer = new Signer(mnemonic, network);
+            signed = signer.sign(pset);
+          } finally {
+            try {
+              signer?.free();
+              mnemonic?.free();
+            } catch {
+              // best effort
+            }
           }
         }
+
+        // Accounted at SIGNING time, not settlement (§4.5).
+        await this.guardrails.recordSpend(brlCents, "boltz-submarine");
+
+        const finalized = wollet.finalize(signed);
+        // Crossing into the network stage — an error from here on may leave the
+        // lockup live, so the caller must NOT roll back the refund material.
+        broadcastAttempted = true;
+        const txid = await this.syncEngine.broadcast(finalized);
+        return { txid };
+      } catch (err) {
+        if (!broadcastAttempted && err !== null && typeof err === "object") {
+          try {
+            (err as { nothingLocked?: boolean }).nothingLocked = true;
+          } catch {
+            // Non-extensible/frozen error → default to PRESERVE (leave unset).
+          }
+        }
+        throw err;
       }
-
-      // Accounted at SIGNING time, not settlement (§4.5).
-      await this.guardrails.recordSpend(brlCents, "boltz-submarine");
-
-      const finalized = wollet.finalize(signed);
-      const txid = await this.syncEngine.broadcast(finalized);
-      return { txid };
     });
   }
 
