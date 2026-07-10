@@ -16,9 +16,13 @@
 // What PR3 adds (the rest of §4):
 //   - config-driven ceilings (option/env, immutable in runtime — §4.2/G9),
 //   - allowlist destination classes (§4.3),
-//   - state AUTHENTICATION with AES-256-GCM on the seed-store key + a wallet.json
-//     marker; missing/corrupt state WITH the marker present → fail-closed,
-//     window treated as FULL (§4.5).
+//   - state AUTHENTICATION with AES-256-GCM on the seed-store key + a SEED-BOUND
+//     anchor (marker + monotonic epoch) in wallet.json's authenticated envelope
+//     (§4.5). Missing/corrupt state WITH the marker present → fail-closed, window
+//     treated as FULL. The marker/epoch cannot be stripped or rolled back without
+//     the passphrase (they are covered by the seed's GCM AAD — seed-store.ts), so:
+//       * stripping the marker to fake a fresh wallet bricks signing, not resets;
+//       * replaying an older state ciphertext fails the epoch match → fail-closed.
 
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -67,20 +71,28 @@ interface StateEntry {
   kind: string;
 }
 
-interface StateFileV1 {
-  version: 1;
+/** State-file format version — v2 carries the monotonic anti-replay epoch (§4.5). */
+const STATE_VERSION = 2 as const;
+
+interface StateFileV2 {
+  version: 2;
+  /** Monotonic epoch that MUST equal the seed-bound anchor epoch (anti-replay §4.5). */
+  epoch: number;
   entries: StateEntry[];
 }
 
 /**
- * The `guardrailsStateInitialized` marker (§4.5), backed by wallet.json. Its
- * presence turns a later missing/corrupt state into fail-closed. Deleting the
- * whole wallet.json to erase it destroys the seed access itself — self-defeating
- * for an attacker.
+ * The seed-bound guardrail anchor store (§4.5), backed by wallet.json's
+ * authenticated (GCM-AAD) envelope. `read()` returns the current marker + the
+ * monotonic epoch; `advance()` bumps the epoch (and sets the marker) INSIDE the
+ * seed's authenticated envelope, returning the new epoch. Because the anchor is
+ * covered by the seed's GCM tag, an injected agent cannot strip the marker (it
+ * bricks seed decryption) nor roll the epoch back (it has no passphrase), so an
+ * old replayed state carries a stale epoch and is rejected.
  */
-export interface GuardrailMarkerStore {
-  isInitialized(): Promise<boolean>;
-  markInitialized(): Promise<void>;
+export interface GuardrailAnchorStore {
+  read(): Promise<{ initialized: boolean; epoch: number }>;
+  advance(): Promise<number>;
 }
 
 export interface GuardrailsOptions {
@@ -93,7 +105,7 @@ export interface GuardrailsOptions {
    * state file actually exists (a view-only wallet without a seed never has one).
    */
   stateKey: () => Promise<CryptoKey>;
-  marker: GuardrailMarkerStore;
+  anchor: GuardrailAnchorStore;
   logger?: Logger;
   /** Clock injection for tests. */
   now?: () => number;
@@ -101,9 +113,14 @@ export interface GuardrailsOptions {
 
 interface WindowLoad {
   entries: StateEntry[];
-  /** Missing/corrupt state WITH the marker present → treat the window as FULL (§4.5). */
+  /**
+   * Fail-closed = treat the rolling window as FULL (§4.5). Triggered by: missing
+   * state WITH the marker set, corrupt/wrong-key state WITH the marker set, or a
+   * state whose epoch does not match the seed-bound anchor (replay/rollback).
+   */
   failClosed: boolean;
-  markerPresent: boolean;
+  /** Whether the wallet has ever recorded a spend (seed-bound marker). */
+  initialized: boolean;
 }
 
 export class Guardrails {
@@ -112,7 +129,7 @@ export class Guardrails {
   private readonly logger: Logger;
   private readonly now: () => number;
   private readonly stateKey: () => Promise<CryptoKey>;
-  private readonly marker: GuardrailMarkerStore;
+  private readonly anchor: GuardrailAnchorStore;
   private readonly allowlist: AllowlistMatcher;
   // Serializes the state read-modify-write so concurrent recordSpend() calls
   // never lose entries (PR1 — kept verbatim). Defense in depth beyond the
@@ -129,7 +146,7 @@ export class Guardrails {
     this.logger = options.logger ?? defaultLogger;
     this.now = options.now ?? Date.now;
     this.stateKey = options.stateKey;
-    this.marker = options.marker;
+    this.anchor = options.anchor;
     this.perTxLimitBrlCents = options.config.perTxLimitBrlCents;
     this.dailyLimitBrlCents = options.config.dailyLimitBrlCents;
     // Built once; an invalid liquidAddresses entry fails fast at open() with
@@ -142,6 +159,18 @@ export class Guardrails {
    * or irrevocably commits funds. Throws typed GuardrailError — nothing partial
    * happens. Order: arithmetic fail-closed → per-tx → daily (incl. state
    * fail-closed) → allowlist.
+   *
+   * CALLER CONTRACT (INVARIANT — review low, guardrails.ts:158): `enforce()`
+   * reads the rolling window OUTSIDE the internal `writeMutex` (which only
+   * serializes recordSpend-vs-recordSpend). So the enforce→sign→recordSpend
+   * sequence is NOT atomic within Guardrails. Every signing caller MUST route its
+   * whole enforce→sign→record through a SINGLE per-wallet op mutex (the wallet's
+   * `opMutex`, which `send()` holds). Two concurrent ops that skip it can both
+   * pass the daily check and jointly exceed the cap (check-then-act TOCTOU) — and
+   * for pure Liquid sends/swaps/gift cards this is the ONLY limit layer (§4.6).
+   * A future conversion path (PR4+: withdraw/SideSwap/Boltz/gift-card) that adds
+   * a new signing caller inherits this obligation: record MUST follow the enforce
+   * that authorized it, under the same lock.
    */
   async enforce(intent: GuardrailIntent): Promise<void> {
     const attempted = intent.brlCents;
@@ -213,24 +242,31 @@ export class Guardrails {
     await this.writeMutex.runExclusive(async () => {
       const load = await this.loadWindow();
       if (load.failClosed) {
-        // Never overwrite a missing/tampered state with a fresh single-entry
-        // window — that is exactly the reset attack (§4.5). Refuse; the caller's
-        // signing path aborts before broadcast (send() records BEFORE broadcast).
+        // Never overwrite a missing/tampered/replayed state with a fresh
+        // single-entry window — that is exactly the reset attack (§4.5). Refuse;
+        // the caller's signing path aborts before broadcast (send() records
+        // BEFORE broadcast).
         throw new GuardrailError(
           "GUARDRAIL_DAILY_LIMIT",
-          "Refusing to record a spend over a missing/tampered guardrails state (fail-closed, §4.5)."
+          "Refusing to record a spend over a missing/tampered/replayed guardrails state (fail-closed, §4.5)."
         );
       }
       const now = this.now();
       const entries = load.entries.filter((e) => now - e.ts <= WINDOW_MS);
       entries.push({ ts: now, brlCents, kind });
-      const plaintext = JSON.stringify({ version: 1, entries } satisfies StateFileV1);
+      // Advance the seed-bound monotonic anchor FIRST (durable), THEN stamp the
+      // state with the new epoch (§4.5 anti-replay). Ordering is deliberate:
+      //   * the anchor (marker + epoch) becomes durable BEFORE the state, so
+      //     there is never a "state present / marker absent" window an attacker
+      //     could exploit by deleting the state (closes the crash-window low,
+      //     guardrails.ts:233);
+      //   * a crash BETWEEN the two writes leaves anchor.epoch > state.epoch →
+      //     the next read fails CLOSED (safe), never a bypass.
+      const epoch = await this.anchor.advance();
+      const plaintext = JSON.stringify({ version: STATE_VERSION, epoch, entries } satisfies StateFileV2);
       const envelope = await encryptState(plaintext, await this.stateKey());
       await ensureDir(this.dataDir);
       await writeFileDurable(this.statePath, `${JSON.stringify(envelope)}\n`);
-      // Mark AFTER the first successful state write (durable §2.4) so its
-      // presence always implies a real state file once existed.
-      if (!load.markerPresent) await this.marker.markInitialized();
     });
   }
 
@@ -257,7 +293,7 @@ export class Guardrails {
   }
 
   private async loadWindow(): Promise<WindowLoad> {
-    const markerPresent = await this.marker.isInitialized();
+    const { initialized, epoch: anchorEpoch } = await this.anchor.read();
     let raw: string | null;
     try {
       raw = await readFile(this.statePath, "utf8");
@@ -267,15 +303,15 @@ export class Guardrails {
     }
 
     if (raw === null) {
-      if (markerPresent) {
+      if (initialized) {
         this.logger.error(
           "guardrails-state.json is MISSING while the initialized marker is set — " +
             "failing closed, rolling-24h window treated as FULL (spec §4.5)."
         );
-        return { entries: [], failClosed: true, markerPresent };
+        return { entries: [], failClosed: true, initialized };
       }
-      // Fresh wallet, no marker ever existed — empty window (§4.5).
-      return { entries: [], failClosed: false, markerPresent };
+      // Fresh wallet, never signed — empty window (§4.5).
+      return { entries: [], failClosed: false, initialized };
     }
 
     // A state file exists — it MUST decrypt and authenticate.
@@ -283,38 +319,64 @@ export class Guardrails {
     if (!result.ok) {
       this.logger.error(
         `guardrails-state.json failed authentication (${result.reason}) — ${
-          markerPresent
+          initialized
             ? "failing closed, window treated as FULL (marker set)"
             : "empty window (no marker; fresh wallet)"
         } (spec §4.5).`
       );
-      return { entries: [], failClosed: markerPresent, markerPresent };
+      return { entries: [], failClosed: initialized, initialized };
     }
 
-    const entries = this.parseEntries(result.plaintext);
-    if (entries === null) {
+    const parsed = this.parseState(result.plaintext);
+    if (parsed === null) {
       this.logger.error(
         `guardrails-state.json authenticated but its payload is malformed — ${
-          markerPresent ? "failing closed (marker set)" : "empty window (no marker)"
+          initialized ? "failing closed (marker set)" : "empty window (no marker)"
         } (spec §4.5).`
       );
-      return { entries: [], failClosed: markerPresent, markerPresent };
+      return { entries: [], failClosed: initialized, initialized };
     }
+
+    // Anti-replay (§4.5): the state's epoch MUST equal the seed-bound anchor
+    // epoch. An old state ciphertext replayed onto disk authenticates (same key,
+    // fixed AAD) but carries a STALE epoch < anchorEpoch → reject → fail-closed.
+    // The anchor epoch is monotonic and cannot be rolled back without the
+    // passphrase (it is covered by the seed's GCM tag), so this closes the
+    // rollback hole. A fresh wallet (initialized=false, anchorEpoch=0) that
+    // somehow has a state file is treated as empty rather than bricked.
+    if (parsed.epoch !== anchorEpoch) {
+      this.logger.error(
+        `guardrails-state.json epoch ${parsed.epoch} does not match the seed-bound anchor ` +
+          `epoch ${anchorEpoch} — replay/rollback detected, ${
+            initialized ? "failing closed" : "empty window (no marker)"
+          } (spec §4.5).`
+      );
+      return { entries: [], failClosed: initialized, initialized };
+    }
+
     const now = this.now();
     return {
-      entries: entries.filter((e) => now - e.ts <= WINDOW_MS),
+      entries: parsed.entries.filter((e) => now - e.ts <= WINDOW_MS),
       failClosed: false,
-      markerPresent
+      initialized
     };
   }
 
-  private parseEntries(plaintext: string): StateEntry[] | null {
+  private parseState(plaintext: string): { epoch: number; entries: StateEntry[] } | null {
     try {
-      const parsed = JSON.parse(plaintext) as StateFileV1;
-      if (parsed.version !== 1 || !Array.isArray(parsed.entries)) return null;
-      return parsed.entries.filter(
+      const parsed = JSON.parse(plaintext) as StateFileV2;
+      if (
+        parsed.version !== STATE_VERSION ||
+        !Number.isSafeInteger(parsed.epoch) ||
+        parsed.epoch < 0 ||
+        !Array.isArray(parsed.entries)
+      ) {
+        return null;
+      }
+      const entries = parsed.entries.filter(
         (e) => typeof e?.ts === "number" && Number.isSafeInteger(e.brlCents) && e.brlCents > 0
       );
+      return { epoch: parsed.epoch, entries };
     } catch {
       return null;
     }

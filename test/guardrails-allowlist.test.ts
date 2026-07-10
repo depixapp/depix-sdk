@@ -126,6 +126,17 @@ describe("btcAddresses — SideSwap peg-out recv_addr", () => {
     const none = matcherFor({ enabled: true });
     expectBlocked(() => none.check([{ kind: "btcAddress", address: "bc1qexamplepegoutaddress" }]), "btcAddress");
   });
+
+  it("matches bech32 case-INSENSITIVELY (BIP173) — no spurious fail-closed block (review low)", () => {
+    // Owner allowlists uppercase; a peg-out (§5.2) supplies the lowercase form.
+    const m = matcherFor({ enabled: true, btcAddresses: ["BC1QEXAMPLEPEGOUTADDRESS"] });
+    expect(() => m.check([{ kind: "btcAddress", address: "bc1qexamplepegoutaddress" }])).not.toThrow();
+    // And the reverse: lowercase entry, uppercase destination.
+    const m2 = matcherFor({ enabled: true, btcAddresses: ["bc1qexamplepegoutaddress"] });
+    expect(() => m2.check([{ kind: "btcAddress", address: "BC1QEXAMPLEPEGOUTADDRESS" }])).not.toThrow();
+    // A genuinely different address is still blocked.
+    expectBlocked(() => m2.check([{ kind: "btcAddress", address: "BC1QOTHER" }]), "btcAddress");
+  });
 });
 
 describe("evmAddresses — Boltz stablecoin settle (case-insensitive)", () => {

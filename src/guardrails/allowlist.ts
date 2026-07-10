@@ -64,6 +64,21 @@ const normEvm = (a: string): string => a.trim().toLowerCase();
 const normExact = (s: string): string => s.trim();
 
 /**
+ * Normalize a BTC address for allowlist matching (review low, allowlist.ts:158).
+ * BTC bech32/bech32m (BIP173) is case-INSENSITIVE and only valid as all-lower or
+ * all-upper; the canonical form is lowercase. So an owner who allowlists a
+ * `bc1…` in one case and a PR4+ peg-out (§5.2) that supplies the other case must
+ * still match. We lowercase ONLY bech32 (bc1/tb1/bcrt1 HRP, bech32 charset) —
+ * base58 P2PKH/P2SH (`1…`/`3…`) is case-SENSITIVE, so those (and the non-bech32
+ * classes: gift-card beneficiary, SideShift refund) stay exact to avoid
+ * corrupting a case-significant identifier.
+ */
+const normBtcAddress = (a: string): string => {
+  const t = a.trim();
+  return /^(bc1|tb1|bcrt1)[0-9a-z]+$/i.test(t) ? t.toLowerCase() : t;
+};
+
+/**
  * Pre-derives normalized lookup sets from the resolved allowlist once (at open
  * time). An invalid liquidAddresses entry fails fast with
  * GUARDRAIL_CONFIG_INVALID — a typo in the owner's allowlist must not silently
@@ -92,7 +107,7 @@ export class AllowlistMatcher {
       })
     );
     this.pixKeys = new Set(allowlist.pixKeys.map(normPixKey));
-    this.btcAddresses = new Set(allowlist.btcAddresses.map(normExact));
+    this.btcAddresses = new Set(allowlist.btcAddresses.map(normBtcAddress));
     this.evmAddresses = new Set(allowlist.evmAddresses.map(normEvm));
     this.giftcardBeneficiaries = new Set(allowlist.giftcardBeneficiaries.map(normExact));
     this.sideshiftRefundAddresses = new Set(allowlist.sideshiftRefundAddresses.map(normExact));
@@ -155,7 +170,7 @@ export class AllowlistMatcher {
         }
         return;
       case "btcAddress":
-        if (!this.btcAddresses.has(normExact(dest.address))) {
+        if (!this.btcAddresses.has(normBtcAddress(dest.address))) {
           throw allowlistError(
             "btcAddress",
             `BTC destination is not in the allowlist (allowlist.btcAddresses): ${dest.address}`

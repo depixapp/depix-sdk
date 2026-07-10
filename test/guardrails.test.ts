@@ -15,7 +15,7 @@ import {
   type GuardrailConfig
 } from "../src/guardrails/guardrails.js";
 import { GuardrailError, isDepixSdkError } from "../src/errors.js";
-import { InMemoryMarker, keyProvider } from "./guardrail-utils.js";
+import { InMemoryAnchor, keyProvider } from "./guardrail-utils.js";
 
 let dataDir: string;
 
@@ -28,13 +28,13 @@ afterEach(async () => {
 });
 
 function makeGuardrails(
-  opts: { now?: () => number; config?: GuardrailConfig; marker?: InMemoryMarker } = {}
+  opts: { now?: () => number; config?: GuardrailConfig; anchor?: InMemoryAnchor } = {}
 ): Guardrails {
   return new Guardrails({
     dataDir,
     config: resolveGuardrailConfig(opts.config, {}),
     stateKey: keyProvider(),
-    marker: opts.marker ?? new InMemoryMarker(),
+    anchor: opts.anchor ?? new InMemoryAnchor(),
     now: opts.now
   });
 }
@@ -104,9 +104,12 @@ describe("daily limit — rolling 24h window (G7)", () => {
   });
 
   it("persists across restarts (new instance, same encrypted state + dataDir)", async () => {
-    const first = makeGuardrails();
+    // One anchor object models the single persisted wallet.json shared across
+    // restarts (its epoch must survive so a replayed/stale state is rejected).
+    const anchor = new InMemoryAnchor();
+    const first = makeGuardrails({ anchor });
     await first.recordSpend(45_000, "send");
-    const second = makeGuardrails();
+    const second = makeGuardrails({ anchor });
     await expect(second.enforce({ kind: "send", brlCents: 6_000 })).rejects.toSatisfy(
       (err: unknown) => isDepixSdkError(err, "GUARDRAIL_DAILY_LIMIT")
     );
@@ -138,7 +141,7 @@ describe("state file handling (§4.5 — fresh-wallet semantics without a marker
 
   it("corrupted state WITHOUT a marker is surfaced as an empty window", async () => {
     await writeFile(join(dataDir, GUARDRAILS_STATE_FILE), "{corrupt", "utf8");
-    const guardrails = makeGuardrails({ marker: new InMemoryMarker(false) });
+    const guardrails = makeGuardrails({ anchor: new InMemoryAnchor(false) });
     await expect(guardrails.enforce({ kind: "send", brlCents: 10_000 })).resolves.toBeUndefined();
   });
 

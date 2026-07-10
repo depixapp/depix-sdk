@@ -35,15 +35,20 @@ import { WalletError } from "./errors.js";
 import {
   Guardrails,
   resolveGuardrailConfig,
+  type GuardrailAnchorStore,
   type GuardrailConfig,
-  type GuardrailMarkerStore,
   type ResolvedGuardrailConfig
 } from "./guardrails/guardrails.js";
 import { QuotesClient, resolveApiBase, type QuotesSource } from "./guardrails/quotes.js";
 import { BrlValuator } from "./guardrails/valuation.js";
 import { createLogger, registerSecret, type Logger } from "./logger.js";
 import { Mutex } from "./mutex.js";
-import { assertStrongPassphrase, deriveKey } from "./store/crypto.js";
+import {
+  assertStrongPassphrase,
+  deriveKeyBytes,
+  deriveStateSubkey,
+  importAesKey
+} from "./store/crypto.js";
 import { acquireDirLock, type DirLock } from "./store/dir-lock.js";
 import { ensureDir } from "./store/fs-util.js";
 import { SeedStore, type WalletFileV1 } from "./store/seed-store.js";
@@ -192,9 +197,13 @@ export class DepixWallet {
   private wollet: Wollet | null = null;
   private wolletReady = false;
   private wolletPromise: Promise<Wollet> | null = null;
-  // Memoized AES key for the guardrails-state authentication (§4.5): the SAME
-  // key as the seed store (Argon2id over passphrase+salt). Derived at most once
-  // per process — Argon2id is deliberately expensive, so never per enforce().
+  // Memoized key material for the seed store + guardrails-state (§4.5). Argon2id
+  // over passphrase+salt is deliberately expensive, so it runs at most once per
+  // process; the raw bytes feed BOTH the seed AES key (seed encrypt/decrypt +
+  // anchor re-encryption) AND the HKDF-derived state subkey (state file), which
+  // domain-separates the two keystreams (review low, state-crypto.ts:14).
+  private rootKeyBytesPromise: Promise<Uint8Array> | null = null;
+  private seedKeyPromise: Promise<CryptoKey> | null = null;
   private guardrailKeyPromise: Promise<CryptoKey> | null = null;
   // Serializes the guardrail choke point (enforce→sign→record) and the
   // nextReceiveIndex read-modify-write against concurrent in-process calls
@@ -210,17 +219,26 @@ export class DepixWallet {
     this.logger = createLogger();
     this.updateStore = new UpdateStore(parts.dataDir);
     this.valuator = new BrlValuator(parts.quotes ?? new QuotesClient({ apiBase: resolveApiBase() }));
-    // Marker backed by wallet.json (§4.5) — deleting it to erase the marker
-    // destroys seed access itself, so it is self-defeating to attack.
-    const marker: GuardrailMarkerStore = {
-      isInitialized: () => this.seedStore.isGuardrailsStateInitialized(),
-      markInitialized: () => this.seedStore.setGuardrailsStateInitialized()
+    // Seed-bound anchor backed by wallet.json's authenticated envelope (§4.5).
+    // The marker + monotonic epoch are covered by the seed's GCM AAD, so an
+    // injected agent cannot strip the marker (it bricks seed decryption) nor roll
+    // the epoch back (no passphrase); advance() re-encrypts the seed under the
+    // bumped anchor and durably rewrites wallet.json.
+    const anchor: GuardrailAnchorStore = {
+      read: () => this.seedStore.readGuardrailAnchor(),
+      advance: async () => {
+        const epoch = await this.seedStore.advanceGuardrailAnchor(await this.seedKey());
+        // wallet.json's iv + anchor fields changed on disk — refresh the cache so
+        // a subsequent decrypt uses the current AAD.
+        await this.refreshFile();
+        return epoch;
+      }
     };
     this.guardrails = new Guardrails({
       dataDir: parts.dataDir,
       config: parts.guardrailConfig,
       stateKey: () => this.guardrailStateKey(),
-      marker,
+      anchor,
       logger: this.logger
     });
     this.syncEngine = new SyncEngine({
@@ -661,14 +679,14 @@ export class DepixWallet {
   // ─── internals ─────────────────────────────────────────────────────────
 
   /**
-   * Derive (once) the AES-256-GCM key that authenticates the guardrails-state
-   * file (§4.5) — the SAME key as the seed store: Argon2id over the passphrase
-   * and the wallet's salt. Memoized because Argon2id is deliberately expensive;
-   * it must never run per enforce()/recordSpend().
+   * Argon2id(passphrase, salt) → raw 32-byte key material, derived at most once
+   * per process (§4.5). The salt never changes across anchor advances, so this is
+   * safely memoized. Argon2id is deliberately expensive — it must never run per
+   * enforce()/recordSpend().
    */
-  private guardrailStateKey(): Promise<CryptoKey> {
-    if (!this.guardrailKeyPromise) {
-      this.guardrailKeyPromise = (async () => {
+  private rootKeyBytes(): Promise<Uint8Array> {
+    if (!this.rootKeyBytesPromise) {
+      this.rootKeyBytesPromise = (async () => {
         const salt = this.file.salt;
         if (!salt) {
           // No seed → no key. A view-only/wiped wallet cannot have written any
@@ -678,8 +696,34 @@ export class DepixWallet {
             "Cannot derive the guardrail state key: this wallet has no seed (wiped or view-only)."
           );
         }
-        return deriveKey(this.requirePassphrase(), base64.decode(salt));
+        return deriveKeyBytes(this.requirePassphrase(), base64.decode(salt));
       })();
+    }
+    return this.rootKeyBytesPromise;
+  }
+
+  /**
+   * The SEED root AES-256-GCM key — encrypts/decrypts the seed and re-encrypts it
+   * on each guardrail anchor advance (§4.5). Same raw bytes as the state subkey's
+   * HKDF input, so a single Argon2id derivation backs both.
+   */
+  private seedKey(): Promise<CryptoKey> {
+    if (!this.seedKeyPromise) {
+      this.seedKeyPromise = this.rootKeyBytes().then(importAesKey);
+    }
+    return this.seedKeyPromise;
+  }
+
+  /**
+   * The guardrails-state authentication key (§4.5) — an HKDF subkey of the seed
+   * root material (info='depix-sdk-guardrails-state-v1'), so the state file never
+   * shares raw AES-GCM keystream with the seed blob (review low, state-crypto.ts:14)
+   * while keeping a single passphrase / single Argon2id derivation ("mesma chave
+   * do seed-store" in spirit).
+   */
+  private guardrailStateKey(): Promise<CryptoKey> {
+    if (!this.guardrailKeyPromise) {
+      this.guardrailKeyPromise = this.rootKeyBytes().then(deriveStateSubkey);
     }
     return this.guardrailKeyPromise;
   }
