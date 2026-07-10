@@ -48,11 +48,20 @@ export interface BoltzWalletContext {
    * L-BTC in BRL, enforces the caps with the given FINAL destinations, signs the
    * lockup with an ephemeral signer, records the spend and broadcasts — all under
    * the wallet's opMutex. Returns the broadcast txid.
+   *
+   * `feeSplit` (gift cards, §5.5): an OPTIONAL second L-BTC output in the SAME
+   * transaction paying the DePix service fee to the config `splitAddress`. It is
+   * NOT counted by the guardrail (the value counted is `amountSats` — the lockup
+   * — per §4.3 "idem") and NOT an allowlist destination (it pays DePix's own
+   * address from the authenticated config). `kind` labels the spend for the
+   * rolling-24h accountant / telemetry (default "boltz-submarine").
    */
   lockupLbtc: (params: {
     address: string;
     amountSats: bigint;
     destinations: readonly GuardrailDestination[];
+    feeSplit?: { address: string; amountSats: bigint };
+    kind?: string;
   }) => Promise<{ txid: string }>;
   /** Backup-gated receive address (refund on send / claim on receive). */
   getReceiveAddress: () => Promise<string>;
@@ -179,8 +188,22 @@ export class BoltzConvert {
    * signs the L-BTC lockup through the guardrail choke point (the expectedAmount
    * is valued in BRL; the FINAL Lightning payee is checked against the allowlist
    * `allowLightning` class — verify-lockup binding does NOT exempt it, §4.3).
+   *
+   * REUSED by the gift-card flow (§5.5): `extraDestinations` adds the
+   * `giftcardBeneficiary` class so the allowlist gates BOTH the Lightning payee
+   * AND the CryptoRefills beneficiary (§4.3 requires both for a gift card);
+   * `feeSplit` adds the 1% DePix service-fee output to the same lockup tx;
+   * `spendKind` labels the spend. All optional — a plain LN send passes none.
    */
-  async payLightningInvoice(params: { invoice: string }): Promise<PayLightningResult> {
+  async payLightningInvoice(params: {
+    invoice: string;
+    /** Extra FINAL destination classes to enforce (gift-card beneficiary, §5.5). */
+    extraDestinations?: readonly GuardrailDestination[];
+    /** Optional service-fee output paid to DePix's config splitAddress (§5.5). */
+    feeSplit?: { address: string; amountSats: bigint };
+    /** Rolling-24h accountant label (default "boltz-submarine"). */
+    spendKind?: string;
+  }): Promise<PayLightningResult> {
     const prepared = await prepareSubmarineSwap(
       { invoice: params.invoice },
       {
@@ -214,13 +237,17 @@ export class BoltzConvert {
     await this.ctx.store.put(record);
 
     // Guardrail choke point + L-BTC lockup signing (in the wallet). The FINAL
-    // destination is the Lightning payee → the `lightning` allowlist class.
+    // destination is the Lightning payee → the `lightning` allowlist class, plus
+    // any caller-supplied classes (gift card = beneficiary, §5.5 — BOTH must be
+    // opted in with the allowlist ON).
     let lockupTxid: string;
     try {
       const res = await this.ctx.lockupLbtc({
         address: prepared.lockupAddress,
         amountSats: BigInt(prepared.expectedAmountSats),
-        destinations: [{ kind: "lightning" }]
+        destinations: [{ kind: "lightning" }, ...(params.extraDestinations ?? [])],
+        ...(params.feeSplit ? { feeSplit: params.feeSplit } : {}),
+        ...(params.spendKind ? { kind: params.spendKind } : {})
       });
       lockupTxid = res.txid;
     } catch (err) {
