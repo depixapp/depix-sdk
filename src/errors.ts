@@ -177,9 +177,10 @@ export class WithdrawContractError extends DepixSdkError {
  *   INVOICE_NO_AMOUNT     — an amount-less / unparseable BOLT11 (no trusted
  *                           ceiling to lock against, §5.3).
  *   TIMEOUT_OUT_OF_BOUNDS — the refund timeout height is out of the sane bound
- *                           (MAX_SUBMARINE_TIMEOUT_BLOCKS, §5.3).
+ *                           (MAX_SUBMARINE_TIMEOUT_BLOCKS for LN; MAX_CHAIN_
+ *                           TIMEOUT_BLOCKS for the stablecoin chain swap, §5.3).
  *
- * The gift-card PR6 subset:
+ * The gift-card subset (PR6):
  *   GIFTCARDS_DISABLED     — the backend has the CryptoRefills integration OFF
  *                            (/api/config `giftcardEnabled` is false, or the
  *                            config is unreachable → fail-closed, §5.5).
@@ -187,8 +188,17 @@ export class WithdrawContractError extends DepixSdkError {
  *                            (Rewarble VISA/PayPal, iCash, …) the anonymous
  *                            browser-direct Lightning flow cannot fulfil; the
  *                            typed error carries the external deep-link (§5.5).
- * The remaining codes (CUSTODIAL_NOT_ACKNOWLEDGED, AFFILIATE_ID_MISSING,
- * STABLECOIN_DEPS_MISSING) arrive with the SideShift/stablecoin flows.
+ *
+ * The stablecoin subset (PR5b, Boltz stablecoin, G5 — L-BTC → USDC/USDT EVM) reuses
+ * SWAP_VALIDATION_FAILED (unsupported target / invalid or token-contract
+ * destination / uneconomical amount), LOCKUP_INFLATED (route asks to lock more than
+ * requested, or ≤ 0), LOCKUP_TREE_MISMATCH (chain-swap verify-lockup) and adds
+ * STABLECOIN_DEPS_MISSING — the EVM signing stack (viem) could not be dynamically
+ * resolved (§2.2). viem is a REGULAR dependency (G5), so this is a defense-in-depth
+ * guard for a broken/partial install, never the norm.
+ *
+ * The remaining codes (CUSTODIAL_NOT_ACKNOWLEDGED, AFFILIATE_ID_MISSING) arrive
+ * with the SideShift/affiliate flows.
  */
 export class ConversionError extends DepixSdkError {
   constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {

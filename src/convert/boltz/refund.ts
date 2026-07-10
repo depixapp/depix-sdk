@@ -235,6 +235,45 @@ export function buildSubmarineRefundTx(args: {
   });
 }
 
+/**
+ * Persisted CHAIN-swap (L-BTC -> stablecoin) refund material (§5.3). Same lockup
+ * refund shape as the submarine record except Boltz's key in the lockup is
+ * `serverPublicKey` (not claimPublicKey) — the DEX/bridge legs are irrelevant to
+ * sweeping the L-BTC lockup back; the Taproot cooperative→timeout logic is
+ * identical.
+ */
+export interface ChainRefundRecord {
+  swapId: string;
+  serverPublicKey: string;
+  swapTree: unknown;
+  blindingKey?: string;
+  timeoutBlockHeight: number;
+  refundPrivateKeyHex: string;
+  refundPublicKeyHex: string;
+}
+
+/** CHAIN lockup refund builder — Boltz's key is serverPublicKey. */
+export function buildChainRefundTx(args: {
+  swap: ChainRefundRecord;
+  lockupTxHex: string;
+  refundKeys: RefundKeys;
+  refundAddress: string;
+  cooperative?: boolean;
+}): Promise<string> {
+  return buildRefundTx({
+    swapId: args.swap.swapId,
+    boltzPublicKey: args.swap.serverPublicKey,
+    swapTree: args.swap.swapTree,
+    blindingKey: args.swap.blindingKey,
+    timeoutBlockHeight: args.swap.timeoutBlockHeight,
+    swapType: "chain",
+    lockupTxHex: args.lockupTxHex,
+    refundKeys: args.refundKeys,
+    refundAddress: args.refundAddress,
+    cooperative: args.cooperative ?? true
+  });
+}
+
 export interface RefundDeps {
   /** Required — the wallet L-BTC receive address the lockup is refunded to. */
   getRefundAddress: () => Promise<string>;
@@ -254,16 +293,33 @@ export interface RefundDeps {
   }) => Promise<string>;
 }
 
+/** Deps for {@link refundChainSwap} — mirrors RefundDeps with a chain-record refund fn. */
+export interface ChainRefundDeps {
+  getRefundAddress: () => Promise<string>;
+  getLockupHex?: () => Promise<string | null | undefined>;
+  broadcast?: (asset: string, txHex: string) => Promise<{ id?: string } | null>;
+  getBlockHeight?: () => Promise<number | null>;
+  refund?: (args: {
+    swap: ChainRefundRecord;
+    lockupTxHex: string;
+    refundKeys: RefundKeys;
+    refundAddress: string;
+    cooperative?: boolean;
+  }) => Promise<string>;
+}
+
 /**
  * Shared cooperative→timeout orchestration. Tries the cooperative refund (Boltz
  * co-signs — broadcastable now). On failure, falls back to the trustless TIMEOUT
  * refund — but only once the lock has expired; otherwise RefundPendingError.
+ * Generic over the record type (submarine record / chain record) — the body only
+ * forwards `record` to `refundFn`, so both lockup kinds share one orchestrator.
  */
-async function runRefund(args: {
-  record: SubmarineRefundRecord;
+async function runRefund<R>(args: {
+  record: R;
   refundKeys: RefundKeys;
   refundFn: (a: {
-    swap: SubmarineRefundRecord;
+    swap: R;
     lockupTxHex: string;
     refundKeys: RefundKeys;
     refundAddress: string;
@@ -271,7 +327,7 @@ async function runRefund(args: {
   }) => Promise<string>;
   getLockupHex: () => Promise<string | null | undefined>;
   timeoutBlockHeight: number;
-  deps: RefundDeps;
+  deps: { getRefundAddress: () => Promise<string>; broadcast?: RefundDeps["broadcast"]; getBlockHeight?: RefundDeps["getBlockHeight"] };
 }): Promise<RefundResult> {
   const { record, refundKeys, refundFn, getLockupHex, timeoutBlockHeight, deps } = args;
   const refundAddress = await deps.getRefundAddress();
@@ -362,6 +418,54 @@ export async function refundSubmarineSwap(
     record,
     refundKeys,
     refundFn: deps.refund ?? buildSubmarineRefundTx,
+    getLockupHex,
+    timeoutBlockHeight: Number(record.timeoutBlockHeight) || 0,
+    deps
+  });
+}
+
+/**
+ * Refund a failed CHAIN swap (L-BTC -> stablecoin) from its persisted
+ * boltz-swaps record (§5.3). Same cooperative→timeout logic as the submarine
+ * refund; only Boltz's key (serverPublicKey) and the lockup SwapType differ.
+ */
+export async function refundChainSwap(
+  record: ChainRefundRecord,
+  deps: ChainRefundDeps
+): Promise<RefundResult> {
+  if (typeof deps?.getRefundAddress !== "function") {
+    throw new TypeError("refundChainSwap requires a getRefundAddress dep");
+  }
+  if (
+    !record?.swapId ||
+    !record?.serverPublicKey ||
+    !record?.swapTree ||
+    !record?.refundPrivateKeyHex ||
+    !record?.refundPublicKeyHex
+  ) {
+    throw new TypeError("refundChainSwap: record is missing refund material");
+  }
+  await ensureBoltzConfig();
+  const refundKeys: RefundKeys = {
+    privateKey: hex.decode(record.refundPrivateKeyHex),
+    publicKey: hex.decode(record.refundPublicKeyHex)
+  };
+  const getLockupHex =
+    deps.getLockupHex ??
+    (async () => {
+      const [{ getLockupTransaction }, { SwapType }] = (await Promise.all([
+        import("boltz-swaps/client"),
+        import("boltz-swaps/types")
+      ])) as unknown as [
+        { getLockupTransaction: (id: string, t: unknown) => Promise<{ hex?: string }> },
+        { SwapType: { Chain: unknown } }
+      ];
+      return (await getLockupTransaction(record.swapId, SwapType.Chain))?.hex;
+    });
+  return runRefund({
+    record,
+    refundKeys,
+    refundFn: deps.refund ?? buildChainRefundTx,
     getLockupHex,
     timeoutBlockHeight: Number(record.timeoutBlockHeight) || 0,
     deps

@@ -23,6 +23,22 @@ import type { ReverseSwapRecord } from "./reverse.js";
 
 export const BOLTZ_SWAPS_FILE = "boltz-swaps.json";
 
+// A stablecoin record's createdSwap/plan carry bigints (Boltz route amounts) —
+// plain JSON.stringify throws on those. Encode bigints as {__bigint:"…"} and
+// revive them on read so the resume material round-trips intact (parity with the
+// frontend's boltzStableReplacer/Reviver). Submarine/reverse records have no
+// bigints, so both hooks are no-ops for them.
+function bigintReplacer(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? { __bigint: value.toString() } : value;
+}
+function bigintReviver(_key: string, value: unknown): unknown {
+  return value !== null &&
+    typeof value === "object" &&
+    typeof (value as { __bigint?: unknown }).__bigint === "string"
+    ? BigInt((value as { __bigint: string }).__bigint)
+    : value;
+}
+
 export type SubmarineState =
   | "prepared" // verified, lockup NOT yet broadcast
   | "locked_up" // lockup broadcast — watching for payment
@@ -56,7 +72,49 @@ export interface StoredReverseSwap extends ReverseSwapRecord {
   createdAt: number;
 }
 
-export type StoredBoltzSwap = StoredSubmarineSwap | StoredReverseSwap;
+export type StablecoinState =
+  | "prepared" // route verified, L-BTC lockup NOT yet broadcast
+  | "locked_up" // lockup broadcast — awaiting server lockup / execution
+  | "settled" // executed (claim → DEX → bridge delivered)
+  | "refunded" // L-BTC lockup swept back
+  | "refund_pending"; // cooperative refund failed, timeout not reached
+
+/**
+ * A persisted L-BTC -> stablecoin (chain) swap (spec §5.3, PR5b). Carries the
+ * crash-safe resume material: the refund key (the ONLY key that can sweep the
+ * lockup back), the swap preimage, the ephemeral EVM key (hex — encrypted at rest
+ * with the rest of the record), and the createdSwap/plan the executor re-runs. The
+ * `outcome` marker records a swap we've decided will refund so resume stops
+ * re-attempting execution (mirrors the frontend's record.outcome).
+ */
+export interface StoredStablecoinSwap {
+  type: "stablecoin";
+  swapId: string;
+  asset: "USDC" | "USDT";
+  networkId: string;
+  /** FINAL recipient (EVM/Tron) address. */
+  claimAddress: string;
+  lockupAddress: string;
+  lockAmountSats: number;
+  serverPublicKey: string;
+  swapTree: unknown;
+  blindingKey?: string;
+  timeoutBlockHeight: number;
+  refundPrivateKeyHex: string;
+  refundPublicKeyHex: string;
+  preimageHex: string;
+  /** Ephemeral EVM key (hex) — sensitive; encrypted at rest, zeroed once decoded. */
+  evmPrivateKeyHex: string;
+  /** Route material the executor re-runs after a crash (bigint-safe via the store's JSON). */
+  createdSwap: unknown;
+  plan: unknown;
+  lockupTxid?: string;
+  outcome?: "refund";
+  state: StablecoinState;
+  createdAt: number;
+}
+
+export type StoredBoltzSwap = StoredSubmarineSwap | StoredReverseSwap | StoredStablecoinSwap;
 
 interface Envelope {
   /** swapId — stable record locator (plaintext; not secret). */
@@ -112,7 +170,7 @@ export class BoltzSwapStore {
 
   private async encrypt(record: StoredBoltzSwap): Promise<Envelope> {
     const iv = randomIv();
-    const plaintext = new TextEncoder().encode(JSON.stringify(record));
+    const plaintext = new TextEncoder().encode(JSON.stringify(record, bigintReplacer));
     const ct = await aesGcmEncrypt(plaintext, await this.key(), iv, new TextEncoder().encode(record.swapId));
     return { id: record.swapId, iv: base64.encode(iv), ct: base64.encode(ct) };
   }
@@ -124,7 +182,7 @@ export class BoltzSwapStore {
       base64.decode(env.iv),
       new TextEncoder().encode(env.id)
     );
-    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext)) as StoredBoltzSwap;
+    return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(plaintext), bigintReviver) as StoredBoltzSwap;
   }
 
   private async readEnvelopes(): Promise<Envelope[]> {
