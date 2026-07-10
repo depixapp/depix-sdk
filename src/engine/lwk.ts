@@ -23,6 +23,7 @@ import {
   Network,
   Pset,
   Signer,
+  Transaction,
   TxBuilder,
   Update,
   Wollet,
@@ -32,7 +33,7 @@ import { WalletError } from "../errors.js";
 
 // Re-export the classes the SDK uses so every other module goes through this
 // wrapper (single import point = single place to swap in candidate A).
-export { Address, AssetId, EsploraClient, Mnemonic, Network, Pset, Signer, TxBuilder, Update, Wollet, WolletDescriptor };
+export { Address, AssetId, EsploraClient, Mnemonic, Network, Pset, Signer, Transaction, TxBuilder, Update, Wollet, WolletDescriptor };
 
 // Namespace-style access for guardian checks (e.g. lwk.Pset.prototype.addDetails).
 export const lwk = {
@@ -43,6 +44,7 @@ export const lwk = {
   Network,
   Pset,
   Signer,
+  Transaction,
   TxBuilder,
   Update,
   Wollet,

@@ -19,8 +19,8 @@
 // after a failed persist), it falls back to an inline scan.
 
 import { Worker } from "node:worker_threads";
-import type { Pset, Update as LwkUpdate, Wollet } from "lwk_node";
-import { EsploraClient, Update, mainnetNetwork } from "../engine/lwk.js";
+import type { Pset, Transaction as LwkTransaction, Update as LwkUpdate, Wollet } from "lwk_node";
+import { EsploraClient, Transaction, Update, mainnetNetwork } from "../engine/lwk.js";
 import { WalletError } from "../errors.js";
 import { defaultLogger, type Logger } from "../logger.js";
 import type { UpdateStore } from "../store/update-store.js";
@@ -56,8 +56,15 @@ const WARM_SYNC_TIMEOUT_MS = 60_000;
 export interface EsploraClientLike {
   fullScan(wollet: Wollet): Promise<LwkUpdate | undefined>;
   broadcast(pset: Pset): Promise<unknown>;
+  /** Re-broadcast of a raw signed tx (§3.2.9 resume); optional on test fakes. */
+  broadcastTx?(tx: LwkTransaction): Promise<unknown>;
   free?(): void;
 }
+
+// A re-broadcast of a tx already known to the network is SUCCESS, not failure
+// (§7.3) — the resume path stores signedTxHex and re-broadcasts the SAME bytes,
+// so "already in mempool/chain" means the earlier broadcast propagated.
+const ALREADY_KNOWN_RE = /already|duplicate|txn-already-known|transaction already/i;
 
 export interface SyncEngineOptions {
   descriptor: string;
@@ -363,6 +370,54 @@ export class SyncEngine {
     throw new WalletError(
       "BROADCAST_FAILED",
       `Broadcast rejected by all providers (${failures.join(" | ")})`
+    );
+  }
+
+  /**
+   * Re-broadcast a raw signed tx by its consensus hex (spec §3.2.9 resume).
+   * The bytes are NEVER re-derived — the caller re-broadcasts exactly what it
+   * signed and persisted, so this can never double-pay. A provider reporting
+   * the tx as already known/duplicate is treated as SUCCESS (the earlier
+   * broadcast propagated); BROADCAST_FAILED only when ALL providers hard-fail.
+   * A fresh Transaction is parsed per attempt (wasm objects are consumed).
+   */
+  async broadcastRawTx(txHex: string): Promise<string> {
+    const localTxid = Transaction.fromString(txHex).txid().toString();
+    const startIndex = Math.min(this.lastGoodProviderIndex, this.providers.length - 1);
+    const failures: string[] = [];
+    for (let step = 0; step < this.providers.length; step++) {
+      const idx = (startIndex + step) % this.providers.length;
+      const provider = this.providers[idx]!;
+      const client = this.buildClient(provider);
+      try {
+        if (!client.broadcastTx) {
+          throw new WalletError("BROADCAST_FAILED", "Esplora client has no broadcastTx");
+        }
+        await client.broadcastTx(Transaction.fromString(txHex));
+        this.lastGoodProviderIndex = idx;
+        // The provider's returned Txid is telemetry-only (§3.2.7); return the
+        // locally-derived txid (same value, already a string) so the result
+        // never depends on the wasm Txid.toString() shape — identical to the
+        // already-known branch below.
+        return localTxid;
+      } catch (err) {
+        const message = String((err as Error)?.message ?? err);
+        if (ALREADY_KNOWN_RE.test(message)) {
+          this.lastGoodProviderIndex = idx;
+          this.logger.info("re-broadcast: tx already known — treating as success", {
+            provider: provider.name,
+            txid: localTxid
+          });
+          return localTxid;
+        }
+        failures.push(`${provider.name}: ${message}`);
+      } finally {
+        client.free?.();
+      }
+    }
+    throw new WalletError(
+      "BROADCAST_FAILED",
+      `Re-broadcast rejected by all providers (${failures.join(" | ")})`
     );
   }
 }

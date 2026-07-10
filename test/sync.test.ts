@@ -17,6 +17,10 @@ import type { Wollet } from "lwk_node";
 
 const KNOWN_MNEMONIC =
   "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+// A real, small Liquid mainnet tx hex (public), parseable by Transaction.fromString.
+const FIXTURE_TXID = "21cb9e1fd71f5d9e9d9f5843f14f912ffd2f023b089fd0b78f2718fcdde52f33";
+const FIXTURE_HEX =
+  "0200000001010000000000000000000000000000000000000000000000000000000000000000ffffffff060365843c0101ffffffff03016d521c38ec1ea15734ae22b7c46064412829c0d0579f0a713d1c04ede979026f01000000000000000000266a240a8ce26f7f113667dccb98522fb9c292911d81ec200d31adc94501000000000000000000016d521c38ec1ea15734ae22b7c46064412829c0d0579f0a713d1c04ede979026f01000000000000010d001976a914fc26751a5025129a2fd006c6fbfa598ddd67f7e188ac016d521c38ec1ea15734ae22b7c46064412829c0d0579f0a713d1c04ede979026f01000000000000000000266a24aa21a9ed8fbc0adfe56fb749b2640b7b9131e42c6043588725c997c70c3658eea333f1510000000000000120000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
 let dataDir: string;
 let wollet: Wollet;
@@ -194,6 +198,26 @@ describe("broadcast chain (spec §3.2.6 parity)", () => {
     const engine = makeEngine({ factory });
     const txid = await engine.broadcast({} as never);
     expect(txid).toBe("aa".repeat(32));
+  });
+});
+
+describe("broadcastRawTx returns the locally-derived txid (spec §3.2.9 resume)", () => {
+  it("returns localTxid even when broadcastTx resolves a non-string Txid object", async () => {
+    // The real lwk_node EsploraClient.broadcastTx resolves a Txid object, not a
+    // string — the result must derive from the tx bytes, never from the wasm
+    // Txid.toString() shape (which is telemetry-only, §3.2.7).
+    const engine = makeEngine({
+      factory: () => ({
+        fullScan: async () => undefined,
+        broadcast: async () => {
+          throw new Error("not used");
+        },
+        broadcastTx: async () => ({ toString: () => "not-the-real-txid" }),
+        free: () => {}
+      })
+    });
+    const txid = await engine.broadcastRawTx(FIXTURE_HEX);
+    expect(txid).toBe(FIXTURE_TXID);
   });
 });
 

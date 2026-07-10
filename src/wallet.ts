@@ -23,6 +23,7 @@ import {
   Address,
   AssetId,
   Mnemonic,
+  Pset,
   Signer,
   TxBuilder,
   buildWollet,
@@ -31,7 +32,25 @@ import {
   mainnetNetwork,
   validateMnemonic
 } from "./engine/lwk.js";
-import { WalletError } from "./errors.js";
+import {
+  DepixApiClient,
+  type FetchLike,
+  type StatusReadResponse,
+  type WithdrawRequestBody,
+  type WithdrawWireResponse
+} from "./api/client.js";
+import { DepixApiError, WalletError } from "./errors.js";
+import {
+  assertFeeAddressExplicit,
+  assertSplitConsistent,
+  assertWithdrawPsetOutputs,
+  centsToDepixSats,
+  normalizeWithdrawResponse,
+  type NormalizedWithdraw,
+  type WithdrawMode
+} from "./flows/withdraw.js";
+import { waitForDeposit as pollDeposit, waitForWithdrawal as pollWithdrawal, type WaitOptions } from "./flows/status.js";
+import { PendingWithdrawals } from "./pending.js";
 import {
   Guardrails,
   resolveGuardrailConfig,
@@ -39,7 +58,7 @@ import {
   type GuardrailConfig,
   type ResolvedGuardrailConfig
 } from "./guardrails/guardrails.js";
-import { QuotesClient, resolveApiBase, type QuotesSource } from "./guardrails/quotes.js";
+import { QuotesClient, resolveApiBase as resolveQuotesApiBase, type QuotesSource } from "./guardrails/quotes.js";
 import { BrlValuator } from "./guardrails/valuation.js";
 import { createLogger, registerSecret, type Logger } from "./logger.js";
 import { Mutex } from "./mutex.js";
@@ -53,13 +72,15 @@ import { acquireDirLock, type DirLock } from "./store/dir-lock.js";
 import { ensureDir } from "./store/fs-util.js";
 import { SeedStore, type WalletFileV1 } from "./store/seed-store.js";
 import { UpdateStore } from "./store/update-store.js";
-import { SyncEngine, type EsploraProvider } from "./sync/sync.js";
+import { SyncEngine, type EsploraClientLike, type EsploraProvider } from "./sync/sync.js";
 
 export interface WalletSyncOptions {
   /** Override the Esplora provider chain (default: waterfalls→vanilla §2.6). */
   providers?: EsploraProvider[];
   /** Run fullScan in a worker_thread (§2.7). Default ON. */
   worker?: boolean;
+  /** Advanced/testing: inject fake Esplora clients (broadcast seam). */
+  clientFactory?: (provider: EsploraProvider) => EsploraClientLike;
 }
 
 export interface OpenOptions {
@@ -80,7 +101,17 @@ export interface OpenOptions {
    * ?? https://api.depixapp.com), fresh 30s / stale 5min.
    */
   quotes?: QuotesSource;
-  // TODO(PR2): apiKey/apiBase (api/client.ts — Bearer sk_, Idempotency-Key).
+  /** Default: $DEPIX_API_KEY (sk_test_/sk_live_) — required for deposit/withdraw/waitFor. */
+  apiKey?: string;
+  /** Default: $DEPIX_API_BASE ?? https://api.depixapp.com. */
+  apiBase?: string;
+  /** Advanced/testing: inject the fetch implementation of the API client. */
+  fetch?: FetchLike;
+  /**
+   * Auto-run resumePendingWithdrawals() on open() (§3.2.9). Default true — an
+   * MCP-only agent has no other path to recover after a crash. Opt out here.
+   */
+  resumePendingWithdrawalsOnOpen?: boolean;
 }
 
 export interface CreateOptions extends OpenOptions {
@@ -146,12 +177,67 @@ export interface SendResult {
   txid: string;
 }
 
+export interface DepositParams {
+  /** Deposit amount in BRL cents (R$ 5,00–R$ 3.000,00 server-side). */
+  amountCents: number;
+  /** CPF/CNPJ of the OWNER who will pay the QR (wire: payer_tax_number, §2.3). */
+  payerTaxNumber: string;
+}
+
+export interface DepositResult {
+  id: string;
+  qrCopyPaste: string;
+  sandbox?: true;
+}
+
+export interface WithdrawParams {
+  pixKey: string;
+  /** CPF/CNPJ of the destination Pix key HOLDER (wire: taxNumber, §2.3). */
+  recipientTaxNumber: string;
+  amountCents: number;
+  /** "send" → depositAmountInCents (você envia); "payout" → payoutAmountInCents (você recebe). */
+  mode: WithdrawMode;
+}
+
+/** Normative return of withdraw() (§2.3). txid is null only in sandbox. */
+export interface WithdrawResult {
+  withdrawalId: string;
+  txid: string | null;
+  feeCents: number | null;
+  feeAddress: string | null;
+  netCents: number;
+  grossCents: number;
+  payoutCents: number;
+  sandbox?: true;
+}
+
+export interface ResumeSummary {
+  /** rebroadcast + reposted. */
+  resumed: number;
+  /** "signed" records re-broadcast with the SAME bytes. */
+  rebroadcast: number;
+  /** "requested" records re-POSTed with the same Idempotency-Key + re-validated. */
+  reposted: number;
+  /** records that failed GCM authentication and were discarded (§3.2.9). */
+  discarded: number;
+  /** records that could not be resumed this pass. */
+  failed: number;
+}
+
 function resolveDataDir(explicit?: string): string {
   return explicit ?? process.env.DEPIX_WALLET_DIR ?? join(homedir(), ".depix-wallet");
 }
 
 function resolvePassphrase(explicit?: string): string | undefined {
   return explicit ?? process.env.DEPIX_WALLET_PASSPHRASE;
+}
+
+function resolveApiKey(explicit?: string): string | undefined {
+  return explicit ?? process.env.DEPIX_API_KEY;
+}
+
+function resolveApiBase(explicit?: string): string | undefined {
+  return explicit ?? process.env.DEPIX_API_BASE;
 }
 
 async function runRitual(mnemonic: string, io?: RitualIo): Promise<boolean> {
@@ -181,6 +267,9 @@ interface WalletParts {
   guardrailConfig: ResolvedGuardrailConfig;
   /** Injected quotes source, or undefined for the default QuotesClient (§4.4). */
   quotes?: QuotesSource;
+  apiKey?: string;
+  apiBase?: string;
+  apiFetch?: FetchLike;
 }
 
 export class DepixWallet {
@@ -192,6 +281,10 @@ export class DepixWallet {
   private readonly valuator: BrlValuator;
   private readonly logger: Logger;
   private readonly passphrase: string | undefined;
+  // Pix flows (PR2) — null when no apiKey / no seed. deposit/withdraw/waitFor
+  // surface a clear error rather than a confusing crash when they are missing.
+  private readonly api: DepixApiClient | null;
+  private readonly pending: PendingWithdrawals | null;
   private file: WalletFileV1;
   private lock: DirLock | null;
   private wollet: Wollet | null = null;
@@ -218,7 +311,7 @@ export class DepixWallet {
     this.passphrase = parts.passphrase;
     this.logger = createLogger();
     this.updateStore = new UpdateStore(parts.dataDir);
-    this.valuator = new BrlValuator(parts.quotes ?? new QuotesClient({ apiBase: resolveApiBase() }));
+    this.valuator = new BrlValuator(parts.quotes ?? new QuotesClient({ apiBase: resolveQuotesApiBase() }));
     // Seed-bound anchor backed by wallet.json's authenticated envelope (§4.5).
     // The marker + monotonic epoch are covered by the seed's GCM AAD, so an
     // injected agent cannot strip the marker (it bricks seed decryption) nor roll
@@ -247,8 +340,30 @@ export class DepixWallet {
       updateStore: this.updateStore,
       providers: parts.sync?.providers,
       worker: parts.sync?.worker,
+      clientFactory: parts.sync?.clientFactory,
       logger: this.logger
     });
+    // API client — only when an apiKey is configured. Its base defaults to the
+    // canonical host inside the client.
+    this.api = parts.apiKey
+      ? new DepixApiClient({
+          apiKey: parts.apiKey,
+          apiBase: parts.apiBase,
+          fetch: parts.apiFetch,
+          logger: this.logger
+        })
+      : null;
+    // Pending-withdrawals store — needs the seed-store key material (passphrase
+    // + wallet salt). A view-only/wiped wallet cannot withdraw, so it has none.
+    this.pending =
+      parts.passphrase && parts.file.salt
+        ? new PendingWithdrawals({
+            dataDir: parts.dataDir,
+            passphrase: parts.passphrase,
+            saltB64: parts.file.salt,
+            logger: this.logger
+          })
+        : null;
   }
 
   // ─── lifecycle ─────────────────────────────────────────────────────────
@@ -263,6 +378,8 @@ export class DepixWallet {
     // Resolve the (immutable) guardrail config up front so a bad option/env
     // fails fast with GUARDRAIL_CONFIG_INVALID before any lock is taken (§4.2).
     const guardrailConfig = resolveGuardrailConfig(options.guardrails);
+    const apiKey = resolveApiKey(options.apiKey);
+    const apiBase = resolveApiBase(options.apiBase);
     const seedStore = new SeedStore(dataDir);
     const file = await seedStore.read();
     if (!file) {
@@ -278,6 +395,7 @@ export class DepixWallet {
     }
     await ensureDir(dataDir);
     const lock = await acquireDirLock(dataDir);
+    let wallet: DepixWallet;
     try {
       if (file.encryptedSeed) {
         // Validate the passphrase eagerly (fail fast with WRONG_PASSPHRASE).
@@ -286,7 +404,7 @@ export class DepixWallet {
         // pattern-based (logger.ts), never by keeping the live seed resident.
         await seedStore.decryptMnemonic(passphrase as string);
       }
-      return new DepixWallet({
+      wallet = new DepixWallet({
         dataDir,
         passphrase,
         seedStore,
@@ -294,14 +412,24 @@ export class DepixWallet {
         lock,
         sync: options.sync,
         guardrailConfig,
-        quotes: options.quotes
+        quotes: options.quotes,
+        apiKey,
+        apiBase,
+        apiFetch: options.fetch
       });
     } catch (err) {
       await lock.release();
       throw err;
     }
-    // TODO(PR2): auto-run resumePendingWithdrawals() here (§3.2.9, opt-out
-    // via option) once the withdraw flow and its pending store exist.
+    // Auto-resume any crashed withdrawals (§3.2.9), opt-out via option. Best
+    // effort: resumePendingWithdrawals() never throws (it logs per-record
+    // failures), so a stuck resume can never block opening the wallet.
+    if (options.resumePendingWithdrawalsOnOpen !== false) {
+      await wallet.resumePendingWithdrawals().catch(() => {
+        /* resume already logs; never fail open() on it */
+      });
+    }
+    return wallet;
   }
 
   /**
@@ -362,7 +490,10 @@ export class DepixWallet {
         lock,
         sync: options.sync,
         guardrailConfig,
-        quotes: options.quotes
+        quotes: options.quotes,
+        apiKey: resolveApiKey(options.apiKey),
+        apiBase: resolveApiBase(options.apiBase),
+        apiFetch: options.fetch
       });
       return { mnemonic, descriptor, backupConfirmed, wallet };
     } catch (err) {
@@ -414,7 +545,10 @@ export class DepixWallet {
         lock,
         sync: options.sync,
         guardrailConfig,
-        quotes: options.quotes
+        quotes: options.quotes,
+        apiKey: resolveApiKey(options.apiKey),
+        apiBase: resolveApiBase(options.apiBase),
+        apiFetch: options.fetch
       });
     } catch (err) {
       await lock.release();
@@ -667,6 +801,427 @@ export class DepixWallet {
       const txid = await this.syncEngine.broadcast(finalized);
       return { txid };
     });
+  }
+
+  // ─── Pix flows (§3) ────────────────────────────────────────────────────
+
+  /**
+   * On-ramp (§3.1): create a Pix deposit QR. Fills depixAddress with a FRESH
+   * receive address of THIS wallet (subject to the backup gate §2.9 —
+   * BACKUP_REQUIRED before the backup is confirmed): the only point the AX
+   * layer touches the immutable Eulen flow. deposit() does NOT pass through the
+   * guardrail — it is an INFLOW (§4.3). The QR is paid by the human OWNER; the
+   * DePix lands here and appears on the next sync().
+   */
+  async deposit(params: DepositParams): Promise<DepositResult> {
+    this.assertOpen();
+    const api = this.requireApi();
+    if (!Number.isSafeInteger(params.amountCents) || params.amountCents <= 0) {
+      throw new WalletError(
+        "INVALID_AMOUNT",
+        "deposit amountCents must be a positive integer (BRL cents)"
+      );
+    }
+    if (typeof params.payerTaxNumber !== "string" || params.payerTaxNumber.trim().length === 0) {
+      throw new WalletError("INVALID_ARGUMENT", "payerTaxNumber (payer CPF/CNPJ) is required");
+    }
+    // Fresh receive address (§3.1) — throws BACKUP_REQUIRED until backup done.
+    const depixAddress = await this.getReceiveAddress();
+    const wire = await api.createDeposit(
+      { amountInCents: params.amountCents, depixAddress, payer_tax_number: params.payerTaxNumber },
+      { idempotencyKey: DepixApiClient.newIdempotencyKey() }
+    );
+    const result: DepositResult = { id: wire.id, qrCopyPaste: wire.qrCopyPaste };
+    if (wire.sandbox === true) result.sandbox = true;
+    return result;
+  }
+
+  /**
+   * Off-ramp (§3.2 — CRITICAL contract). Persists the request BEFORE the POST
+   * (crash-safe §3.2.9), then processes the AUTHENTICATED response:
+   * fee-address fail-closed (FEE_ADDRESS_NOT_EXPLICIT), split consistency
+   * (NET+fee=GROSS), guardrail on the GROSS, ONE Liquid tx with the Eulen
+   * output + an EXPLICIT fee output, sign, persist-before-broadcast, broadcast.
+   * There is NO txid-archival step — Eulen reports settlement via webhook and
+   * the F0.9 cron verifies the fee output on-chain.
+   */
+  async withdraw(params: WithdrawParams): Promise<WithdrawResult> {
+    this.assertOpen();
+    const api = this.requireApi();
+    const pending = this.requirePending();
+    if (params.mode !== "send" && params.mode !== "payout") {
+      throw new WalletError(
+        "INVALID_ARGUMENT",
+        `withdraw mode must be "send" or "payout", got ${String(params.mode)}`
+      );
+    }
+    if (!Number.isSafeInteger(params.amountCents) || params.amountCents <= 0) {
+      throw new WalletError(
+        "INVALID_AMOUNT",
+        "withdraw amountCents must be a positive integer (BRL cents)"
+      );
+    }
+    if (typeof params.pixKey !== "string" || params.pixKey.trim().length === 0) {
+      throw new WalletError("INVALID_ARGUMENT", "pixKey is required");
+    }
+    if (
+      typeof params.recipientTaxNumber !== "string" ||
+      params.recipientTaxNumber.trim().length === 0
+    ) {
+      throw new WalletError(
+        "INVALID_ARGUMENT",
+        "recipientTaxNumber (destination Pix-key holder CPF/CNPJ) is required"
+      );
+    }
+
+    const request: WithdrawRequestBody = {
+      pixKey: params.pixKey,
+      taxNumber: params.recipientTaxNumber
+    };
+    if (params.mode === "send") request.depositAmountInCents = params.amountCents;
+    else request.payoutAmountInCents = params.amountCents;
+
+    const idempotencyKey = DepixApiClient.newIdempotencyKey();
+    // Persist BEFORE the POST so a crash mid-request resumes with the SAME
+    // Idempotency-Key (§3.2.9). Nothing is signed yet — no double-pay window.
+    await pending.putRequested({ idempotencyKey, request });
+    let wire;
+    try {
+      wire = await api.createWithdraw(request, { idempotencyKey });
+    } catch (err) {
+      // Only a DEFINITIVE rejection (4xx other than 409) means the server did
+      // NOT create the withdrawal — drop the still-unsigned record. A TRANSIENT
+      // failure (network / 5xx / 409 in-flight) may have created it server-side
+      // with the response lost, so KEEP the "requested" record: a later open()
+      // re-POSTs the SAME Idempotency-Key (authenticated replay, §3.2.9) instead
+      // of orphaning the provider-side withdrawal. Nothing is signed here, so
+      // keeping the record can never double-pay.
+      if (this.isPermanentApiRejection(err)) {
+        await this.discardIfUnsigned(idempotencyKey);
+      }
+      throw err;
+    }
+    return this.processWithdrawResponse(wire, idempotencyKey);
+  }
+
+  /** Poll GET /api/deposits/:id until terminal (§3.4, shared read throttle). */
+  async waitForDeposit(id: string, options: WaitOptions = {}): Promise<StatusReadResponse> {
+    this.assertOpen();
+    return pollDeposit(this.requireApi(), id, options);
+  }
+
+  /** Poll GET /api/withdrawals/:id until terminal (§3.4; sandbox `confirmed`). */
+  async waitForWithdrawal(id: string, options: WaitOptions = {}): Promise<StatusReadResponse> {
+    this.assertOpen();
+    return pollWithdrawal(this.requireApi(), id, options);
+  }
+
+  /**
+   * Recover crashed withdrawals (§3.2.9). Auto-run by open() (opt-out). NEVER
+   * throws — per-record failures are logged. "signed" records are re-broadcast
+   * with the SAME bytes (never re-signed — the anti-double-pay invariant);
+   * "requested" records re-POST with the same Idempotency-Key
+   * (authenticated replay) and re-run the full validation cadence. A record
+   * failing GCM authentication is discarded and never signed from.
+   */
+  async resumePendingWithdrawals(): Promise<ResumeSummary> {
+    const summary: ResumeSummary = {
+      resumed: 0,
+      rebroadcast: 0,
+      reposted: 0,
+      discarded: 0,
+      failed: 0
+    };
+    if (!this.lock || !this.pending) return summary;
+
+    let readResult;
+    try {
+      readResult = await this.pending.readAll();
+    } catch (err) {
+      this.logger.error("could not read pending withdrawals — skipping resume", {
+        error: String((err as Error)?.message ?? err)
+      });
+      return summary;
+    }
+
+    for (const id of readResult.tamperedIds) {
+      summary.discarded++;
+      this.logger.error(
+        "pending withdrawal failed authentication (tampered) — discarding, not signed from",
+        { idempotencyKey: id }
+      );
+      await this.pending.remove(id).catch(() => {});
+    }
+
+    for (const record of readResult.records) {
+      try {
+        if (record.state === "signed") {
+          if (!record.signedTxHex) {
+            summary.failed++;
+            continue;
+          }
+          // Re-broadcast the EXACT signed bytes — NEVER re-sign (§3.2.9).
+          await this.syncEngine.broadcastRawTx(record.signedTxHex);
+          summary.rebroadcast++;
+          await this.pending.remove(record.idempotencyKey).catch(() => {});
+        } else {
+          // "requested": re-POST same key (authenticated replay) + re-validate.
+          if (!this.api) {
+            summary.failed++;
+            continue;
+          }
+          const wire = await this.api.createWithdraw(record.request, {
+            idempotencyKey: record.idempotencyKey
+          });
+          await this.processWithdrawResponse(wire, record.idempotencyKey);
+          summary.reposted++;
+        }
+      } catch (err) {
+        summary.failed++;
+        this.logger.error("failed to resume a pending withdrawal", {
+          idempotencyKey: record.idempotencyKey,
+          state: record.state,
+          error: String((err as Error)?.message ?? err)
+        });
+        // A permanent 4xx (not_found/expired/validation — not 409) means the
+        // provider will never complete this withdrawal → drop the record.
+        if (this.isPermanentApiRejection(err)) {
+          await this.pending.remove(record.idempotencyKey).catch(() => {});
+        }
+      }
+    }
+
+    summary.resumed = summary.rebroadcast + summary.reposted;
+    return summary;
+  }
+
+  /**
+   * Run the withdraw contract on an AUTHENTICATED response (shared by the
+   * initial call and resume-of-"requested"). Sandbox short-circuits BEFORE any
+   * on-chain validation (§3.2 step 0). The guardrail→build→sign→broadcast
+   * section is serialized with send()/other withdraws (§4.3 TOCTOU).
+   */
+  private async processWithdrawResponse(
+    wire: WithdrawWireResponse,
+    idempotencyKey: string
+  ): Promise<WithdrawResult> {
+    try {
+      const norm = normalizeWithdrawResponse(wire);
+
+      // Step 0 (§3.2): sandbox short-circuit BEFORE any address/fee validation —
+      // the placeholders do not parse and the SDK runs NO on-chain leg.
+      if (norm.sandbox) {
+        await this.pending?.remove(idempotencyKey).catch(() => {});
+        return {
+          withdrawalId: norm.withdrawalId,
+          txid: null,
+          feeCents: norm.feeCents,
+          feeAddress: norm.feeAddress,
+          netCents: norm.netCents,
+          grossCents: norm.grossCents,
+          payoutCents: norm.payoutCents,
+          sandbox: true
+        };
+      }
+
+      // Steps 3–4 fail-closed validations (pure — nothing is signed if they trip):
+      if (norm.hasFee) {
+        // fee_address MUST be explicit (ex1) or the fee output is unverifiable →
+        // account block. Abort BEFORE signing (§3.2.3).
+        const feeAddr = assertFeeAddressExplicit(norm.feeAddress as string);
+        try {
+          feeAddr.free();
+        } catch {
+          // best effort
+        }
+        assertSplitConsistent(norm.netCents, norm.feeCents as number, norm.grossCents);
+      }
+      this.assertParseableLiquidAddress(norm.depositAddress);
+
+      return await this.opMutex.runExclusive(async () => {
+        // Guardrail on the GROSS (§3.2.4) — BEFORE anything is built or signed.
+        await this.guardrails.enforce({ kind: "withdraw", brlCents: norm.grossCents });
+        const signedTxHex = await this.buildSignPersistWithdraw(norm, idempotencyKey);
+        // Broadcast the SAME persisted bytes (identical path to resume).
+        const txid = await this.syncEngine.broadcastRawTx(signedTxHex);
+        // Broadcast succeeded → tx is public; drop the record. A crash in the
+        // broadcast→remove window leaves a "signed" record that resume simply
+        // re-broadcasts (idempotent), never re-signs — so the anti-double-pay
+        // invariant holds without keeping the file unbounded.
+        await this.pending?.remove(idempotencyKey).catch(() => {});
+        return {
+          withdrawalId: norm.withdrawalId,
+          txid,
+          feeCents: norm.feeCents,
+          feeAddress: norm.feeAddress,
+          netCents: norm.netCents,
+          grossCents: norm.grossCents,
+          payoutCents: norm.payoutCents
+        };
+      });
+    } catch (err) {
+      // A failure BEFORE signing (contract/guardrail/insufficient) is a
+      // deliberate refusal, not a crash — drop the still-"requested" record so
+      // resume never re-drives it. A failure AFTER signing (broadcast) leaves a
+      // "signed" record UNTOUCHED for resume to re-broadcast (same bytes).
+      await this.discardIfUnsigned(idempotencyKey);
+      throw err;
+    }
+  }
+
+  /**
+   * A withdraw POST failure is DEFINITIVE only when it is a 4xx other than 409:
+   * the server rejected the request and created nothing, so the still-unsigned
+   * record can be dropped. Network errors (DepixApiError status 0), any 5xx and
+   * a 409 (idempotency in-flight) are TRANSIENT — the withdrawal may exist
+   * server-side with the response lost, so the record is KEPT for an idempotent
+   * resume re-POST (§3.2.9). Single source of truth for both withdraw() and
+   * resumePendingWithdrawals().
+   */
+  private isPermanentApiRejection(err: unknown): boolean {
+    return (
+      err instanceof DepixApiError &&
+      err.status >= 400 &&
+      err.status < 500 &&
+      err.status !== 409
+    );
+  }
+
+  /** Remove a pending record only while it is still "requested" (unsigned). */
+  private async discardIfUnsigned(idempotencyKey: string): Promise<void> {
+    if (!this.pending) return;
+    try {
+      const record = await this.pending.get(idempotencyKey);
+      if (record && record.state === "requested") {
+        await this.pending.remove(idempotencyKey);
+      }
+    } catch {
+      // get() can throw PENDING_RECORD_TAMPERED — leave it for resume to discard.
+    }
+  }
+
+  /**
+   * Build ONE Liquid tx (Eulen output A + explicit fee output B when fee'd),
+   * re-pin its outputs (§3.2.5), sign with an ephemeral signer, account the
+   * GROSS at signing time and persist the signed bytes BEFORE the first
+   * broadcast (§3.2.9). Returns the signed tx hex. Callers hold opMutex.
+   */
+  private async buildSignPersistWithdraw(
+    norm: NormalizedWithdraw,
+    idempotencyKey: string
+  ): Promise<string> {
+    const wollet = await this.ensureWollet();
+    const network = mainnetNetwork();
+    const netSats = centsToDepixSats(norm.netCents);
+    const grossSats = centsToDepixSats(norm.grossCents);
+    const feeSats = norm.hasFee ? centsToDepixSats(norm.feeCents as number) : undefined;
+
+    // Capture the output scripts BEFORE building (frontend parity: addresses are
+    // not reused after addRecipient; not freed, matching send()).
+    const depositAddr = new Address(norm.depositAddress);
+    const depositScriptHex = depositAddr.scriptPubkey().toString();
+    let builder = new TxBuilder(network);
+    builder = builder.addRecipient(depositAddr, netSats, new AssetId(ASSETS.DEPIX.id));
+    let feeScriptHex: string | undefined;
+    if (norm.hasFee) {
+      const feeAddr = new Address(norm.feeAddress as string);
+      feeScriptHex = feeAddr.scriptPubkey().toString();
+      builder = builder.addRecipient(feeAddr, feeSats as bigint, new AssetId(ASSETS.DEPIX.id));
+    }
+
+    const pset = await this.finishWithdrawPset(builder, wollet, grossSats);
+
+    // Re-pin the built PSET (§3.2.5): Eulen output present; fee output EXPLICIT
+    // (readable asset+value) paying the fee script exactly.
+    assertWithdrawPsetOutputs(pset, { depositScriptHex, netSats, feeScriptHex, feeSats });
+
+    // Ephemeral signer, zeroed in finally (per-op auth §2.3).
+    let signed;
+    {
+      let mnemonic: InstanceType<typeof Mnemonic> | null = null;
+      let signer: InstanceType<typeof Signer> | null = null;
+      try {
+        mnemonic = new Mnemonic(await this.decryptMnemonic());
+        signer = new Signer(mnemonic, network);
+        signed = signer.sign(pset);
+      } finally {
+        try {
+          signer?.free();
+          mnemonic?.free();
+        } catch {
+          // best effort
+        }
+      }
+    }
+
+    const finalized = wollet.finalize(signed);
+    const tx = finalized.extractTx();
+    const signedTxHex = tx.toString();
+    const txid = tx.txid().toString();
+
+    // Account the GROSS at SIGNING time (§4.5), in the fail-closed direction: if
+    // a crash regresses to "requested", resume re-signs a FRESH tx (the original
+    // was never broadcast) and records again — over-counting blocks more, never
+    // a double-pay.
+    await this.guardrails.recordSpend(norm.grossCents, "withdraw");
+    // Persist the signed bytes BEFORE the first broadcast — the anti-double-pay
+    // checkpoint. Resume from "signed" re-broadcasts THESE bytes, never re-signs.
+    await this.requirePending().markSigned(idempotencyKey, {
+      withdrawalId: norm.withdrawalId,
+      signedTxHex,
+      txid
+    });
+    return signedTxHex;
+  }
+
+  private async finishWithdrawPset(
+    builder: InstanceType<typeof TxBuilder>,
+    wollet: Wollet,
+    grossSats: bigint
+  ): Promise<InstanceType<typeof Pset>> {
+    try {
+      return builder.finish(wollet);
+    } catch (err) {
+      // Reuse the send() classifier: INSUFFICIENT_FUNDS / INSUFFICIENT_LBTC_FOR_FEE.
+      throw await this.classifyFinishError(err, "DEPIX", grossSats);
+    }
+  }
+
+  private requireApi(): DepixApiClient {
+    if (!this.api) {
+      throw new WalletError(
+        "API_KEY_REQUIRED",
+        "Set apiKey (or $DEPIX_API_KEY) on open()/create() to use deposit(), withdraw() and the waiters."
+      );
+    }
+    return this.api;
+  }
+
+  private requirePending(): PendingWithdrawals {
+    if (!this.pending) {
+      throw new WalletError(
+        "WALLET_NOT_FOUND",
+        "This wallet has no seed material (view-only/wiped) — withdraw() is unavailable."
+      );
+    }
+    return this.pending;
+  }
+
+  private assertParseableLiquidAddress(address: string): void {
+    try {
+      const parsed = new Address(address);
+      try {
+        parsed.free();
+      } catch {
+        // best effort
+      }
+    } catch (err) {
+      throw new WalletError(
+        "INVALID_ADDRESS",
+        `withdraw response depositAddress is not a valid Liquid address: ${address}`,
+        { cause: err }
+      );
+    }
   }
 
   /** Selective wipe (§2.4): view-only survives, restore detects mismatch. */
