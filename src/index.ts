@@ -24,6 +24,7 @@ export {
 } from "./wallet.js";
 
 export {
+  BoltzApiError,
   ConversionError,
   DepixApiError,
   DepixSdkError,
@@ -37,6 +38,35 @@ export {
   type ErrorDetails,
   type GuardrailDetails
 } from "./errors.js";
+
+export {
+  BoltzClient,
+  BoltzConvert,
+  BOLTZ_API_BASE,
+  BOLTZ_WS_URL,
+  MAX_SUBMARINE_TIMEOUT_BLOCKS,
+  decodeInvoiceAmountSats,
+  decodeInvoicePaymentHash,
+  assertLockupAddressBindsToUser,
+  prepareSubmarineSwap,
+  refundSubmarineSwap,
+  RefundPendingError,
+  receiveViaLightning,
+  resumeReverseSwap,
+  getReverseLimits,
+  estimateReverseReceive,
+  type BoltzConvertDeps,
+  type PayLightningResult,
+  type ReceiveLightningResult,
+  type SubmarineOutcome,
+  type BoltzResumeSummary,
+  type PreparedSubmarineSwap,
+  type ReverseSwapRecord,
+  type ReverseOutcome,
+  type StoredBoltzSwap,
+  type StoredSubmarineSwap,
+  type StoredReverseSwap
+} from "./convert/boltz/index.js";
 
 export {
   DepixApiClient,

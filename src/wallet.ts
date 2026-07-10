@@ -75,6 +75,9 @@ import { UpdateStore } from "./store/update-store.js";
 import { SyncEngine, type EsploraClientLike, type EsploraProvider } from "./sync/sync.js";
 import { ConvertNamespace, type ConvertNamespaceOptions } from "./convert/namespace.js";
 import type { ConvertWalletHooks } from "./convert/hooks.js";
+import type { GuardrailDestination } from "./guardrails/allowlist.js";
+import { BoltzConvert, type BoltzConvertDeps } from "./convert/boltz/convert.js";
+import { BoltzSwapStore } from "./convert/boltz/store.js";
 
 export interface WalletSyncOptions {
   /** Override the Esplora provider chain (default: waterfalls→vanilla §2.6). */
@@ -120,6 +123,12 @@ export interface OpenOptions {
    * and lwk signer.
    */
   convert?: ConvertNamespaceOptions;
+  /**
+   * Advanced/testing: inject the Boltz conversion deps (fake REST/WS client,
+   * verify-lockup / refund / reverse overrides) so the wallet.convert.boltz
+   * flows never touch real Boltz or WASM (§5.3).
+   */
+  boltz?: BoltzConvertDeps;
 }
 
 export interface CreateOptions extends OpenOptions {
@@ -280,6 +289,8 @@ interface WalletParts {
   apiFetch?: FetchLike;
   /** SideSwap client/signer/clock injection for wallet.convert.* (§5). */
   convert?: ConvertNamespaceOptions;
+  /** Injected Boltz conversion deps (§5.3) — advanced/testing. */
+  boltz?: BoltzConvertDeps;
 }
 
 export class DepixWallet {
@@ -297,6 +308,12 @@ export class DepixWallet {
   // surface a clear error rather than a confusing crash when they are missing.
   private readonly api: DepixApiClient | null;
   private readonly pending: PendingWithdrawals | null;
+  // Boltz conversion holder (§2.3, §5.3). null on a view-only/wiped wallet (no
+  // seed to sign the L-BTC lockup / no key to authenticate the swap store). The
+  // same BoltzConvert instance is exposed as wallet.convert.boltz; this private
+  // handle lets close() dispose its in-flight watches (.sideswap lives on the
+  // ConvertNamespace `convert` field).
+  private readonly convertNamespace: { boltz: BoltzConvert } | null;
   private file: WalletFileV1;
   private lock: DirLock | null;
   private wollet: Wollet | null = null;
@@ -376,10 +393,37 @@ export class DepixWallet {
             logger: this.logger
           })
         : null;
+    // Boltz conversion namespace (§5.3). Needs the seed key material (durable
+    // authenticated boltz-swaps.json) + the ability to sign the L-BTC lockup, so
+    // it only exists for a wallet with a seed — a view-only/wiped wallet has none.
+    // Held as a private field (not just inside .convert) so close() can dispose
+    // its in-flight watches (§5.3 resource hygiene) — the SAME instance is wired
+    // into the convert namespace below as wallet.convert.boltz.
+    this.convertNamespace =
+      parts.passphrase && parts.file.salt
+        ? {
+            boltz: new BoltzConvert(
+              {
+                store: new BoltzSwapStore({
+                  dataDir: parts.dataDir,
+                  passphrase: parts.passphrase,
+                  saltB64: parts.file.salt,
+                  logger: this.logger
+                }),
+                logger: this.logger,
+                lockupLbtc: (p) => this.lockupLbtc(p),
+                getReceiveAddress: () => this.getReceiveAddress()
+              },
+              parts.boltz ?? {}
+            )
+          }
+        : null;
     // Conversions (§5) — a narrow seam onto the same choke point (§4.3), BRL
     // valuator (§4.4), op mutex (§4.3 TOCTOU) and encrypted seed used by
     // send()/withdraw(). Everything forwarded here already exists on this
-    // instance; the convert flows live under src/convert/.
+    // instance; the convert flows live under src/convert/. wallet.convert exposes
+    // BOTH .sideswap (§5.1/§5.2, always available) and .boltz (§5.3, the same
+    // BoltzConvert instance held above — absent on a seedless/view-only wallet).
     const convertHooks: ConvertWalletHooks = {
       dataDir: this.dataDir,
       logger: this.logger,
@@ -394,7 +438,11 @@ export class DepixWallet {
       assertOpen: () => this.assertOpen(),
       now: () => Date.now()
     };
-    this.convert = new ConvertNamespace(convertHooks, parts.convert);
+    this.convert = new ConvertNamespace(
+      convertHooks,
+      parts.convert,
+      this.convertNamespace?.boltz ?? null
+    );
   }
 
   // ─── lifecycle ─────────────────────────────────────────────────────────
@@ -447,7 +495,8 @@ export class DepixWallet {
         apiKey,
         apiBase,
         apiFetch: options.fetch,
-        convert: options.convert
+        convert: options.convert,
+        boltz: options.boltz
       });
     } catch (err) {
       await lock.release();
@@ -526,7 +575,8 @@ export class DepixWallet {
         apiKey: resolveApiKey(options.apiKey),
         apiBase: resolveApiBase(options.apiBase),
         apiFetch: options.fetch,
-        convert: options.convert
+        convert: options.convert,
+        boltz: options.boltz
       });
       return { mnemonic, descriptor, backupConfirmed, wallet };
     } catch (err) {
@@ -582,7 +632,8 @@ export class DepixWallet {
         apiKey: resolveApiKey(options.apiKey),
         apiBase: resolveApiBase(options.apiBase),
         apiFetch: options.fetch,
-        convert: options.convert
+        convert: options.convert,
+        boltz: options.boltz
       });
     } catch (err) {
       await lock.release();
@@ -830,6 +881,89 @@ export class DepixWallet {
       // Accounted at SIGNING time, not settlement (§4.5) — a failed broadcast
       // still counts against the window (the tx may propagate later).
       await this.guardrails.recordSpend(brlCents, "send");
+
+      const finalized = wollet.finalize(signed);
+      const txid = await this.syncEngine.broadcast(finalized);
+      return { txid };
+    });
+  }
+
+  /**
+   * Guardrail choke point + L-BTC lockup signing for a conversion (§4.3/§5.3).
+   * Same proven path as send()'s L-BTC branch — enforce (value L-BTC in BRL with
+   * the caller's FINAL destinations) → build → ephemeral-sign → recordSpend →
+   * broadcast, all under opMutex — but the destination CLASS is the caller's
+   * (e.g. `lightning` for a Boltz submarine payee), NOT `liquidAddress`: the
+   * lockup being protocol-bound does NOT exempt the final destination (§4.3).
+   * The internal seam wallet.convert.boltz uses to fund a lockup.
+   */
+  private async lockupLbtc(params: {
+    address: string;
+    amountSats: bigint;
+    destinations: readonly GuardrailDestination[];
+  }): Promise<{ txid: string }> {
+    this.assertOpen();
+    if (typeof params.amountSats !== "bigint" || params.amountSats <= 0n) {
+      throw new WalletError("INVALID_AMOUNT", "lockup amountSats must be a positive bigint");
+    }
+    let address: InstanceType<typeof Address>;
+    try {
+      address = new Address(params.address);
+    } catch (err) {
+      throw new WalletError("INVALID_ADDRESS", `Not a valid Liquid address: ${params.address}`, {
+        cause: err
+      });
+    }
+
+    return this.opMutex.runExclusive(async () => {
+      // Choke point BEFORE anything is built/signed. L-BTC is valued via
+      // /api/quotes and fails CLOSED with QUOTES_UNAVAILABLE (§4.4/G6).
+      const brlCents = await this.valuator.valuate("LBTC", params.amountSats);
+      await this.guardrails.enforce({
+        kind: "boltz-submarine",
+        brlCents,
+        destinations: params.destinations
+      });
+
+      const wollet = await this.ensureWollet();
+      const network = mainnetNetwork();
+      let builder = new TxBuilder(network);
+      try {
+        builder = builder.addLbtcRecipient(address, params.amountSats);
+      } catch (err) {
+        throw new WalletError("INVALID_ADDRESS", "Recipient rejected by the transaction builder", {
+          cause: err
+        });
+      }
+
+      let pset;
+      try {
+        pset = builder.finish(wollet);
+      } catch (err) {
+        throw await this.classifyFinishError(err, "LBTC", params.amountSats);
+      }
+
+      // Ephemeral signer, zeroed in finally (per-op auth §2.3).
+      let signed;
+      {
+        let mnemonic: InstanceType<typeof Mnemonic> | null = null;
+        let signer: InstanceType<typeof Signer> | null = null;
+        try {
+          mnemonic = new Mnemonic(await this.decryptMnemonic());
+          signer = new Signer(mnemonic, network);
+          signed = signer.sign(pset);
+        } finally {
+          try {
+            signer?.free();
+            mnemonic?.free();
+          } catch {
+            // best effort
+          }
+        }
+      }
+
+      // Accounted at SIGNING time, not settlement (§4.5).
+      await this.guardrails.recordSpend(brlCents, "boltz-submarine");
 
       const finalized = wollet.finalize(signed);
       const txid = await this.syncEngine.broadcast(finalized);
