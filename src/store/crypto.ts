@@ -182,3 +182,55 @@ export async function decryptSeed(
     );
   }
 }
+
+/**
+ * Authenticated AES-256-GCM encryption of arbitrary bytes with additional
+ * authenticated data (spec §3.2.9). The pending-withdrawals store uses this
+ * with the SAME key derived from the seed store (deriveKey), binding each
+ * record's ciphertext to its AAD (the withdrawalId, or the idempotencyKey
+ * before the withdrawalId is known). An injected agent that rewrites the file
+ * cannot forge the GCM tag without the key.
+ */
+export async function aesGcmEncrypt(
+  plaintext: Uint8Array,
+  key: CryptoKey,
+  iv: Uint8Array,
+  additionalData?: Uint8Array
+): Promise<Uint8Array> {
+  const algorithm = {
+    name: "AES-GCM",
+    iv: iv as Uint8Array<ArrayBuffer>,
+    ...(additionalData ? { additionalData: additionalData as Uint8Array<ArrayBuffer> } : {})
+  };
+  const ciphertext = await globalThis.crypto.subtle.encrypt(
+    algorithm,
+    key,
+    plaintext as Uint8Array<ArrayBuffer>
+  );
+  return new Uint8Array(ciphertext);
+}
+
+/**
+ * Authenticated AES-256-GCM decryption. Throws a plain Error on
+ * authentication failure (wrong key, tampered ciphertext or mismatched AAD) —
+ * callers map that to their domain error (e.g. PENDING_RECORD_TAMPERED),
+ * unlike decryptSeed which is passphrase-specific.
+ */
+export async function aesGcmDecrypt(
+  ciphertext: Uint8Array,
+  key: CryptoKey,
+  iv: Uint8Array,
+  additionalData?: Uint8Array
+): Promise<Uint8Array> {
+  const algorithm = {
+    name: "AES-GCM",
+    iv: iv as Uint8Array<ArrayBuffer>,
+    ...(additionalData ? { additionalData: additionalData as Uint8Array<ArrayBuffer> } : {})
+  };
+  const plaintext = await globalThis.crypto.subtle.decrypt(
+    algorithm,
+    key,
+    ciphertext as Uint8Array<ArrayBuffer>
+  );
+  return new Uint8Array(plaintext);
+}
