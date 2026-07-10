@@ -7,6 +7,11 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
+    // dist/coverage are build artifacts. scripts/ is intentionally NOT ignored:
+    // it holds release-critical Node ESM helpers (publish guard, affiliate bake,
+    // smoke, openapi-diff) that must stay linted — a regression in the guard that
+    // ships an empty affiliate id would otherwise go uncaught. They get a
+    // Node-globals override below (they run directly under `node`, not in dist/).
     ignores: ["dist/", "node_modules/", "coverage/"]
   },
   js.configs.recommended,
@@ -28,11 +33,30 @@ export default tseslint.config(
   },
   {
     // Build tooling — plain Node ESM scripts (not shipped in dist). They run under
-    // Node, so `process`/`console` are legitimate globals here (unlike src/, where
-    // console is banned for the stdio JSON-RPC discipline).
+    // Node, so Node globals (process/console/fetch/AbortSignal…) are legitimate
+    // here (unlike src/, where console is banned for the stdio JSON-RPC
+    // discipline). Declared explicitly because the `globals` package is not a
+    // direct dependency of this project.
     files: ["scripts/**/*.mjs"],
     languageOptions: {
-      globals: { process: "readonly", console: "readonly" }
+      globals: {
+        process: "readonly",
+        console: "readonly",
+        fetch: "readonly",
+        URL: "readonly",
+        URLSearchParams: "readonly",
+        AbortSignal: "readonly",
+        AbortController: "readonly",
+        Buffer: "readonly",
+        setTimeout: "readonly",
+        clearTimeout: "readonly",
+        setInterval: "readonly",
+        clearInterval: "readonly",
+        queueMicrotask: "readonly",
+        structuredClone: "readonly",
+        TextEncoder: "readonly",
+        TextDecoder: "readonly"
+      }
     }
   }
 );

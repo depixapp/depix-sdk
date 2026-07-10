@@ -1,31 +1,241 @@
 # @depixapp/sdk
 
-Non-custodial Liquid wallet SDK for AI agents. An agent runs a full wallet in Node
-— its own seed, signing locally — to **pay and receive over Pix/DePix**, hold and
-convert the three Liquid assets (DePix, L-BTC, USDt), and buy gift cards. Nothing
-custodial: the seed never leaves the agent's environment and the backend never signs.
+Non-custodial Liquid wallet SDK for AI agents. An agent runs a full wallet in
+Node — its own seed, signing locally — to **pay and receive over Pix/DePix**,
+hold and convert the three Liquid assets (DePix, L-BTC, USDt), and buy gift
+cards, with **client-side guardrails** blocking anything over the owner's limits.
 
-> Status: **F3 in active implementation.** Spec: internal. Not yet published to npm.
+Nothing custodial: the seed never leaves the agent's environment and the backend
+never signs. There is also an optional **local MCP facade** (`depix-wallet-mcp`)
+so an MCP host (Claude Desktop, Claude Code, Cursor…) can drive the same wallet.
 
-## Install
+- **Runtime:** Node **≥ 22.4** (the WebSocket-stable floor), **Linux + macOS**.
+  Windows is not supported in 1.0 — use WSL.
+- **Install size:** ~25 MB base (+~25 MB when the EVM stablecoin route pulls in
+  `viem`); `npx` caches a single download.
 
 ```bash
-npm install @depixapp/sdk   # coming with 1.0.0
+npm install @depixapp/sdk
 ```
 
-## Quickstart
+---
+
+## Non-custodial by construction
+
+- The **seed lives only in the agent's environment**, encrypted at rest
+  (Argon2id → AES-256-GCM) under your passphrase. No endpoint ever receives a
+  private key.
+- **Every signature happens locally.** The backend quotes and settles Pix; it
+  never signs a Liquid transaction.
+- **Conversions are client-direct and non-custodial** (SideSwap market/peg,
+  Boltz Lightning/refund) — funds move under your key. One documented route,
+  cross-network USDt via a third-party shifter, **is custodial** and is labelled
+  as such wherever it appears (JSDoc, MCP tool description, `custodial: true` on
+  results).
+- **Guardrails are the owner's, immutable at runtime.** They defend against a
+  prompt-injected / hallucinating agent — not against the host itself. Whoever
+  controls the process controls the passphrase env + the `0600` wallet file, and
+  therefore the wallet, regardless of the tool catalog. The mitigation there is
+  blast radius: fund the agent with only what it needs.
+
+---
+
+## Quickstart 1 — Agent wallet in 5 minutes (create → back up → open)
+
+A wallet cannot hand out a receive address until its seed has been backed up
+(so no funds can ever enter a wallet with no backup).
 
 ```ts
 import { DepixWallet } from "@depixapp/sdk";
 
-const wallet = await DepixWallet.open({
-  // dataDir:    defaults to ~/.depix-wallet
-  // passphrase: defaults to $DEPIX_WALLET_PASSPHRASE
-  // apiKey:     defaults to $DEPIX_API_KEY  (sk_test_ / sk_live_)
+// Create a fresh 12-word wallet. In a real terminal (TTY) this runs an
+// interactive backup ritual. In code/CI, pass mnemonicSecured: true to accept
+// the backup consciously — the mnemonic is returned in the foreground so it is
+// impossible not to receive it.
+const { wallet, mnemonic } = await DepixWallet.create({
+  passphrase: process.env.DEPIX_WALLET_PASSPHRASE, // ≥ 12 chars
+  mnemonicSecured: true
+});
+
+// Store `mnemonic` with a human guardian (see "Fleet operators" for many
+// agents). To make an explicit backup at any time:
+const backup = await wallet.exportBackup(); // { kind: "mnemonic", mnemonic }
+await wallet.confirmBackup();               // unlocks receive addresses
+
+const address = await wallet.getReceiveAddress();
+const { balances } = await wallet.getBalances();
+await wallet.close();
+
+// Later, reopen the same wallet dir:
+const reopened = await DepixWallet.open({
+  passphrase: process.env.DEPIX_WALLET_PASSPHRASE
+});
+
+// Restoring from an existing mnemonic is born backup-confirmed:
+const restored = await DepixWallet.restore({
+  passphrase: process.env.DEPIX_WALLET_PASSPHRASE,
+  mnemonic
 });
 ```
 
-See the docs for the full flow (create → back up → fund → pay a real Pix).
+`open()` / `create()` / `restore()` read `DEPIX_WALLET_DIR` (default
+`~/.depix-wallet`), `DEPIX_WALLET_PASSPHRASE`, `DEPIX_API_KEY` and
+`DEPIX_API_BASE` from the environment when the options are omitted.
+
+---
+
+## Quickstart 2 — An agent that pays a Pix (deposit → owner pays QR → withdraw)
+
+The agent has no bank account. It receives DePix (its owner pays a Pix QR into
+it) and pays out to a Pix key via `withdraw()`, signing the Liquid transaction
+locally.
+
+```ts
+const wallet = await DepixWallet.open({
+  apiKey: process.env.DEPIX_API_KEY // sk_test_… (sandbox) or sk_live_… (prod)
+});
+
+// ── On-ramp: create a deposit QR. The OWNER (a human with a bank) pays it. ──
+const dep = await wallet.deposit({
+  amountCents: 1000,            // R$ 10.00 (R$ 5–3000 server-side)
+  payerTaxNumber: "OWNER_CPF"   // CPF/CNPJ of whoever pays the QR
+});
+console.log("Ask the owner to pay:", dep.qrCopyPaste);
+
+const paid = await wallet.waitForDeposit(dep.id, { intervalMs: 5000 });
+// paid.status === "depix_sent" → the DePix is now in the wallet.
+
+// ── Off-ramp: pay out R$ 5 to a Pix key. Signed locally with the fee output. ──
+const out = await wallet.withdraw({
+  pixKey: "destination@pix.key",
+  recipientTaxNumber: "HOLDER_CPF", // CPF/CNPJ of the Pix key's HOLDER
+  amountCents: 500,                 // R$ 5.00
+  mode: "send"                      // "send" = you send X; "payout" = they receive X
+});
+const settled = await wallet.waitForWithdrawal(out.withdrawalId, { intervalMs: 5000 });
+// settled.status === "sent", settled.liquid_txid === out.txid.
+```
+
+> **Two different people, two different documents.** `payerTaxNumber` is the
+> owner paying the deposit QR; `recipientTaxNumber` is the holder of the
+> destination Pix key. Never reuse one for the other.
+
+**Rate/limit notes for the quickstart.** Creating a deposit or withdrawal is
+capped at **2/min per key**; status reads at **30/min per endpoint** — the SDK
+paces both for you. A live key (`sk_live_`) needs the account's
+`merchant.api_access` flag (admin-granted); when WhatsApp enforcement is on, the
+owner must have WhatsApp verified in the app or deposit/withdraw return
+`whatsapp_verification_required`.
+
+### Sending, converting, gift cards
+
+```ts
+await wallet.send({ asset: "LBTC", amountSats: 5000n, address: "lq1…" });
+
+// SideSwap market swap (non-custodial): a live quote stream, then execute.
+const stream = await wallet.convert.sideswap.quote({ from: "DEPIX", to: "LBTC", amountSats: 500_000_000n });
+const quote = await stream.next();
+const swap = await stream.execute(quote);
+stream.close();
+
+// Lightning, refunds and gift cards live under wallet.convert.* / wallet.giftcards.*.
+// A documented cross-network USDt route is custodial and marked custodial: true.
+```
+
+Guardrails run on **every** signature. Over the per-tx or daily ceiling, or (with
+the allowlist on) to a destination that isn't allow-listed, the call throws a
+`GuardrailError` (`GUARDRAIL_PER_TX_LIMIT` / `GUARDRAIL_DAILY_LIMIT` /
+`GUARDRAIL_ALLOWLIST_BLOCKED`) **before anything is signed**.
+
+---
+
+## Quickstart 3 — Run the local MCP (`depix-wallet-mcp`)
+
+The SDK ships a stdio MCP server so an MCP host can drive the wallet with
+`wallet_*` tools. It runs **in the agent's environment** — the seed never
+leaves the machine. It is configured 100% by environment (no CLI flags for
+secrets), boots by `open()`-ing the wallet (never auto-creates a seed), and
+speaks JSON-RPC on **stdout** while every log line goes to **stderr** (secrets
+redacted).
+
+```bash
+npx -p @depixapp/sdk depix-wallet-mcp
+```
+
+**Claude Desktop / Claude Code** (`claude_desktop_config.json` or the MCP config):
+
+```jsonc
+{
+  "mcpServers": {
+    "depix-wallet": {
+      "command": "npx",
+      "args": ["-p", "@depixapp/sdk", "depix-wallet-mcp"],
+      "env": {
+        "DEPIX_API_KEY": "sk_live_…",
+        "DEPIX_WALLET_PASSPHRASE": "your-passphrase",
+        "DEPIX_WALLET_DIR": "/home/agent/.depix-wallet"
+      }
+    }
+  }
+}
+```
+
+Tools: `wallet_status`, `wallet_get_address`, `wallet_get_balances`,
+`wallet_list_transactions`, `wallet_send`, `wallet_create_deposit`,
+`wallet_wait_deposit`, `wallet_create_withdrawal`, `wallet_wait_withdrawal`,
+`wallet_get_guardrails`, plus swap/lightning/gift-card fast-follows. Monetary
+fields name their unit (`amount_cents` for Pix/BRL, `amount_sats` for
+sends/swaps). There is **no** tool that exports the seed/mnemonic or changes
+guardrails — those are never reachable by a tool call, even from a fully
+injected model.
+
+> **Two hosts, one wallet dir?** Each host spawns its own process; a second
+> process on the same `DEPIX_WALLET_DIR` fails fast with `WALLET_DIR_LOCKED`.
+> Point hosts at **distinct** dirs (distinct wallets) or share a single server.
+
+---
+
+## Environment variables
+
+| Variable | Required? | Default | Purpose |
+|---|---|---|---|
+| `DEPIX_WALLET_PASSPHRASE` | **Required** when a seed exists | — | Unlocks the encrypted seed (Argon2id → AES-256-GCM). **≥ 12 chars** or `WEAK_PASSPHRASE`. Never logged. |
+| `DEPIX_API_KEY` | **Required** for deposit/withdraw/status | — | `sk_test_…` (sandbox) or `sk_live_…` (production). |
+| `DEPIX_WALLET_DIR` | Optional | `~/.depix-wallet` | Wallet data dir (encrypted seed, sync state, pending/guardrail files). One process per dir (`WALLET_DIR_LOCKED`). |
+| `DEPIX_API_BASE` | Optional | `https://api.depixapp.com` | Canonical API base. |
+| `DEPIX_GUARDRAIL_PER_TX_BRL_CENTS` | Optional | `10000` (R$ 100) | Per-transaction ceiling, in BRL cents. `0`/negative is a config error; to disable, set `Number.MAX_SAFE_INTEGER` explicitly. |
+| `DEPIX_GUARDRAIL_DAILY_BRL_CENTS` | Optional | `50000` (R$ 500) | Rolling-24h ceiling, in BRL cents. |
+| `DEPIX_GUARDRAIL_ALLOWLIST` | Optional | off | JSON allowlist (`liquidAddresses`, `pixKeys`, per-rail opt-ins…). When on, any non-allow-listed / non-representable destination is fail-closed. |
+| `DEPIX_MCP_MAX_WAIT_SECONDS` | Optional | `900` | Ceiling (seconds) a `wallet_wait_*` MCP tool may block; the per-tool default is 300. |
+| `DEPIX_SDK_LOG_LEVEL` | Optional | `info` | `debug` \| `info` \| `warn` \| `error` — minimum level written to stderr. |
+
+Guardrail options passed to `open()` (`guardrails: { … }`) take precedence over
+the env, which takes precedence over the defaults. Guardrails are set **only** at
+`open()` and are immutable at runtime — there is no update method an injected
+agent could reach.
+
+> **`SIDESHIFT_AFFILIATE_ID` is a build/publish variable, not a runtime one.**
+> It is baked into the artifact at publish time (see [Publishing](#publishing))
+> and is never read at runtime.
+
+---
+
+## Fleet operators (many agents)
+
+For one agent, the simplest safe thing is for the operator to store that
+wallet's mnemonic. At scale, use the **envelope** procedure with standard tools
+(age/PGP) — this is a documented manual procedure, **not** a feature of the SDK,
+and DePix never hosts the blobs:
+
+1. The **operator** generates a recovery keypair and gives the agent only the
+   **public** key (the private key never transits).
+2. Each agent encrypts its wallet mnemonic(s) to that public key and stores the
+   ciphertext in any durable storage (it is useless without the private key).
+3. Recovery: decrypt offline with the private key → `DepixWallet.restore()`.
+
+One private key covers N wallets; the secret doesn't disappear, it changes shape.
+
+---
 
 ## Conversions
 
@@ -67,24 +277,58 @@ to its network class — `evmAddresses` / `tronAddresses`) **and** the
 `refundAddress` (`sideshiftRefundAddresses`) to be opted in. A Solana settle has
 no representable allowlist class, so it is fail-closed when the allowlist is on.
 
+---
+
+## Testing
+
+- `npm test` — offline unit / sandbox / contract suite. Set `DEPIX_SDK_OFFLINE=1`
+  to skip the read-only live-network integration checks.
+- `npm run smoke` — smokes the built `dist/` (lwk_node init, descriptor + addr[0]
+  goldens, seed-store roundtrip) after `npm run build`.
+- `npm run openapi:diff` — advisory drift check of the vendored OpenAPI fixture
+  against the live document.
+- **Mainnet e2e** (`test/e2e/mainnet.test.ts`) — opt-in, real funds, human in the
+  loop. Skipped unless `RUN_MAINNET_E2E=1` and a `sk_live_` `DEPIX_API_KEY` are
+  set; see the file header for the full prerequisites.
+
+CI runs the matrix Node **22.4 / 24 / current** × **ubuntu / macos** (Windows is
+out for 1.0).
+
+---
+
 ## Publishing
 
-The SideShift affiliate id (the DePix affiliate id — public, but not committed to
-this repo) is **baked into the package at build time**, mirroring the frontend's
-build-time substitution. The publisher **must** set `SIDESHIFT_AFFILIATE_ID` in
-the publish environment:
+The package (`version` **1.0.0**) is published **by a human** — the npm account
+uses passkey 2FA, so the publish is interactive. The **`SIDESHIFT_AFFILIATE_ID`**
+value (the DePix affiliate id — public, but never committed to this repo) is
+supplied by the **publisher's environment** and baked into the build at publish
+time (spec §5.4), mirroring the frontend's build-time substitution. It is never
+read at runtime and never served by the backend.
+
+`prepublishOnly` runs `scripts/check-affiliate-env.mjs` → `npm run build` → the
+offline test suite (`DEPIX_SDK_OFFLINE=1 npm run test`). The guard **fails the
+publish loudly** if `SIDESHIFT_AFFILIATE_ID` is unset, so a release can never ship
+without it; the build then bakes the value into
+`dist/convert/sideshift-affiliate.js`, and the published package performs **no
+runtime env read**. A dev build without the env var still succeeds but bakes an
+empty id, so SideShift calls throw `AFFILIATE_ID_MISSING` until a real build is
+published.
 
 ```bash
 SIDESHIFT_AFFILIATE_ID=<depix-affiliate-id> npm publish
 ```
 
-`prepublishOnly` runs `scripts/check-affiliate-env.mjs`, which **fails the publish**
-if the env var is unset, so a release can never ship without it. `npm run build`
-then bakes the value into `dist/convert/sideshift-affiliate.js` — the published
-package performs **no runtime env read**. A dev build without the env var succeeds
-but bakes an empty id, so SideShift calls throw `AFFILIATE_ID_MISSING` until a real
-build is published. Tests run with `SIDESHIFT_AFFILIATE_ID=test-affiliate` (wired
-in `package.json`).
+Tests and CI use `SIDESHIFT_AFFILIATE_ID=test-affiliate` (wired in `package.json`).
+Validate the tarball without publishing anything:
+
+```bash
+SIDESHIFT_AFFILIATE_ID=test-affiliate npm publish --dry-run
+```
+
+The published package contains `dist/` (compiled JS + types), `README.md` and
+`LICENSE`, and exposes the `depix-wallet-mcp` bin.
+
+---
 
 ## License
 

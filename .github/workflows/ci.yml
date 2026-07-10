@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (keeps the matrix from piling up).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Full suite × platform (spec §8.5) ──────────────────────────────────────
+  # Typecheck + lint + offline unit/sandbox/contract suite + build + smoke, on
+  # the Node versions whose bundled npm installs the vitest→vite@8→rolldown
+  # native binding cleanly. Rolldown ships per-platform bindings as optional
+  # deps, and npm < 11 mis-installs them from a lockfile (npm/cli#4828); only
+  # Node ≥ 22.9 bundles npm 11. The SDK logic these tests validate is
+  # Node-version-independent, so this is the authoritative correctness gate.
+  # The engines FLOOR (Node 22.4) is proven separately by `floor-smoke` below.
+  test:
+    name: node ${{ matrix.node }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["24", "latest"] # 24 (LTS) + current; 22.4 floor → floor-smoke
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # .npmrc pins `legacy-peer-deps=true` (the boltz peer set) + `save-exact`,
+      # so `npm ci` picks both up without extra flags.
+      - name: Install (npm ci)
+        run: npm ci
+
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Lint (eslint .)
+        run: npm run lint
+
+      - name: Test (offline unit/sandbox/contract suite)
+        env:
+          # Baked-affiliate-id source resolves to a placeholder in tests; offline
+          # skips every live-network integration test (§8.3/§8.5).
+          SIDESHIFT_AFFILIATE_ID: test-affiliate
+          DEPIX_SDK_OFFLINE: "1"
+        run: npm test
+
+      - name: Build (tsc -p tsconfig.build.json)
+        env:
+          SIDESHIFT_AFFILIATE_ID: test-affiliate
+        run: npm run build
+
+      # Smoke the COMPILED dist on this Node/OS (spec §8.5): lwk_node wasm init +
+      # Pset.addDetails export, descriptor + addr[0] goldens, and a seed-store
+      # encrypt/decrypt roundtrip (incl. dataDir lock via open()).
+      - name: Smoke (built artifact)
+        run: npm run smoke
+
+  # ── Build dist once for the floor-smoke job ────────────────────────────────
+  # Node 22.4's bundled npm (10.8.1) cannot install the rolldown native binding
+  # (npm/cli#4828), so the 22.4 cell must not install devDeps — it therefore
+  # cannot run `tsc` to build. Build the dist here on a modern Node (npm 11) and
+  # hand it to floor-smoke as an artifact. The SHIPPED runtime deps carry zero
+  # native optional bindings (all pure-JS/wasm: lwk_node is wasm), so the floor
+  # job installs them with `npm ci --omit=dev` on 22.4 cleanly.
+  build-dist:
+    name: build dist (for floor smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "latest"
+      - name: Install (npm ci)
+        run: npm ci
+      - name: Build (tsc -p tsconfig.build.json)
+        env:
+          SIDESHIFT_AFFILIATE_ID: test-affiliate
+        run: npm run build
+      - name: Upload dist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # ── Engines FLOOR proof — Node 22.4 (spec §8.5) ────────────────────────────
+  # The matrix's real purpose: prove the shipped SDK RUNS on the engines floor.
+  # Installs runtime deps ONLY (`--omit=dev` → no vitest/rolldown, so no
+  # npm/cli#4828), pulls the prebuilt dist, and runs the SAME smoke every other
+  # cell runs (lwk_node wasm init, descriptor/addr goldens, seed roundtrip). A
+  # real 22.4 runtime break surfaces here honestly, not masked by a toolchain
+  # install artifact.
+  floor-smoke:
+    name: floor smoke · node 22.4 · ${{ matrix.os }}
+    needs: build-dist
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node 22.4 (engines floor)
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.4"
+      - name: Install runtime deps only (no devDeps → no rolldown)
+        run: npm ci --omit=dev
+      - name: Download prebuilt dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Smoke (built artifact on the 22.4 floor)
+        run: npm run smoke
+
+  # ── OpenAPI drift — NON-BLOCKING (spec §8.2) ───────────────────────────────
+  # Diffs the vendored fixture (test/fixtures/openapi.json) against the live
+  # document and reports drift LOUDLY without failing the build. No deps needed:
+  # the checker uses only Node built-ins (readFile + fetch).
+  openapi-drift:
+    name: openapi drift (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "latest"
+      - name: Diff vendored OpenAPI fixture against live
+        run: npm run openapi:diff

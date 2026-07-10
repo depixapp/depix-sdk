@@ -1,17 +1,31 @@
 {
   "name": "@depixapp/sdk",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Non-custodial Liquid wallet SDK for AI agents — headless Node, local signing, Pix on/off-ramp.",
   "license": "MIT",
-  "private": true,
   "type": "module",
+  "keywords": [
+    "depix",
+    "liquid",
+    "wallet",
+    "non-custodial",
+    "pix",
+    "bitcoin",
+    "agent",
+    "mcp",
+    "sdk"
+  ],
+  "homepage": "https://github.com/depixapp/depix-sdk#readme",
+  "bugs": {
+    "url": "https://github.com/depixapp/depix-sdk/issues"
+  },
   "engines": {
     "node": ">=22.4"
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "bin": {
-    "depix-wallet-mcp": "./dist/mcp/stdio.js"
+    "depix-wallet-mcp": "dist/mcp/stdio.js"
   },
   "exports": {
     ".": {
@@ -30,7 +44,9 @@
     "lint": "eslint .",
     "test": "SIDESHIFT_AFFILIATE_ID=test-affiliate vitest run",
     "test:watch": "SIDESHIFT_AFFILIATE_ID=test-affiliate vitest",
-    "prepublishOnly": "node scripts/check-affiliate-env.mjs && npm run build"
+    "smoke": "node scripts/smoke.mjs",
+    "openapi:diff": "node scripts/openapi-diff.mjs",
+    "prepublishOnly": "node scripts/check-affiliate-env.mjs && npm run build && DEPIX_SDK_OFFLINE=1 npm run test"
   },
   "repository": {
     "type": "git",
