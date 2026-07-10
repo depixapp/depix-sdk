@@ -92,6 +92,37 @@ export interface StatusReadResponse {
   sandbox?: boolean;
 }
 
+// ─── merchant light-profile (§5.6) ───────────────────────────────────────────
+
+/** GET /api/me — merchant identity probe (scope merchant_read). */
+export interface MeWireResponse {
+  merchant_id: string;
+  name: string;
+  username: string | null;
+  merchant_slug: string;
+  is_live: boolean;
+  created_at: string;
+}
+
+/**
+ * PATCH /api/merchants/me body — ONLY the 5 LIGHT fields an API key may edit
+ * (§5.6). liquid_address/split_address/cnpj are deliberately absent: they are
+ * owner/admin-only and rejected by the server on the key path.
+ */
+export interface MerchantUpdateWireBody {
+  business_name?: string;
+  website?: string | null;
+  logo_url?: string | null;
+  default_callback_url?: string | null;
+  default_redirect_url?: string | null;
+}
+
+/** PATCH /api/merchants/me success shape. */
+export interface MerchantUpdateWireResponse {
+  success: true;
+  merchant_slug: string;
+}
+
 // ─── fetch seam ──────────────────────────────────────────────────────────
 
 export interface FetchResponseLike {
@@ -123,7 +154,7 @@ export interface ApiClientOptions {
 }
 
 interface RequestSpec {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "PATCH";
   path: string;
   bucket: string;
   throttle: Throttle;
@@ -235,6 +266,40 @@ export class DepixApiClient {
       path: `/api/withdrawals/${encodeURIComponent(id)}`,
       bucket: `withdraw-status:${this.apiKey}`,
       throttle: this.readThrottle
+    });
+    return data;
+  }
+
+  // ─── merchant light-profile (§5.6) ─────────────────────────────────────────
+
+  /**
+   * GET /api/me — the merchant identity behind the key (scope merchant_read).
+   * The read surface wallet.merchant.get() maps to. Shares the read throttle.
+   */
+  async getMe(): Promise<MeWireResponse> {
+    const { data } = await this.request<MeWireResponse>({
+      method: "GET",
+      path: "/api/me",
+      bucket: `me:${this.apiKey}`,
+      throttle: this.readThrottle
+    });
+    return data;
+  }
+
+  /**
+   * PATCH /api/merchants/me — edit the LIGHT profile fields (scope
+   * merchant_write, §5.6). No Idempotency-Key: the update is state-idempotent
+   * (last-write-wins on the same fields), so the generic 5xx retry is safe. The
+   * server rejects any owner-only field (liquid_address/cnpj/password) with a
+   * 400 validation_error and emails the owner on success (G11) — no client work.
+   */
+  async patchMerchantProfile(body: MerchantUpdateWireBody): Promise<MerchantUpdateWireResponse> {
+    const { data } = await this.request<MerchantUpdateWireResponse>({
+      method: "PATCH",
+      path: "/api/merchants/me",
+      bucket: `merchant-update:${this.apiKey}`,
+      throttle: this.readThrottle,
+      body
     });
     return data;
   }

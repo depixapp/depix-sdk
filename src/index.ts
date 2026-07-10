@@ -31,6 +31,7 @@ export {
   DepixApiError,
   DepixSdkError,
   GuardrailError,
+  MerchantError,
   SideSwapError,
   WalletError,
   WithdrawContractError,
@@ -98,10 +99,21 @@ export {
   type DepositRequestBody,
   type DepositWireResponse,
   type FetchLike,
+  type MeWireResponse,
+  type MerchantUpdateWireBody,
+  type MerchantUpdateWireResponse,
   type StatusReadResponse,
   type WithdrawRequestBody,
   type WithdrawWireResponse
 } from "./api/client.js";
+
+// ─── merchant light-profile (§5.6): wallet.merchant.* ────────────────────────
+export {
+  MerchantNamespace,
+  type MerchantProfile,
+  type MerchantUpdateFields,
+  type MerchantUpdateResult
+} from "./merchant.js";
 
 export { type WaitOptions } from "./flows/status.js";
 export { type WithdrawMode } from "./flows/withdraw.js";
