@@ -9,9 +9,12 @@
 // lose precision), and every money field carries its unit in the name.
 
 import type {
+  ConversionResumeSummary,
   DepositParams,
   DepositResult,
   GuardrailReadout,
+  PendingItem,
+  RecoverySummary,
   ResumeSummary,
   SendParams,
   SendResult,
@@ -99,6 +102,8 @@ export interface McpWalletFacade {
   withdraw(params: WithdrawParams): Promise<WithdrawResult>;
   waitForDeposit(id: string, options?: WaitOptions): Promise<StatusReadResponse>;
   waitForWithdrawal(id: string, options?: WaitOptions): Promise<StatusReadResponse>;
+  recover(): Promise<RecoverySummary>;
+  getPending(): Promise<PendingItem[]>;
   readonly convert: McpConvertFacade;
   readonly giftcards: McpGiftcardsFacade;
 }
@@ -110,6 +115,8 @@ export interface ToolContext {
   apiKeyConfigured: boolean;
   /** Crash-resume summary captured at boot (§3.2.9). */
   bootResume: ResumeSummary;
+  /** Conversion crash-resume summary captured at boot (§5 recovery wiring). */
+  bootConversions: ConversionResumeSummary;
 }
 
 // ── reshapers ──
@@ -166,6 +173,35 @@ function waitOptions(
   return { intervalMs: intervalSeconds * 1000, timeoutMs: timeoutSeconds * 1000 };
 }
 
+function withdrawalsResumeToOutput(r: ResumeSummary) {
+  return {
+    resumed: r.resumed,
+    rebroadcast: r.rebroadcast,
+    reposted: r.reposted,
+    discarded: r.discarded,
+    failed: r.failed,
+  };
+}
+
+function conversionsResumeToOutput(c: ConversionResumeSummary) {
+  return {
+    boltz: c.boltz
+      ? {
+          submarine_resumed: c.boltz.submarineResumed,
+          submarine_refunded: c.boltz.submarineRefunded,
+          reverse_resumed: c.boltz.reverseResumed,
+          stablecoin_resumed: c.boltz.stablecoinResumed,
+          stablecoin_refunded: c.boltz.stablecoinRefunded,
+          discarded: c.boltz.discarded,
+          removed: c.boltz.removed,
+          failed: c.boltz.failed,
+        }
+      : null,
+    pegin: { pending: c.pegin.pending, cleared: c.pegin.cleared, failed: c.pegin.failed },
+    sideshift: { checked: c.sideshift.checked, refreshed: c.sideshift.refreshed, failed: c.sideshift.failed },
+  };
+}
+
 // ── handlers ──
 export async function statusTool(wallet: McpWalletFacade, ctx: ToolContext) {
   const guardrails = await wallet.getGuardrails();
@@ -174,13 +210,8 @@ export async function statusTool(wallet: McpWalletFacade, ctx: ToolContext) {
     api_key_configured: ctx.apiKeyConfigured,
     backup_confirmed: wallet.isBackupConfirmed(),
     guardrails: guardrailBudget(guardrails),
-    pending_withdrawals: {
-      resumed: ctx.bootResume.resumed,
-      rebroadcast: ctx.bootResume.rebroadcast,
-      reposted: ctx.bootResume.reposted,
-      discarded: ctx.bootResume.discarded,
-      failed: ctx.bootResume.failed,
-    },
+    pending_withdrawals: withdrawalsResumeToOutput(ctx.bootResume),
+    pending_conversions: conversionsResumeToOutput(ctx.bootConversions),
   };
 }
 
@@ -489,6 +520,53 @@ export async function listGiftcardOrdersTool(wallet: McpWalletFacade) {
  * live in the wallet method; a SideShiftApiError (upstream text) maps through the
  * SAME safe-by-default mapToolError (untrusted path) as every provider transport.
  */
+/**
+ * wallet_recover — re-run crash recovery for every rail (withdrawals §3.2.9 +
+ * conversions §5) mid-session. Zero money logic here: each rail's resume owns
+ * its own idempotency invariants (same bytes / same Idempotency-Key / persisted
+ * swap keys); this handler only maps the per-rail counters to snake_case.
+ */
+export async function recoverTool(wallet: McpWalletFacade) {
+  const r = await wallet.recover();
+  return {
+    withdrawals: withdrawalsResumeToOutput(r.withdrawals),
+    ...conversionsResumeToOutput(r),
+  };
+}
+
+function pendingItemToOutput(item: PendingItem) {
+  const out: Record<string, unknown> = {
+    rail: item.rail,
+    id: item.id,
+    state: item.state,
+    created_at: item.createdAt,
+  };
+  switch (item.rail) {
+    case "withdrawal":
+      out.withdrawal_id = item.withdrawalId;
+      out.txid = item.txid;
+      break;
+    case "boltz":
+      out.swap_type = item.swapType;
+      break;
+    case "pegin":
+      out.peg_addr = item.pegAddr;
+      out.recv_addr = item.recvAddr;
+      break;
+    case "sideshift":
+      out.shift_type = item.shiftType;
+      out.network = item.network;
+      break;
+  }
+  return out;
+}
+
+/** wallet_pending — unified read-only view over the four pending stores. */
+export async function pendingTool(wallet: McpWalletFacade) {
+  const items = await wallet.getPending();
+  return { pending: items.map(pendingItemToOutput) };
+}
+
 export async function shiftUsdtTool(
   wallet: McpWalletFacade,
   args: { network: string; amount_sats: string; settle_address: string; refund_address?: string },

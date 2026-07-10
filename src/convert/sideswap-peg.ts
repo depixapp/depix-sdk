@@ -189,6 +189,8 @@ export interface PegInResult {
   /** OUR Liquid receive address SideSwap pays L-BTC to. */
   recvAddr: string;
   expiresAt: number | null;
+  /** When the peg-in was first tracked (epoch ms). Present when read back from the store. */
+  createdAt?: number;
 }
 
 export interface PegOutParams {
@@ -348,7 +350,7 @@ export class SideSwapPeg {
   async getPendingPegIn(): Promise<PegInResult | null> {
     const rec = await this.pending.load();
     if (!rec) return null;
-    return { orderId: rec.orderId, pegAddr: rec.pegAddr, recvAddr: rec.recvAddr, expiresAt: null };
+    return { orderId: rec.orderId, pegAddr: rec.pegAddr, recvAddr: rec.recvAddr, expiresAt: null, createdAt: rec.createdAt };
   }
 
   private async buildSignBroadcastLbtc(

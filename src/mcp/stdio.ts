@@ -9,12 +9,13 @@
 // through the redacting logger.
 //
 // Boot opens the wallet (WALLET_NOT_FOUND with an actionable message if the
-// dataDir is empty — NEVER auto-creates a seed), runs crash-resume once to feed
-// wallet_status (§3.2.9), then serves. Shutdown closes the wallet, which cancels
-// in-flight Boltz watches and releases the dataDir lock (§2.4/§5.3) — no hang.
+// dataDir is empty — NEVER auto-creates a seed), runs crash-resume once for
+// BOTH withdrawals (§3.2.9) and conversions (§5) to feed wallet_status, then
+// serves. Shutdown closes the wallet, which cancels in-flight Boltz watches and
+// releases the dataDir lock (§2.4/§5.3) — no hang.
 
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { DepixWallet, type ResumeSummary } from "../wallet.js";
+import { DepixWallet, type ConversionResumeSummary, type ResumeSummary } from "../wallet.js";
 import { defaultLogger, redactSecrets } from "../logger.js";
 import { createWalletMcpServer } from "./server.js";
 import { createShutdownHandler, resolveKeyMode, resolveMaxWaitSeconds } from "./runtime.js";
@@ -23,9 +24,12 @@ async function main(): Promise<void> {
   const apiKey = process.env.DEPIX_API_KEY;
 
   // Open the existing wallet. Passphrase / dataDir / apiKey / guardrails all come
-  // from env inside open() (§2.3/§6.1). Disable the auto-resume so we can run it
-  // explicitly and surface its summary via wallet_status.
-  const wallet = await DepixWallet.open({ resumePendingWithdrawalsOnOpen: false });
+  // from env inside open() (§2.3/§6.1). Disable BOTH auto-resumes so we can run
+  // them explicitly and surface their summaries via wallet_status.
+  const wallet = await DepixWallet.open({
+    resumePendingWithdrawalsOnOpen: false,
+    resumePendingConversionsOnOpen: false,
+  });
 
   let bootResume: ResumeSummary;
   try {
@@ -35,11 +39,27 @@ async function main(): Promise<void> {
     bootResume = { resumed: 0, rebroadcast: 0, reposted: 0, discarded: 0, failed: 0 };
   }
 
+  // Conversion recovery (§5 fund-safety wiring): reconcile in-flight Boltz
+  // swaps (re-attach watch / claim / refund), the tracked SideSwap peg-in and
+  // non-terminal SideShift shifts — same boot slot as the withdrawals resume.
+  let bootConversions: ConversionResumeSummary;
+  try {
+    bootConversions = await wallet.resumePendingConversions();
+  } catch (err) {
+    defaultLogger.error("boot_conversion_resume_failed", { name: err instanceof Error ? err.name : "unknown" });
+    bootConversions = {
+      boltz: null,
+      pegin: { pending: 0, cleared: 0, failed: 0 },
+      sideshift: { checked: 0, refreshed: 0, failed: 0 },
+    };
+  }
+
   const server = createWalletMcpServer({
     wallet,
     keyMode: resolveKeyMode(apiKey),
     apiKeyConfigured: Boolean(apiKey && apiKey.startsWith("sk_")),
     bootResume,
+    bootConversions,
     maxWaitSeconds: resolveMaxWaitSeconds(),
   });
 

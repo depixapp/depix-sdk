@@ -180,6 +180,13 @@ export class BoltzConvert {
   private readonly logger: Logger;
   /** Teardown handles for every in-flight watch (status socket + reconnect timer). */
   private readonly activeUnsubs = new Set<() => void>();
+  /**
+   * Live watch handle PER swapId — dedups repeated recover()/auto-resume. A swap
+   * is watched by AT MOST one status subscription at a time; a second attach for
+   * the same swapId (a `wallet_recover` poll on a still-in-flight swap) is a no-op
+   * so watches (and their refund/claim triggers) never stack (§5.3).
+   */
+  private readonly watchesBySwap = new Map<string, () => void>();
   private disposed = false;
 
   constructor(ctx: BoltzWalletContext, deps: BoltzConvertDeps = {}) {
@@ -194,15 +201,26 @@ export class BoltzConvert {
    * watch can be torn down on dispose(). Without this a reverse/submarine watch
    * keeps its WebSocket + reconnect backoff timer alive after wallet.close()
    * (§5.3 resource hygiene). Deregisters itself when the watch unsubscribes.
+   *
+   * DEDUPED per swapId: recover()/auto-resume is advertised "safe to call
+   * repeatedly", so an agent polling `wallet_recover` on a still-in-flight swap
+   * would otherwise re-attach a FRESH watch every call — unbounded WS listeners
+   * plus a second, concurrent refund/claim trigger for the SAME swap. If a live
+   * watch already exists for this swapId we skip re-subscribing and hand back an
+   * inert teardown; the existing watch owns the single real subscription (and the
+   * single refund/claim path). The handle is freed when that watch unsubscribes,
+   * so a later attach for the same id (after it settled) works normally.
    */
   private trackedSubscribe(swapId: string, onRaw: (raw: string) => void): () => void {
     if (this.disposed) return () => {};
+    if (this.watchesBySwap.has(swapId)) return () => {};
     const raw = this.client.subscribeSwap(swapId, onRaw);
     let cleared = false;
     const wrapped = (): void => {
       if (cleared) return;
       cleared = true;
       this.activeUnsubs.delete(wrapped);
+      this.watchesBySwap.delete(swapId);
       try {
         raw();
       } catch {
@@ -210,6 +228,7 @@ export class BoltzConvert {
       }
     };
     this.activeUnsubs.add(wrapped);
+    this.watchesBySwap.set(swapId, wrapped);
     return wrapped;
   }
 
@@ -229,6 +248,7 @@ export class BoltzConvert {
       }
     }
     this.activeUnsubs.clear();
+    this.watchesBySwap.clear();
   }
 
   // ─── LN SEND (submarine) ─────────────────────────────────────────────────

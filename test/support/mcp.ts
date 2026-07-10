@@ -14,6 +14,8 @@ import type {
   DepositParams,
   DepositResult,
   GuardrailReadout,
+  PendingItem,
+  RecoverySummary,
   SendParams,
   SendResult,
   WalletBalances,
@@ -288,6 +290,41 @@ export class FakeWallet implements McpWalletFacade {
     updated_at: "2026-07-10 12:02:00",
     liquid_txid: "cc".repeat(32),
   };
+  recoverResult: RecoverySummary = {
+    withdrawals: { resumed: 1, rebroadcast: 1, reposted: 0, discarded: 0, failed: 0 },
+    boltz: {
+      submarineResumed: 1,
+      submarineRefunded: 0,
+      reverseResumed: 1,
+      stablecoinResumed: 0,
+      stablecoinRefunded: 1,
+      discarded: 0,
+      removed: 2,
+      failed: 0,
+    },
+    pegin: { pending: 1, cleared: 1, failed: 0 },
+    sideshift: { checked: 2, refreshed: 2, failed: 0 },
+  };
+  pendingItems: PendingItem[] = [
+    {
+      rail: "withdrawal",
+      id: "idem-1",
+      state: "signed",
+      createdAt: 1_720_000_000_000,
+      withdrawalId: "wd_1",
+      txid: "cc".repeat(32),
+    },
+    { rail: "boltz", id: "sub_1", state: "locked_up", createdAt: 1_720_000_001_000, swapType: "submarine" },
+    { rail: "pegin", id: "peg_1", state: "pending", createdAt: null, pegAddr: "bc1qpeg", recvAddr: "lq1qrecv" },
+    {
+      rail: "sideshift",
+      id: "shift_1",
+      state: "waiting",
+      createdAt: 1_720_000_002_000,
+      shiftType: "send",
+      network: "tron",
+    },
+  ];
   lastWaitOptions?: WaitOptions;
 
   private rec(method: keyof McpWalletFacade, args: unknown[]): void {
@@ -336,6 +373,14 @@ export class FakeWallet implements McpWalletFacade {
     this.rec("waitForWithdrawal", [id, options]);
     this.lastWaitOptions = options;
     return this.withdrawStatus;
+  }
+  async recover(): Promise<RecoverySummary> {
+    this.rec("recover", []);
+    return this.recoverResult;
+  }
+  async getPending(): Promise<PendingItem[]> {
+    this.rec("getPending", []);
+    return this.pendingItems;
   }
 
   /** Convenience: find the args of the last recorded call to `method`. */
