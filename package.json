@@ -10,6 +10,9 @@
   },
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "depix-wallet-mcp": "./dist/mcp/stdio.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -33,6 +36,7 @@
     "url": "git+https://github.com/depixapp/depix-sdk.git"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@noble/curves": "2.2.0",
     "@noble/hashes": "2.2.0",
     "@scure/base": "2.2.0",
@@ -42,7 +46,8 @@
     "hash-wasm": "4.12.0",
     "liquidjs-lib": "6.0.2-liquid.38",
     "lwk_node": "0.18.0",
-    "viem": "2.54.1"
+    "viem": "2.54.1",
+    "zod": "3.25.76"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",

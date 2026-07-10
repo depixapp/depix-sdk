@@ -11,6 +11,7 @@ export {
   type DepositParams,
   type DepositResult,
   type GiftcardsWalletOptions,
+  type GuardrailReadout,
   type MnemonicBackup,
   type OpenOptions,
   type RestoreOptions,
@@ -251,3 +252,31 @@ export {
   MAX_STORED_ORDERS,
   type StoredGiftcardOrder
 } from "./giftcards/store.js";
+
+// ─── local MCP facade (§6): depix-wallet-mcp stdio + createWalletMcpServer ────
+// The `wallet_*` tools (G10) run in the agent's environment; the stdio bin is
+// src/mcp/stdio.ts. This barrel lets a host embed the same server in-process.
+export {
+  createWalletMcpServer,
+  WALLET_TOOL_NAMES,
+  SERVER_NAME as WALLET_MCP_SERVER_NAME,
+  SERVER_TITLE as WALLET_MCP_SERVER_TITLE,
+  DEFAULT_SERVER_VERSION as WALLET_MCP_DEFAULT_VERSION,
+  ToolError,
+  mapToolError,
+  missingApiKeyError,
+  AUTO_RETRY_CODES,
+  SCOPES,
+  resolveKeyMode,
+  resolveMaxWaitSeconds,
+  createShutdownHandler,
+  MAX_WAIT_SECONDS_CEILING,
+  DEFAULT_WAIT_SECONDS,
+  DEFAULT_POLL_INTERVAL_SECONDS,
+  MIN_POLL_INTERVAL_SECONDS,
+  SEND_ASSETS,
+  type CreateWalletMcpServerOptions,
+  type McpWalletFacade,
+  type ToolContext,
+  type Scope
+} from "./mcp/index.js";

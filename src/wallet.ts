@@ -249,6 +249,21 @@ export interface WithdrawResult {
   sandbox?: true;
 }
 
+/**
+ * Read-only guardrail config + current rolling-24h usage (§4). Feeds the
+ * wallet_get_guardrails / wallet_status MCP tools (§6.2) and any programmatic
+ * caller. There is deliberately NO setter — the config is the owner's,
+ * immutable at runtime (G9); this only exposes it.
+ */
+export interface GuardrailReadout {
+  usedCents: number;
+  dailyLimitCents: number;
+  perTxLimitCents: number;
+  remainingCents: number;
+  /** Whether the owner turned the allowlist on (§4.3). */
+  allowlistEnabled: boolean;
+}
+
 export interface ResumeSummary {
   /** rebroadcast + reposted. */
   resumed: number;
@@ -322,6 +337,8 @@ export class DepixWallet {
   private readonly updateStore: UpdateStore;
   private readonly syncEngine: SyncEngine;
   private readonly guardrails: Guardrails;
+  /** Resolved, immutable guardrail config (§4.2/G9) — read by getGuardrails(). */
+  private readonly guardrailConfig: ResolvedGuardrailConfig;
   private readonly valuator: BrlValuator;
   /** Conversions (§5): wallet.convert.sideswap.* (PR4); PR5 adds .boltz. */
   readonly convert: ConvertNamespace;
@@ -383,6 +400,7 @@ export class DepixWallet {
         return epoch;
       }
     };
+    this.guardrailConfig = parts.guardrailConfig;
     this.guardrails = new Guardrails({
       dataDir: parts.dataDir,
       config: parts.guardrailConfig,
@@ -854,6 +872,24 @@ export class DepixWallet {
     this.assertOpen();
     const wollet = await this.ensureWollet();
     return this.syncEngine.sync(wollet);
+  }
+
+  /**
+   * Read the guardrail config + current rolling-24h usage (read-only, §4). Feeds
+   * the wallet_get_guardrails / wallet_status MCP tools (§6.2). A missing/tampered
+   * state with the seed-bound marker set reports the window as FULL (fail-closed,
+   * §4.5) — honest for status. No setter exists (immutable at runtime, G9).
+   */
+  async getGuardrails(): Promise<GuardrailReadout> {
+    this.assertOpen();
+    const usage = await this.guardrails.usage();
+    return {
+      usedCents: usage.usedCents,
+      dailyLimitCents: usage.dailyLimitCents,
+      perTxLimitCents: usage.perTxLimitCents,
+      remainingCents: usage.remainingCents,
+      allowlistEnabled: this.guardrailConfig.allowlist.enabled
+    };
   }
 
   // ─── money ─────────────────────────────────────────────────────────────
