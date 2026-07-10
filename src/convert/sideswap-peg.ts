@@ -19,6 +19,7 @@
 
 import { ASSETS } from "../assets.js";
 import { Address, TxBuilder, mainnetNetwork } from "../engine/lwk.js";
+import type { Pset } from "../engine/lwk.js";
 import { ConversionError, SideSwapError, WalletError } from "../errors.js";
 import { liquidScriptHex } from "../guardrails/allowlist.js";
 import type { ConvertWalletHooks } from "./hooks.js";
@@ -238,27 +239,34 @@ export class SideSwapPeg {
    */
   async pegIn(): Promise<PegInResult> {
     this.hooks.assertOpen();
-    const existing = await this.pending.load();
-    if (existing) {
-      throw new ConversionError(
-        "PEG_IN_ALREADY_PENDING",
-        `a peg-in is already in flight (order ${existing.orderId}, funding BTC address ${existing.pegAddr}). ` +
-          "Complete or wait for it (or let it expire after 7 days) before starting another."
-      );
-    }
-    const recvAddr = await this.hooks.getReceiveAddress(); // backup-gated (§2.9)
-    const client = this.clientFactory({});
-    try {
-      await client.connect();
-      const peg = await client.pegIn({ recvAddr });
-      if (!peg.pegAddr || !peg.orderId) {
-        throw new SideSwapError(SS_ERROR.INVALID_RESPONSE, "SideSwap peg-in returned no peg address / order id");
+    // Serialize the single-in-flight check with its own write (and with the
+    // swap / peg-out paths) through the SAME op mutex peg-out uses. Otherwise two
+    // concurrent pegIn() calls can both read existing===null, both open a
+    // SideSwap order, and the second put() clobbers the first — losing a tracking
+    // record and defeating the PEG_IN_ALREADY_PENDING invariant (§5.2 TOCTOU).
+    return this.hooks.runExclusive(async () => {
+      const existing = await this.pending.load();
+      if (existing) {
+        throw new ConversionError(
+          "PEG_IN_ALREADY_PENDING",
+          `a peg-in is already in flight (order ${existing.orderId}, funding BTC address ${existing.pegAddr}). ` +
+            "Complete or wait for it (or let it expire after 7 days) before starting another."
+        );
       }
-      await this.pending.put({ orderId: peg.orderId, pegAddr: peg.pegAddr, recvAddr });
-      return { orderId: peg.orderId, pegAddr: peg.pegAddr, recvAddr, expiresAt: peg.expiresAt ?? null };
-    } finally {
-      client.disconnect();
-    }
+      const recvAddr = await this.hooks.getReceiveAddress(); // backup-gated (§2.9)
+      const client = this.clientFactory({});
+      try {
+        await client.connect();
+        const peg = await client.pegIn({ recvAddr });
+        if (!peg.pegAddr || !peg.orderId) {
+          throw new SideSwapError(SS_ERROR.INVALID_RESPONSE, "SideSwap peg-in returned no peg address / order id");
+        }
+        await this.pending.put({ orderId: peg.orderId, pegAddr: peg.pegAddr, recvAddr });
+        return { orderId: peg.orderId, pegAddr: peg.pegAddr, recvAddr, expiresAt: peg.expiresAt ?? null };
+      } finally {
+        client.disconnect();
+      }
+    });
   }
 
   /**
@@ -360,29 +368,58 @@ export class SideSwapPeg {
     }
     const expectedScriptHex = liquidScriptHex(pegAddr);
 
-    let builder = new TxBuilder(network);
-    builder = builder.addLbtcRecipient(addr, amountSats);
-    let pset;
+    // lwk MOVES (consumes) its input into wasm on addLbtcRecipient()/finish()
+    // (each consumes the builder), sign() (consumes `pset`) and finalize()
+    // (consumes `signed`) — verified in lwk_wasm.js via `__destroy_into_raw()`.
+    // So the builder and `signed` are reclaimed by those moves; only `addr`
+    // (borrowed, never moved), the surviving `finalized`, and — on a pre-sign
+    // abort (a recipient-pin failure) — `pset`, actually leak. Free those.
+    let psetTakenBySigner = false;
+    let pset: InstanceType<typeof Pset> | undefined;
+    let finalized: InstanceType<typeof Pset> | undefined;
     try {
-      pset = builder.finish(wollet);
-    } catch (err) {
-      throw this.classifyFinishError(err);
+      let builder = new TxBuilder(network);
+      builder = builder.addLbtcRecipient(addr, amountSats);
+      try {
+        pset = builder.finish(wollet);
+      } catch (err) {
+        throw this.classifyFinishError(err);
+      }
+
+      // Re-pin the single external recipient (defense in depth): exactly one, paying
+      // the peg address, L-BTC, not exceeding the authorized amount.
+      const recipients = inspectPegOutRecipients(pset, wollet as unknown as LwkPegWolletLike);
+      assertPegOutRecipient(recipients, {
+        lbtcId: ASSETS.LBTC.id,
+        authorizedSats: amountSats,
+        expectedScriptHex
+      });
+
+      psetTakenBySigner = true; // signWithEphemeralSigner → signer.sign() consumes `pset`
+      const signed = await signWithEphemeralSigner(this.hooks, pset);
+      finalized = wollet.finalize(signed); // consumes `signed`
+      // Account at signing time (§4.5), BEFORE broadcast (parity with send()).
+      await this.hooks.recordSpend(brlCents, "sideswap-pegout");
+      return await this.hooks.broadcast(finalized);
+    } finally {
+      try {
+        finalized?.free?.();
+      } catch {
+        /* best effort */
+      }
+      if (!psetTakenBySigner) {
+        try {
+          pset?.free?.();
+        } catch {
+          /* best effort */
+        }
+      }
+      try {
+        addr.free?.();
+      } catch {
+        /* best effort */
+      }
     }
-
-    // Re-pin the single external recipient (defense in depth): exactly one, paying
-    // the peg address, L-BTC, not exceeding the authorized amount.
-    const recipients = inspectPegOutRecipients(pset, wollet as unknown as LwkPegWolletLike);
-    assertPegOutRecipient(recipients, {
-      lbtcId: ASSETS.LBTC.id,
-      authorizedSats: amountSats,
-      expectedScriptHex
-    });
-
-    const signed = await signWithEphemeralSigner(this.hooks, pset);
-    const finalized = wollet.finalize(signed);
-    // Account at signing time (§4.5), BEFORE broadcast (parity with send()).
-    await this.hooks.recordSpend(brlCents, "sideswap-pegout");
-    return this.hooks.broadcast(finalized);
   }
 
   private classifyFinishError(err: unknown): WalletError {

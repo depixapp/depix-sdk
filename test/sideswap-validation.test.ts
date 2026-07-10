@@ -17,7 +17,9 @@ import { isDepixSdkError } from "../src/errors.js";
 const SCRIPT = "0014abcdef0011223344556677889900aabbccddeeff"; // our receive scriptPubkey hex
 const OTHER_SCRIPT = "0014ffffffffffffffffffffffffffffffffffffffff";
 const LBTC = ASSETS.LBTC.id;
+const DEPIX = ASSETS.DEPIX.id; // the from-asset in these fixtures
 const RECV = 1000n;
+const SEND = 2000n;
 
 function inspection(over: Partial<SwapPsetInspection> = {}): SwapPsetInspection {
   return {
@@ -26,7 +28,13 @@ function inspection(over: Partial<SwapPsetInspection> = {}): SwapPsetInspection 
     ...over
   };
 }
-const expectValid = { expectedScriptHex: SCRIPT, recvAssetId: LBTC, recvAmountSats: RECV };
+const expectValid = {
+  expectedScriptHex: SCRIPT,
+  recvAssetId: LBTC,
+  recvAmountSats: RECV,
+  fromAssetId: DEPIX,
+  sendAmountSats: SEND
+};
 const isSwapFail = (e: unknown): boolean => isDepixSdkError(e, "SWAP_VALIDATION_FAILED");
 
 describe("assertSwapPsetPaysAndBalances — PRIMARY hard check (§5.1)", () => {
@@ -95,6 +103,48 @@ describe("assertSwapPsetPaysAndBalances — SECONDARY check is FAIL-CLOSED (G3, 
   it("rejects a non-positive quoted recv amount", () => {
     expect(() =>
       assertSwapPsetPaysAndBalances(inspection(), { ...expectValid, recvAmountSats: 0n })
+    ).toThrow();
+  });
+});
+
+describe("assertSwapPsetPaysAndBalances — SEND-SIDE bound is FAIL-CLOSED (§5.1/G3 change-diversion)", () => {
+  // recv side always valid; we vary only the FROM (sent) asset's net. selectSwapUtxos
+  // overshoots largest-first, so a dealer that shrinks/omits our change makes us
+  // overpay the from-asset — the recv-only checks above are blind to it.
+  const withFromNet = (fromNet: bigint): SwapPsetInspection =>
+    inspection({ netBalances: new Map([[LBTC, RECV], [DEPIX, fromNet]]) });
+
+  it("passes the honest path: from-net == -sendAmount (change correctly returned)", () => {
+    expect(() => assertSwapPsetPaysAndBalances(withFromNet(-SEND), expectValid)).not.toThrow();
+  });
+
+  it("passes within the network-fee slack (from-net a little beyond -sendAmount)", () => {
+    expect(() => assertSwapPsetPaysAndBalances(withFromNet(-(SEND + 4_000n)), expectValid)).not.toThrow();
+  });
+
+  it("passes exactly at sendAmount + slack, rejects one base unit over (slack = 5_000)", () => {
+    expect(() => assertSwapPsetPaysAndBalances(withFromNet(-(SEND + 5_000n)), expectValid)).not.toThrow();
+    expect(() => assertSwapPsetPaysAndBalances(withFromNet(-(SEND + 5_001n)), expectValid)).toThrow();
+  });
+
+  it("FAIL-CLOSED: a shrunk/omitted change (whole UTXO consumed) aborts, unsigned", () => {
+    // Dealer omits our change: a 1,000,000-unit UTXO fully spent to send 2000.
+    expect(() => assertSwapPsetPaysAndBalances(withFromNet(-1_000_000n), expectValid)).toThrow();
+    try {
+      assertSwapPsetPaysAndBalances(withFromNet(-1_000_000n), expectValid);
+    } catch (e) {
+      expect(isSwapFail(e)).toBe(true);
+    }
+  });
+
+  it("passes when the from-asset is absent (zero outflow — cannot overpay us)", () => {
+    // Only the recv side present in the net balances → sentFrom = 0.
+    expect(() => assertSwapPsetPaysAndBalances(inspection(), expectValid)).not.toThrow();
+  });
+
+  it("rejects a non-positive quoted send amount", () => {
+    expect(() =>
+      assertSwapPsetPaysAndBalances(withFromNet(-SEND), { ...expectValid, sendAmountSats: 0n })
     ).toThrow();
   });
 });

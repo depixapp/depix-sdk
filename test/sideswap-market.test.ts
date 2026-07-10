@@ -183,6 +183,28 @@ describe("execute() — fail-closed validation aborts before recording/broadcast
     expect(client.takerSignCalls).toHaveLength(0);
     stream.close();
   });
+
+  it("a SHRUNK/OMITTED change (from-net beyond sendAmount + slack) aborts: no record, no taker_sign", async () => {
+    const client = new FakeSideSwapClient();
+    // Dealer pays us the exact recv (LBTC +5) but consumes a whole 1,000,000-unit
+    // DEPIX UTXO to send 1000 — pocketing our change. The send-side bound catches it.
+    const changeDiversionSigner = async (
+      _p: string,
+      validate: (i: SwapPsetInspection) => void
+    ): Promise<string> => {
+      validate({ outputScriptsHex: [EXPECTED_SCRIPT], netBalances: new Map([[LBTC, 5n], [DEPIX, -1_000_000n]]) });
+      return "NEVER";
+    };
+    const { hooks, spies } = makeHooks();
+    const market = makeMarket(hooks, client, changeDiversionSigner);
+    const { stream, quote } = await openStreamWithQuote(market, client);
+
+    await expect(stream.execute(quote)).rejects.toSatisfy((e) => isDepixSdkError(e, "SWAP_VALIDATION_FAILED"));
+    expect(client.getQuoteCalls).toEqual(["Q1"]);
+    expect(spies.record).toHaveLength(0);
+    expect(client.takerSignCalls).toHaveLength(0);
+    stream.close();
+  });
 });
 
 describe("execute() — quote TTL guard (§5.1)", () => {

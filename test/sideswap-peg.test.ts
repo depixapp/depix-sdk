@@ -129,4 +129,27 @@ describe("pegIn — one in flight at a time (§5.2)", () => {
     expect(stored).toMatchObject({ orderId: "peg_order_in", pegAddr: "bc1qpegin", recvAddr: "lq1qmyreceive" });
     expect(client.disconnectCount).toBeGreaterThan(0);
   });
+
+  it("serializes concurrent pegIn() through the op mutex — the second gets PEG_IN_ALREADY_PENDING (§5.2 TOCTOU)", async () => {
+    // A real serializing runExclusive (the op mutex): the check→write critical
+    // section now runs inside it, so two concurrent calls cannot both observe
+    // existing===null. Without the fix both would open a SideSwap order and the
+    // second put() would clobber the first.
+    let tail: Promise<unknown> = Promise.resolve();
+    const serialize = <T>(fn: () => Promise<T>): Promise<T> => {
+      const run = tail.then(fn);
+      tail = run.catch(() => {});
+      return run;
+    };
+    const { hooks } = makeHooks(dataDir, { runExclusive: serialize });
+    const peg = new SideSwapPeg({ hooks, pending, clientFactory: () => client });
+
+    const [a, b] = await Promise.allSettled([peg.pegIn(), peg.pegIn()]);
+    expect([a.status, b.status].sort()).toEqual(["fulfilled", "rejected"]);
+    const rejected = (a.status === "rejected" ? a : b) as PromiseRejectedResult;
+    expect(isDepixSdkError(rejected.reason, "PEG_IN_ALREADY_PENDING")).toBe(true);
+    // Only ONE SideSwap order was opened — no clobbered tracking record.
+    expect(client.pegInCalls).toHaveLength(1);
+    expect(await pending.load()).toMatchObject({ orderId: "peg_order_in" });
+  });
 });

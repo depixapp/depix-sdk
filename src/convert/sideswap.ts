@@ -98,6 +98,10 @@ export interface SwapValidationExpectation {
   recvAssetId: string;
   /** Quoted recv amount in base units. */
   recvAmountSats: bigint;
+  /** Liquid asset id (hex) of the SENT (from) side — bounds the change-diversion guard. */
+  fromAssetId: string;
+  /** Quoted send amount in base units — the MOST of the from-asset we agreed to part with. */
+  sendAmountSats: bigint;
 }
 
 /**
@@ -201,6 +205,34 @@ function validationFailed(message: string): ConversionError {
 }
 
 /**
+ * Fail-closed slack (base units) allowed on the SENT asset's net outflow ABOVE
+ * the quoted sendAmount. Rationale: the dealer BUILDS the swap PSET and
+ * `selectSwapUtxos` overshoots (largest-first, stopping at the first UTXO that
+ * covers the send), so a hostile/compromised dealer could shrink or omit our
+ * change output and make us part with up to a whole selected UTXO instead of
+ * `sendAmount` — while paying us the exact quoted recv, so the recv-side ±1%
+ * check stays blind (spec §5.1 only mandates the recv check; this is the §5.1/G3
+ * hardening on the send side). We therefore cap the from-asset net outflow at
+ * `sendAmountSats + this slack`. The slack only has to absorb the Liquid NETWORK
+ * FEE, and only when the from-asset IS L-BTC (the fee is paid in L-BTC out of our
+ * own inputs); for a non-BTC from-asset the fee is a separate L-BTC output, so
+ * the from-asset net is exactly `sendAmountSats`. A confidential Liquid swap tx
+ * is at most a few thousand discounted vB, and Liquid's floor is 0.1 sat/vB
+ * (~a few hundred sats); 5_000 base units is a generous ceiling on that (it also
+ * absorbs a dealer fee-bumping toward ~1 sat/vB) while collapsing the diversion
+ * exposure from ~a whole UTXO down to ≤ 5_000 — the same "no human at the preview
+ * screen" reasoning that drove the recv-side fail-closed (G3).
+ */
+const SEND_NET_FEE_SLACK_SATS = 5_000n;
+
+/** Amount of `assetId` this PSET spends from the wallet (0 if it nets non-negative). */
+function netSpentOf(netBalances: ReadonlyMap<string, bigint>, assetId: string): bigint {
+  const net =
+    netBalances.get(assetId) ?? netBalances.get(assetId.toLowerCase()) ?? netBalances.get(assetId.toUpperCase());
+  return typeof net === "bigint" && net < 0n ? -net : 0n;
+}
+
+/**
  * Validate a swap PSET inspection against the pinned quote (port of
  * validateSwapPsetOutput, wallet.js:2343-2432, with the G3 fail-closed change).
  *
@@ -223,6 +255,9 @@ export function assertSwapPsetPaysAndBalances(
   }
   if (expect.recvAmountSats <= 0n) {
     throw validationFailed("quoted recvAmountSats must be positive");
+  }
+  if (expect.sendAmountSats <= 0n) {
+    throw validationFailed("quoted sendAmountSats must be positive");
   }
   // SECONDARY SANITY CHECK — FAIL-CLOSED in the SDK (G3, diverges from frontend).
   if (inspection.netBalances === null) {
@@ -248,6 +283,18 @@ export function assertSwapPsetPaysAndBalances(
   if (net < expect.recvAmountSats - tolerance || net > expect.recvAmountSats + tolerance) {
     throw validationFailed(
       `PSET amount diverges >1% from the quote (got ${net}, expected ${expect.recvAmountSats}).`
+    );
+  }
+  // SEND-SIDE FAIL-CLOSED BOUND (§5.1/G3 hardening) — the recv checks above are
+  // blind to our change output, so a hostile dealer could pay us the exact recv
+  // while pocketing our overshoot change. Cap the from-asset outflow: what leaves
+  // us must not exceed the quoted send amount plus a network-fee slack. A missing
+  // from-asset key means zero from-outflow (cannot overpay) → passes.
+  const sentFrom = netSpentOf(inspection.netBalances, expect.fromAssetId);
+  if (sentFrom > expect.sendAmountSats + SEND_NET_FEE_SLACK_SATS) {
+    throw validationFailed(
+      `PSET spends ${sentFrom} of the sent asset, above the quoted ${expect.sendAmountSats} + ${SEND_NET_FEE_SLACK_SATS} fee slack — ` +
+        "failing closed (§5.1/G3 change-diversion guard, no human at the preview screen)."
     );
   }
 }
@@ -406,22 +453,47 @@ export function makeForeignPsetSigner(hooks: ConvertWalletHooks): ForeignPsetSig
         cause: err
       });
     }
-    // Foreign PSET — populate derivation paths / witness scripts before the
-    // signer touches it (idempotent on complete PSETs).
+    // lwk MOVES (consumes) a Pset into wasm on sign() and finalize() — verified in
+    // lwk_wasm.js: both do `pset.__destroy_into_raw()`. So the source `pset` is
+    // reclaimed by sign() and the intermediate `signed` by finalize(); freeing
+    // either again would be a double-free (UB). Only the surviving `finalized`
+    // leaks in the happy path, and the source `pset` leaks when we ABORT BEFORE
+    // signing (e.g. a fail-closed validate) — those are the ones we free here.
+    let psetTakenBySigner = false;
+    let finalized: InstanceType<typeof Pset> | undefined;
     try {
-      pset.addDetails(wollet);
-    } catch (err) {
-      throw new ConversionError(
-        "SWAP_VALIDATION_FAILED",
-        "could not associate the swap PSET with the wallet for validation",
-        { cause: err }
-      );
+      // Foreign PSET — populate derivation paths / witness scripts before the
+      // signer touches it (idempotent on complete PSETs).
+      try {
+        pset.addDetails(wollet);
+      } catch (err) {
+        throw new ConversionError(
+          "SWAP_VALIDATION_FAILED",
+          "could not associate the swap PSET with the wallet for validation",
+          { cause: err }
+        );
+      }
+      const inspection = inspectSwapPset(pset as unknown as LwkPsetLike, wollet as unknown as LwkWolletLike);
+      validate(inspection); // throws SWAP_VALIDATION_FAILED (fail-closed) — BEFORE signing
+      psetTakenBySigner = true; // signWithEphemeralSigner → signer.sign() consumes `pset`
+      const signed = await signWithEphemeralSigner(hooks, pset);
+      finalized = wollet.finalize(signed); // consumes `signed`
+      return finalized.toString();
+    } finally {
+      try {
+        finalized?.free?.();
+      } catch {
+        /* best effort */
+      }
+      // Free the source PSET only if the signer never took ownership of it.
+      if (!psetTakenBySigner) {
+        try {
+          pset.free?.();
+        } catch {
+          /* best effort */
+        }
+      }
     }
-    const inspection = inspectSwapPset(pset as unknown as LwkPsetLike, wollet as unknown as LwkWolletLike);
-    validate(inspection); // throws SWAP_VALIDATION_FAILED (fail-closed) — BEFORE signing
-    const signed = await signWithEphemeralSigner(hooks, pset);
-    const finalized = wollet.finalize(signed);
-    return finalized.toString();
   };
 }
 
@@ -549,6 +621,7 @@ export class SwapQuoteStream {
 
     const { hooks, client, from, signForeignPset, expectedScriptHex } = this.deps;
     const recvAssetId = ASSETS[quote.to].id;
+    const fromAssetId = ASSETS[from].id;
 
     return hooks.runExclusive(async () => {
       // Guardrail on the SENT side in BRL (§4.3) — BEFORE anything signs. Market
@@ -572,7 +645,9 @@ export class SwapQuoteStream {
         assertSwapPsetPaysAndBalances(inspection, {
           expectedScriptHex,
           recvAssetId,
-          recvAmountSats: quote.recvAmountSats
+          recvAmountSats: quote.recvAmountSats,
+          fromAssetId,
+          sendAmountSats: quote.sendAmountSats
         })
       );
 
