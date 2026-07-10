@@ -1,10 +1,10 @@
-// The high-level INTENT layer (PR-B): wallet.quote() + wallet.convert().
+// The high-level INTENT layer (PR-B/PR-C): wallet.quote() + wallet.convert().
 //
 // quote({from, to, network, amount})   → EVERY candidate route (single- and
 //   multi-hop) with per-leg estimates. No policy: the SDK never ranks or picks
 //   beyond a stable ordering — the AGENT chooses.
-// convert({from, to, network, amount}) → executes exactly ONE single-hop route
-//   and hides the provider mechanics behind one call:
+// convert({from, to, network, amount}) → executes exactly ONE route and hides
+//   the provider mechanics behind one call:
 //     sideswap market — the quote stream (quote → next → execute → close) is
 //       managed internally; the agent never sees a stream or a quote TTL.
 //     boltz           — the `completion` promise the provider methods return is
@@ -15,19 +15,23 @@
 //   on timeout it returns status "pending" with an actionable nextStep — funds
 //   in flight are never an exception.
 //
+// MULTI-HOP (PR-C): a route with hops > 1 executes end to end — legs run in
+//   sequence on REAL settled amounts behind a durable encrypted plan with
+//   crash recovery (src/convert/multihop.ts).
+//
 // Ambiguity is a typed error, never a silent choice: without an explicit
-// `route`, convert() executes ONLY when the trio resolves to exactly one
-// single-hop table row (multi-hop compositions of that same intent are quote()
-// material, not implicit competitors). Two entry rails, an inbound intent with
-// an unknown source network, or an intent with only multi-hop candidates throw
-// MULTIPLE_ROUTES_AVAILABLE carrying every candidate; an explicitly chosen
-// multi-hop route throws MULTI_HOP_NOT_YET_AUTOMATED teaching the per-leg
-// fallback (PR-C automates it with a plan + recovery).
+// `route`, convert() executes when the trio resolves to exactly one single-hop
+// table row (multi-hop compositions of that same intent are quote() material,
+// not implicit competitors), OR when exactly ONE candidate exists at all —
+// even multi-hop (nothing to choose between; the locked rule is
+// "1 route → execute"). Anything else throws MULTIPLE_ROUTES_AVAILABLE
+// carrying every candidate.
 //
 // GUARDRAILS: this layer adds NO signing path. Every money-moving leg delegates
 // to the provider methods (§5.1–§5.4), each of which routes through the §4.3
 // choke point (valuate → enforce → sign → record) under the wallet op mutex —
-// the intent layer cannot bypass it by construction.
+// the intent layer cannot bypass it by construction. A multi-hop plan counts
+// its value ONCE (§4.3 count-once — see multihop.ts/continuation.ts).
 
 import { MAINNET_ASSET_ID_TO_KEY, type AssetKey } from "../assets.js";
 import { ConversionError, WalletError, type ErrorDetails } from "../errors.js";
@@ -43,6 +47,9 @@ import type {
   ToStablecoinResult
 } from "./boltz/convert.js";
 import type { BoltzConvert } from "./boltz/convert.js";
+import type { Logger } from "../logger.js";
+import { executeMultiHopRoute } from "./multihop.js";
+import type { ConversionPlanStore } from "./plan-store.js";
 import type { ConvertNamespace, SideSwapNamespace } from "./namespace.js";
 import { enumerateRoutes, type ConvertIntent, type Route, type RouteLeg } from "./routes.js";
 import type {
@@ -121,6 +128,23 @@ export interface IntentDeps {
   pollIntervalMs?: number;
   /** Default settle wait bound (default 15 min); per-call timeoutMs overrides. */
   settleTimeoutMs?: number;
+  /**
+   * Durable, encrypted multi-hop conversion-plan store (PR-C). null/absent on a
+   * view-only/wiped wallet (no seed key) — multi-hop convert() is then refused
+   * with a per-leg fallback instruction.
+   */
+  planStore?: ConversionPlanStore | null;
+  /**
+   * Probe a Boltz swap's stored state by swapId (multi-hop recovery). Reads the
+   * SAME durable swap store boltz.resume() drives; absent on a seedless wallet.
+   */
+  probeBoltzSwap?: (swapId: string) => Promise<{ type: string; state: string } | null>;
+  /** Plan id factory (tests inject deterministic ids). Default: crypto.randomUUID. */
+  newPlanId?: () => string;
+  /** Clock injection (plan createdAt). Default Date.now. */
+  now?: () => number;
+  /** Logger for the multi-hop executor/recovery (default: the module logger). */
+  logger?: Logger;
 }
 
 /** Advanced/testing overrides for the intent layer (ConvertNamespaceOptions.intent). */
@@ -245,7 +269,8 @@ function routeForDetails(route: Route): Record<string, unknown> {
   };
 }
 
-function legAsConvertCall(leg: RouteLeg): string {
+/** A leg as an explicit single-hop convert() call — the manual/per-leg fallback text. */
+export function legAsConvertCall(leg: RouteLeg): string {
   const fromNetwork = leg.fromNetwork !== "liquid" ? `, fromNetwork: '${leg.fromNetwork}'` : "";
   return `convert({ from: '${leg.from}', to: '${leg.to}', network: '${leg.network}'${fromNetwork}, amount: <bigint> })`;
 }
@@ -512,57 +537,42 @@ function resolveSingleRoute(params: ConvertParams): Route {
     route = found;
   } else {
     // The routing table maps each trio to its designated SINGLE-HOP provider —
-    // that unique row executes directly. Anything else (two entry rails, no
-    // single-hop row, only multi-hop compositions) is ambiguity the SDK refuses
-    // to resolve: the agent compares via quote() and passes `route`.
+    // that unique row executes directly. A trio with exactly ONE candidate of
+    // any shape also executes (locked rule: "1 route → execute" — a single
+    // multi-hop candidate leaves nothing to choose between). Anything else
+    // (two entry rails, several compositions) is ambiguity the SDK refuses to
+    // resolve: the agent compares via quote() and passes `route`.
     const singleHop = routes.filter((r) => r.hops === 1);
-    if (singleHop.length !== 1) {
-      // Two shapes reach here: (a) >1 candidate — genuine ambiguity the SDK won't
-      // resolve; (b) exactly ONE candidate that happens to be multi-hop — nothing
-      // to choose between, it simply needs >1 hop. Same error code (the recourse is
-      // identical: quote() then per-leg convert()), but a clearer message for (b) so
-      // "1 candidate route(s) … the SDK does not choose for you" doesn't confuse.
-      const onlyMultiHop = routes.length === 1;
-      const message = onlyMultiHop
-        ? `The only route for this intent needs ${routes[0]!.hops} hops — the SDK does not auto-run ` +
-          `multi-hop conversions; run each leg as its own single-hop convert().`
-        : `${routes.length} candidate route(s) resolve this intent — the SDK does not choose for you.`;
-      throw conversionError("MULTIPLE_ROUTES_AVAILABLE", message, {
-        routes: routes.map(routeForDetails),
-        nextStep:
-          "call wallet.quote({ from, to, network, amount }) to compare estimates (fees, receipts, custodial " +
-          "flags), then pass your choice back: wallet.convert({ ..., route: '<route id>' }). A multi-hop " +
-          "candidate is not yet automated — run each leg as its own single-hop convert() " +
-          "(a leg's received amount feeds the next leg's amount)."
-      });
+    if (singleHop.length === 1) {
+      // Custodial single-hop auto-executes BY DESIGN. For USDT-liquid → USDT-external
+      // the only single-hop row is `sideshift.send` (custodial), so convert() runs it
+      // without an explicit `route` — the "one single-hop row ⇒ execute it" rule is
+      // provider-agnostic; there is no allowCustodial opt-in. Custody is DISCLOSED, not
+      // gated: quote() surfaces `custodial:true` per route BEFORE running, and the
+      // ConvertResult carries `custodial:true` AFTER. An integrator who wants a
+      // non-custodial path passes the multi-hop boltz route id to convert({ route }).
+      route = singleHop[0]!;
+    } else if (routes.length === 1) {
+      route = routes[0]!;
+    } else {
+      throw conversionError(
+        "MULTIPLE_ROUTES_AVAILABLE",
+        `${routes.length} candidate route(s) resolve this intent — the SDK does not choose for you.`,
+        {
+          routes: routes.map(routeForDetails),
+          nextStep:
+            "call wallet.quote({ from, to, network, amount }) to compare estimates (fees, receipts, custodial " +
+            "flags), then pass your choice back: wallet.convert({ ..., route: '<route id>' }). Multi-hop " +
+            "candidates execute end to end (sequential legs behind a crash-safe persisted plan)."
+        }
+      );
     }
-    // Custodial single-hop auto-executes BY DESIGN. For USDT-liquid → USDT-external
-    // the only single-hop row is `sideshift.send` (custodial), so convert() runs it
-    // without an explicit `route` — the "one single-hop row ⇒ execute it" rule is
-    // provider-agnostic; there is no allowCustodial opt-in. Custody is DISCLOSED, not
-    // gated: quote() surfaces `custodial:true` per route BEFORE running, and the
-    // ConvertResult carries `custodial:true` AFTER. An integrator who wants a
-    // non-custodial path passes the multi-hop boltz route id to convert({ route }).
-    route = singleHop[0]!;
-  }
-
-  if (route.hops > 1) {
-    throw conversionError(
-      "MULTI_HOP_NOT_YET_AUTOMATED",
-      `Route ${route.id} needs ${route.hops} hops; automated multi-hop execution ships in a later release.`,
-      {
-        route: routeForDetails(route),
-        nextStep:
-          "you can do this today by chaining single-hop conversions — run each leg as its own convert(): " +
-          route.legs.map((leg, i) => `${i + 1}) ${legAsConvertCall(leg)}`).join("; ") +
-          " — use each leg's received amount as the next leg's amount."
-      }
-    );
   }
   return route;
 }
 
-function requireAddress(params: ConvertParams, leg: RouteLeg, what: string): string {
+/** Require the FINAL destination address a route leg delivers to (typed error). */
+export function requireConvertAddress(params: ConvertParams, leg: RouteLeg, what: string): string {
   const address = typeof params.address === "string" ? params.address.trim() : "";
   if (!address) {
     throw new WalletError("INVALID_ADDRESS", `This route needs a destination: ${what}.`, {
@@ -576,7 +586,23 @@ function requireAddress(params: ConvertParams, leg: RouteLeg, what: string): str
   return address;
 }
 
-interface ExecuteContext {
+/** Require the BOLT11 invoice a lightning-exit leg pays (typed error). */
+export function requireConvertInvoice(params: ConvertParams): string {
+  const invoice = typeof params.invoice === "string" ? params.invoice.trim() : "";
+  if (!invoice) {
+    throw new WalletError("INVALID_ADDRESS", "A lightning conversion pays a BOLT11 invoice.", {
+      details: {
+        nextStep:
+          "pass `invoice` — the BOLT11 invoice to pay (its embedded amount governs; `amount` is " +
+          "used only for quoting). The lightning payee is allowlist-gated when the allowlist is ON (§4.3)."
+      }
+    });
+  }
+  return invoice;
+}
+
+/** Per-execution settle/wait knobs shared by the leg executors. */
+export interface ExecuteContext {
   route: Route;
   wait: boolean;
   timeoutMs: number;
@@ -640,7 +666,7 @@ async function executePegOut(
   deps: IntentDeps,
   ctx: ExecuteContext
 ): Promise<ConvertResult> {
-  const address = requireAddress(params, leg, "the BTC address the peg-out pays");
+  const address = requireConvertAddress(params, leg, "the BTC address the peg-out pays");
   // Guardrail (§4.3: BRL ceilings + btcAddress allowlist) runs inside pegOut().
   const peg = await deps.sideswap.pegOut({ recvAddr: address, amountSats: params.amount });
   const base = {
@@ -681,16 +707,7 @@ async function executePayLightning(
   deps: IntentDeps,
   ctx: ExecuteContext
 ): Promise<ConvertResult> {
-  const invoice = typeof params.invoice === "string" ? params.invoice.trim() : "";
-  if (!invoice) {
-    throw new WalletError("INVALID_ADDRESS", "A lightning conversion pays a BOLT11 invoice.", {
-      details: {
-        nextStep:
-          "pass `invoice` — the BOLT11 invoice to pay (its embedded amount governs; `amount` is " +
-          "used only for quoting). The lightning payee is allowlist-gated when the allowlist is ON (§4.3)."
-      }
-    });
-  }
+  const invoice = requireConvertInvoice(params);
   // Guardrail (§4.3) runs inside payLightningInvoice via the wallet's L-BTC lockup.
   const swap = await deps.getBoltz().payLightningInvoice({ invoice });
   const base = { route: ctx.route, custodial: false, trackingId: swap.swapId };
@@ -751,7 +768,7 @@ async function executeToStablecoin(
   deps: IntentDeps,
   ctx: ExecuteContext
 ): Promise<ConvertResult> {
-  const address = requireAddress(params, leg, `the ${leg.network} address the ${leg.to} is delivered to`);
+  const address = requireConvertAddress(params, leg, `the ${leg.network} address the ${leg.to} is delivered to`);
   // Guardrail (§4.3: BRL ceilings + evm/tron allowlist) runs inside toStablecoin.
   const swap = await deps.getBoltz().toStablecoin({
     asset: leg.to as StablecoinAsset,
@@ -791,7 +808,7 @@ async function executeSideshiftSend(
   deps: IntentDeps,
   ctx: ExecuteContext
 ): Promise<ConvertResult> {
-  const address = requireAddress(params, leg, `the ${leg.network} address the USDT is delivered to`);
+  const address = requireConvertAddress(params, leg, `the ${leg.network} address the USDT is delivered to`);
   const refundAddress = typeof params.refundAddress === "string" ? params.refundAddress.trim() : "";
   // Guardrail (§4.3: BRL ceilings + settle/refund allowlist) runs inside send().
   const shift = await deps.sideshift.send({
@@ -879,22 +896,17 @@ async function executeSideshiftReceive(
 }
 
 /**
- * Execute ONE single-hop conversion intent. Resolves the route from the trio,
- * refuses to choose among multiple candidates (MULTIPLE_ROUTES_AVAILABLE) and
- * refuses multi-hop (MULTI_HOP_NOT_YET_AUTOMATED — PR-C automates it). Waits
- * for settlement by default; every non-terminal result carries a nextStep.
+ * Execute ONE route leg via its provider method. `params.amount` is the leg's
+ * INPUT amount (for a multi-hop continuation leg: the REAL settled output of
+ * the previous leg, never an estimate). Shared by the single-hop path and the
+ * multi-hop executor/recovery (multihop.ts).
  */
-export async function convertIntent(params: ConvertParams, deps: IntentDeps): Promise<ConvertResult> {
-  validateIntent(params);
-  const route = resolveSingleRoute(params);
-  const leg = route.legs[0]!;
-  const ctx: ExecuteContext = {
-    route,
-    wait: params.wait ?? true,
-    timeoutMs: params.timeoutMs ?? deps.settleTimeoutMs ?? DEFAULT_SETTLE_TIMEOUT_MS,
-    intervalMs: deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
-  };
-
+export async function executeLeg(
+  leg: RouteLeg,
+  params: ConvertParams,
+  deps: IntentDeps,
+  ctx: ExecuteContext
+): Promise<ConvertResult> {
   switch (leg.method) {
     case "swap":
       return executeMarketSwap(leg, params, deps, ctx);
@@ -913,6 +925,28 @@ export async function convertIntent(params: ConvertParams, deps: IntentDeps): Pr
     case "receive":
       return executeSideshiftReceive(leg, params, deps, ctx);
   }
+}
+
+/**
+ * Execute ONE conversion intent. Resolves the route from the trio (refusing to
+ * choose among multiple candidates — MULTIPLE_ROUTES_AVAILABLE) and executes
+ * it: single-hop directly, multi-hop end to end behind a persisted plan with
+ * crash recovery (PR-C, multihop.ts). Waits for settlement by default; every
+ * non-terminal result carries a nextStep.
+ */
+export async function convertIntent(params: ConvertParams, deps: IntentDeps): Promise<ConvertResult> {
+  validateIntent(params);
+  const route = resolveSingleRoute(params);
+  const ctx: ExecuteContext = {
+    route,
+    wait: params.wait ?? true,
+    timeoutMs: params.timeoutMs ?? deps.settleTimeoutMs ?? DEFAULT_SETTLE_TIMEOUT_MS,
+    intervalMs: deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS
+  };
+  if (route.hops > 1) {
+    return executeMultiHopRoute(route, params, deps, ctx);
+  }
+  return executeLeg(route.legs[0]!, params, deps, ctx);
 }
 
 // ─── wallet facade: callable convert() carrying the advanced namespaces ───────

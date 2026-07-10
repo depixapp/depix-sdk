@@ -304,6 +304,7 @@ export class FakeWallet implements McpWalletFacade {
     },
     pegin: { pending: 1, cleared: 1, failed: 0 },
     sideshift: { checked: 2, refreshed: 2, failed: 0 },
+    plans: { checked: 1, advanced: 1, completed: 1, needsReview: 0, discarded: 0, failed: 0 },
   };
   pendingItems: PendingItem[] = [
     {

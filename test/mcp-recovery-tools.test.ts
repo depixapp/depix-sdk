@@ -125,6 +125,7 @@ describe("wallet_status folds the boot conversion-resume summary", () => {
         },
         pegin: { pending: 1, cleared: 0, failed: 0 },
         sideshift: { checked: 1, refreshed: 1, failed: 0 },
+        plans: { checked: 1, advanced: 0, completed: 0, needsReview: 1, discarded: 0, failed: 0 },
       },
     });
     const out = sc(await client.callTool({ name: "wallet_status", arguments: {} }));
@@ -142,6 +143,7 @@ describe("wallet_status folds the boot conversion-resume summary", () => {
       },
       pegin: { pending: 1, cleared: 0, failed: 0 },
       sideshift: { checked: 1, refreshed: 1, failed: 0 },
+      plans: { checked: 1, advanced: 0, completed: 0, needs_review: 1, discarded: 0, failed: 0 },
     });
   });
 
@@ -153,6 +155,7 @@ describe("wallet_status folds the boot conversion-resume summary", () => {
       boltz: null,
       pegin: { pending: 0, cleared: 0, failed: 0 },
       sideshift: { checked: 0, refreshed: 0, failed: 0 },
+      plans: { checked: 0, advanced: 0, completed: 0, needs_review: 0, discarded: 0, failed: 0 },
     });
   });
 });

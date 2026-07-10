@@ -17,6 +17,7 @@ export {
   type OpenOptions,
   type PegInResumeSummary,
   type PendingBoltzSwapItem,
+  type PendingConversionPlanItem,
   type PendingItem,
   type PendingItemBase,
   type PendingPegInItem,
@@ -198,6 +199,29 @@ export {
   type RouteLegQuote,
   type RouteQuote
 } from "./convert/intent.js";
+// Multi-hop execution (PR-C): durable encrypted plans + crash recovery.
+// runAsPlanContinuation/activePlanContinuation (continuation.ts) are
+// deliberately NOT exported: entering the count-once context is reserved to
+// the multi-hop executor — a public entry point would be a guardrail bypass.
+export {
+  ConversionPlanStore,
+  CONVERSION_PLANS_FILE,
+  type ConversionPlanState,
+  type ConversionPlanStoreOptions,
+  type ConversionPlanStoreReadAll,
+  type PlanLegState,
+  type StoredConversionPlan,
+  type StoredPlanIntent,
+  type StoredPlanLegResult,
+  type StoredPlanParams
+} from "./convert/plan-store.js";
+export {
+  firstValueLegIndex,
+  listPendingPlans,
+  resumeConversionPlans,
+  type PendingPlanDescriptor,
+  type PlanResumeSummary
+} from "./convert/multihop.js";
 export {
   SideSwapMarket,
   SwapQuoteStream,

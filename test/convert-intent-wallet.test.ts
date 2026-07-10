@@ -137,3 +137,190 @@ describe("wallet.quote() — full enumeration on a real wallet", () => {
     });
   });
 });
+
+// ─── PR-C: multi-hop count-once through the REAL wallet hooks ─────────────────
+//
+// The value ceilings are skipped ONLY for a leg running inside the
+// plan-continuation context whose plan AUTHENTICATES in the wallet's encrypted
+// plan store. Everything else — a direct call, a forged planId — gets the full
+// choke point; the allowlist applies even to legitimate continuations.
+
+import { readFile } from "node:fs/promises";
+import { runAsPlanContinuation } from "../src/convert/continuation.js";
+import { ConversionPlanStore, type StoredConversionPlan } from "../src/convert/plan-store.js";
+import { enumerateRoutes } from "../src/convert/routes.js";
+import type { FetchLike, FetchResponseLike } from "../src/api/client.js";
+
+const EVM_ADDR = "0x" + "a".repeat(40);
+const SIDESHIFT_ROUTE = enumerateRoutes({ from: "DEPIX", to: "USDT", network: "ethereum" }).find((r) =>
+  r.id.includes("sideshift.send")
+)!;
+
+/** Fake SideShift REST routed by path (mirrors sideshift-namespace.test.ts). */
+function fakeSideshiftFetch(): { fetchImpl: FetchLike } {
+  const fetchImpl: FetchLike = async (url) => {
+    let body: Record<string, unknown> = {};
+    if (url.endsWith("/quotes")) body = { id: "q1", rate: "0.99", settleAmount: "19.8" };
+    else if (url.endsWith("/shifts/fixed"))
+      body = { id: "SHIFT_W1", depositAddress: "lq1qdeposit", depositAmount: "20", settleAmount: "19.8", status: "waiting" };
+    else if (url.includes("/shifts/")) body = { id: "SHIFT_W1", status: "settled", settleAmount: "19.8", depositAmount: "20" };
+    const res: FetchResponseLike = {
+      ok: true,
+      status: 200,
+      headers: { get: () => null },
+      text: async () => JSON.stringify(body)
+    };
+    return res;
+  };
+  return { fetchImpl };
+}
+
+/** Open the wallet's OWN plan store from disk (same dataDir/passphrase/salt). */
+async function planStoreOf(dir: string): Promise<ConversionPlanStore> {
+  const walletFile = JSON.parse(await readFile(join(dir, "wallet.json"), "utf8")) as { salt: string };
+  return new ConversionPlanStore({ dataDir: dir, passphrase: PASSPHRASE, saltB64: walletFile.salt });
+}
+
+async function seedWalletPlan(dir: string, over: Partial<StoredConversionPlan> = {}): Promise<ConversionPlanStore> {
+  const store = await planStoreOf(dir);
+  await store.put({
+    planId: "plan-wallet-1",
+    intent: { from: "DEPIX", to: "USDT", network: "ethereum", amountSats: 100_000_000n },
+    route: SIDESHIFT_ROUTE,
+    params: { address: EVM_ADDR },
+    currentLegIndex: 1, // the continuation leg — leg 1 (index 0) already counted the value
+    legResults: [{ state: "settled", txids: ["swap_txid"], receivedSats: 2_000_000_000n, trackingId: null }],
+    state: "pending",
+    createdAt: 1,
+    ...over
+  });
+  return store;
+}
+
+describe("multi-hop count-once (§4.3) — the wallet's guardrail hooks", () => {
+  const SEND = {
+    network: "ethereum",
+    amountSats: 2_000_000_000n, // 20 USDt ≈ R$100 under the fixed quotes
+    settleAddress: EVM_ADDR
+  };
+
+  function walletOpts(extra: Record<string, unknown> = {}) {
+    const { fetchImpl } = fakeSideshiftFetch();
+    const sendUsdtCalls: Array<{ depositAddress: string; amountSats: bigint; brlCents: number }> = [];
+    const opts = {
+      dataDir,
+      passphrase: PASSPHRASE,
+      mnemonic: KNOWN_MNEMONIC,
+      quotes: QUOTES,
+      guardrails: { perTxLimitBrlCents: 5_000, dailyLimitBrlCents: 5_000 }, // R$50 — the R$100 send busts it
+      convert: {
+        sideshift: {
+          fetchImpl,
+          affiliateId: "test-affiliate",
+          sendUsdt: async (p: { depositAddress: string; amountSats: bigint; brlCents: number }) => {
+            sendUsdtCalls.push(p);
+            return { txid: "usdt_send_txid" };
+          }
+        }
+      },
+      ...extra
+    };
+    return { opts, sendUsdtCalls };
+  }
+
+  it("a DIRECT send over the caps is blocked (GUARDRAIL_PER_TX_LIMIT) — no bypass without a plan", async () => {
+    const { opts, sendUsdtCalls } = walletOpts();
+    wallet = await open(opts as Parameters<typeof open>[0]);
+    await expect(wallet.convert.sideshift.send(SEND)).rejects.toSatisfy((e) =>
+      isDepixSdkError(e, "GUARDRAIL_PER_TX_LIMIT")
+    );
+    expect(sendUsdtCalls).toHaveLength(0);
+  });
+
+  it("the SAME send as an authenticated plan continuation skips ONLY the value ceilings and executes", async () => {
+    const { opts, sendUsdtCalls } = walletOpts();
+    wallet = await open(opts as Parameters<typeof open>[0]);
+    await seedWalletPlan(dataDir);
+    const result = await runAsPlanContinuation("plan-wallet-1", () => wallet.convert.sideshift.send(SEND));
+    expect(result.shiftId).toBe("SHIFT_W1");
+    expect(sendUsdtCalls).toHaveLength(1);
+    // The continuation recorded NOTHING extra: the window still has room —
+    // count-once means the R$100 leg-2 value never re-entered the accounting.
+    const usage = await wallet.getGuardrails();
+    expect(usage.usedCents).toBe(0);
+  });
+
+  it("a FORGED planId does not bypass anything (fail closed to full enforcement)", async () => {
+    const { opts, sendUsdtCalls } = walletOpts();
+    wallet = await open(opts as Parameters<typeof open>[0]);
+    // No such plan in the store.
+    await expect(
+      runAsPlanContinuation("plan-forged", () => wallet.convert.sideshift.send(SEND))
+    ).rejects.toSatisfy((e) => isDepixSdkError(e, "GUARDRAIL_PER_TX_LIMIT"));
+    expect(sendUsdtCalls).toHaveLength(0);
+  });
+
+  it("a plan still ON its value leg does not authorize a skip (only legs PAST the first outflow leg)", async () => {
+    const { opts, sendUsdtCalls } = walletOpts();
+    wallet = await open(opts as Parameters<typeof open>[0]);
+    await seedWalletPlan(dataDir, { currentLegIndex: 0, legResults: [] });
+    await expect(
+      runAsPlanContinuation("plan-wallet-1", () => wallet.convert.sideshift.send(SEND))
+    ).rejects.toSatisfy((e) => isDepixSdkError(e, "GUARDRAIL_PER_TX_LIMIT"));
+    expect(sendUsdtCalls).toHaveLength(0);
+  });
+
+  it("the allowlist still gates a legitimate continuation leg's destination", async () => {
+    const { opts, sendUsdtCalls } = walletOpts({
+      guardrails: {
+        perTxLimitBrlCents: 100_000,
+        dailyLimitBrlCents: 100_000,
+        allowlist: { enabled: true, evmAddresses: [] } // nothing allowed on EVM
+      }
+    });
+    wallet = await open(opts as Parameters<typeof open>[0]);
+    await seedWalletPlan(dataDir);
+    await expect(
+      runAsPlanContinuation("plan-wallet-1", () => wallet.convert.sideshift.send(SEND))
+    ).rejects.toSatisfy((e) => isDepixSdkError(e, "GUARDRAIL_ALLOWLIST_BLOCKED"));
+    expect(sendUsdtCalls).toHaveLength(0);
+  });
+});
+
+describe("multi-hop plans in wallet.getPending() and wallet.recover()", () => {
+  it("getPending() lists an in-flight plan; recover() finalizes a settled exit leg and removes it", async () => {
+    const { fetchImpl } = fakeSideshiftFetch();
+    wallet = await open({
+      dataDir,
+      passphrase: PASSPHRASE,
+      mnemonic: KNOWN_MNEMONIC,
+      quotes: QUOTES,
+      convert: { sideshift: { fetchImpl, affiliateId: "test-affiliate" } }
+    });
+    const store = await seedWalletPlan(dataDir, {
+      currentLegIndex: 1,
+      legResults: [
+        { state: "settled", txids: ["swap_txid"], receivedSats: 2_000_000_000n, trackingId: null },
+        { state: "pending", txids: ["usdt_send_txid"], receivedSats: null, trackingId: "SHIFT_W1" }
+      ]
+    });
+
+    const pending = await wallet.getPending();
+    const planItem = pending.find((i) => i.rail === "plan");
+    expect(planItem).toMatchObject({
+      rail: "plan",
+      id: "plan-wallet-1",
+      state: "pending",
+      routeId: SIDESHIFT_ROUTE.id,
+      hops: 2,
+      currentLeg: 2
+    });
+
+    // recover(): the shift probes "settled" (fake REST) → the plan completes.
+    const summary = await wallet.recover();
+    expect(summary.plans.checked).toBe(1);
+    expect(summary.plans.completed).toBe(1);
+    expect(await store.count()).toBe(0);
+    expect((await wallet.getPending()).filter((i) => i.rail === "plan")).toHaveLength(0);
+  });
+});

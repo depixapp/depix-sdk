@@ -407,26 +407,33 @@ describe("convertIntent — route resolution (no policy: the agent chooses)", ()
     });
   });
 
-  it("throws MULTIPLE_ROUTES_AVAILABLE when the only resolved route is multi-hop and no route was passed", async () => {
+  it("a single multi-hop candidate RESOLVES (locked rule: 1 route → execute) — without a plan store it fails with the view-only refusal, not ambiguity", async () => {
+    // Full multi-hop execution is covered in convert-multihop.test.ts; these
+    // deps have no planStore (the view-only wallet shape), so the multi-hop
+    // path must refuse with a per-leg fallback — NEVER MULTIPLE_ROUTES_AVAILABLE.
     const { deps } = makeDeps();
     await expect(
-      convertIntent({ from: "DEPIX", to: "BTC", network: "lightning", amount: 1_000n }, deps)
-    ).rejects.toSatisfy((e) => isDepixSdkError(e, "MULTIPLE_ROUTES_AVAILABLE"));
+      convertIntent({ from: "DEPIX", to: "BTC", network: "lightning", amount: 1_000n, invoice: "lnbc1xyz" }, deps)
+    ).rejects.toSatisfy(
+      (e) => isDepixSdkError(e, "WALLET_NOT_FOUND") && /single-hop convert\(\)/.test(String((e as Error).message))
+    );
   });
 
-  it("throws MULTI_HOP_NOT_YET_AUTOMATED for an explicit multi-hop route, teaching the per-leg fallback", async () => {
+  it("an explicit multi-hop route id resolves to the plan machinery (no MULTI_HOP_NOT_YET_AUTOMATED)", async () => {
     const { deps } = makeDeps();
     await expect(
       convertIntent(
-        { from: "DEPIX", to: "USDT", network: "ethereum", amount: 1_000n, route: ROUTE_DEPIX_BOLTZ },
+        {
+          from: "DEPIX",
+          to: "USDT",
+          network: "ethereum",
+          amount: 1_000n,
+          route: ROUTE_DEPIX_BOLTZ,
+          address: "0xdest"
+        },
         deps
       )
-    ).rejects.toSatisfy((e) => {
-      if (!isDepixSdkError(e, "MULTI_HOP_NOT_YET_AUTOMATED")) return false;
-      const nextStep = (e as { details?: { nextStep?: string } }).details?.nextStep ?? "";
-      // The agent CAN do this today: one convert() per leg.
-      return /convert\(/.test(nextStep) && /leg/i.test(nextStep);
-    });
+    ).rejects.toSatisfy((e) => isDepixSdkError(e, "WALLET_NOT_FOUND")); // only the missing plan store blocks here
   });
 
   it("throws ROUTE_NOT_FOUND (with the candidates) for an unknown route id", async () => {

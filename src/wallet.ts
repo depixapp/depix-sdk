@@ -87,6 +87,14 @@ import {
 import type { GuardrailDestination } from "./guardrails/allowlist.js";
 import { BoltzConvert, type BoltzConvertDeps, type BoltzResumeSummary } from "./convert/boltz/convert.js";
 import { BoltzSwapStore } from "./convert/boltz/store.js";
+import { activePlanContinuation } from "./convert/continuation.js";
+import {
+  isPlanContinuationAuthorized,
+  listPendingPlans,
+  resumeConversionPlans,
+  type PlanResumeSummary
+} from "./convert/multihop.js";
+import { ConversionPlanStore } from "./convert/plan-store.js";
 import { isShiftTerminal } from "./convert/sideshift.js";
 import { GiftcardsNamespace } from "./giftcards/namespace.js";
 import { GiftcardConfigClient, type GiftcardConfigSource } from "./giftcards/config.js";
@@ -324,6 +332,12 @@ export interface ConversionResumeSummary {
   boltz: BoltzResumeSummary | null;
   pegin: PegInResumeSummary;
   sideshift: SideShiftResumeSummary;
+  /**
+   * Multi-hop conversion plans resumed from the last completed leg (PR-C):
+   * crash-between-legs plans re-drive the next leg with the previous leg's
+   * REAL settled amount; in-flight legs are probed, never re-executed.
+   */
+  plans: PlanResumeSummary;
 }
 
 /** wallet.recover() result — every rail's recovery summary (§3.2.9 + §5). */
@@ -334,8 +348,8 @@ export interface RecoverySummary extends ConversionResumeSummary {
 /** Common shape of one in-flight item from wallet.getPending(). */
 export interface PendingItemBase {
   /** Which rail the item is in flight on. */
-  rail: "withdrawal" | "boltz" | "pegin" | "sideshift";
-  /** Rail-scoped id: Idempotency-Key | Boltz swapId | peg orderId | shift id. */
+  rail: "withdrawal" | "boltz" | "pegin" | "sideshift" | "plan";
+  /** Rail-scoped id: Idempotency-Key | Boltz swapId | peg orderId | shift id | planId. */
   id: string;
   /** Rail-specific state/status string. */
   state: string;
@@ -367,16 +381,31 @@ export interface PendingSideShiftItem extends PendingItemBase {
   network: string;
 }
 
+/** An in-flight multi-hop conversion plan (PR-C) — the legs it chains show up
+ *  on their own rails (boltz/sideshift/pegin) once started. */
+export interface PendingConversionPlanItem extends PendingItemBase {
+  rail: "plan";
+  /** The route being executed (its id lists every leg). */
+  routeId: string;
+  hops: number;
+  /** 1-based leg currently being driven. */
+  currentLeg: number;
+  /** Manual instruction when the plan is parked needs_review. */
+  note?: string;
+}
+
 /**
  * One in-flight item from wallet.getPending() — a unified, read-only view over
- * the four durable stores (§3.2.9 withdrawals, §5.3 Boltz swaps, §5.2 peg-in,
- * §5.4 SideShift shifts). Metadata only — NEVER key material.
+ * the five durable stores (§3.2.9 withdrawals, §5.3 Boltz swaps, §5.2 peg-in,
+ * §5.4 SideShift shifts, PR-C multi-hop conversion plans). Metadata only —
+ * NEVER key material.
  */
 export type PendingItem =
   | PendingWithdrawalItem
   | PendingBoltzSwapItem
   | PendingPegInItem
-  | PendingSideShiftItem;
+  | PendingSideShiftItem
+  | PendingConversionPlanItem;
 
 function resolveDataDir(explicit?: string): string {
   return explicit ?? process.env.DEPIX_WALLET_DIR ?? join(homedir(), ".depix-wallet");
@@ -470,6 +499,12 @@ export class DepixWallet {
   // getPending() can read the in-flight swaps without expanding BoltzConvert's
   // public surface (reads are metadata-only; records carry swap-scoped keys).
   private readonly boltzSwapStore: BoltzSwapStore | null;
+  // Multi-hop conversion plans (PR-C) — encrypted with the same seed-derived
+  // key material as the Boltz store (AAD = planId). null on a view-only/wiped
+  // wallet (no key → no crash-safe plan → multi-hop convert() is refused).
+  // Also consulted by the guardrail hooks to authenticate a continuation leg's
+  // count-once skip (§4.3) — a planId that does not decrypt gets FULL enforcement.
+  private readonly conversionPlanStore: ConversionPlanStore | null;
   private file: WalletFileV1;
   private lock: DirLock | null;
   private wollet: Wollet | null = null;
@@ -565,6 +600,15 @@ export class DepixWallet {
             logger: this.logger
           })
         : null;
+    this.conversionPlanStore =
+      parts.passphrase && parts.file.salt
+        ? new ConversionPlanStore({
+            dataDir: parts.dataDir,
+            passphrase: parts.passphrase,
+            saltB64: parts.file.salt,
+            logger: this.logger
+          })
+        : null;
     this.convertNamespace = this.boltzSwapStore
       ? {
           boltz: new BoltzConvert(
@@ -591,8 +635,26 @@ export class DepixWallet {
       getReceiveAddress: () => this.getReceiveAddress(),
       decryptMnemonic: () => this.decryptMnemonic(),
       valuate: (asset, amountSats) => this.valuator.valuate(asset, amountSats),
-      enforceGuardrails: (intent) => this.guardrails.enforce(intent),
-      recordSpend: (brlCents, kind) => this.guardrails.recordSpend(brlCents, kind),
+      // §4.3 with the multi-hop count-once carve-out (PR-C): a leg running
+      // inside an AUTHENTICATED plan-continuation context already had its
+      // intent's value counted at the plan's first outflow leg — skip only the
+      // VALUE ceilings; the allowlist still gates this leg's destinations.
+      // Everything else (including a forged/tampered planId) gets the full
+      // choke point — fail closed.
+      enforceGuardrails: async (intent) => {
+        if (await this.isAuthorizedPlanContinuation()) {
+          this.guardrails.checkAllowlist(intent.destinations ?? []);
+          return;
+        }
+        return this.guardrails.enforce(intent);
+      },
+      // Count-once accounting: a continuation leg's spend was already recorded
+      // (in full) when the plan's first outflow leg signed — recording it again
+      // would double-charge the same money against the rolling-24h window.
+      recordSpend: async (brlCents, kind) => {
+        if (await this.isAuthorizedPlanContinuation()) return;
+        return this.guardrails.recordSpend(brlCents, kind);
+      },
       runExclusive: (fn) => this.opMutex.runExclusive(fn),
       broadcast: (finalized) => this.syncEngine.broadcast(finalized),
       assertOpen: () => this.assertOpen(),
@@ -607,7 +669,26 @@ export class DepixWallet {
     // path of its own; every money-moving leg still crosses the §4.3 choke
     // point inside the provider methods. wallet.convert stays the home of the
     // advanced namespaces AND becomes callable with a high-level intent.
-    this.intentDeps = intentDepsFromNamespace(convertNs, parts.convert?.intent);
+    // PR-C adds the multi-hop seams: the encrypted plan store and a read-only
+    // probe over the Boltz swap store (recovery reconciles in-flight exit legs
+    // against the SAME records boltz.resume() drives).
+    this.intentDeps = {
+      ...intentDepsFromNamespace(convertNs, parts.convert?.intent),
+      planStore: this.conversionPlanStore,
+      logger: this.logger,
+      ...(this.boltzSwapStore
+        ? {
+            probeBoltzSwap: async (swapId: string) => {
+              // A missing record means the swap CONCLUDED (Boltz removes
+              // terminal records); a TAMPERED record throws instead — the plan
+              // resume then keeps the plan for the next pass rather than
+              // closing it over unauthenticated data.
+              const record = await this.boltzSwapStore!.get(swapId);
+              return record ? { type: record.type, state: record.state } : null;
+            }
+          }
+        : {})
+    };
     // Pass assertOpen so the callable facade fails fast on a closed wallet — parity
     // with wallet.quote() (§ money methods all assertOpen() first).
     this.convert = makeConvertFacade(convertNs, this.intentDeps, () => this.assertOpen());
@@ -1482,7 +1563,8 @@ export class DepixWallet {
     const summary: ConversionResumeSummary = {
       boltz: null,
       pegin: { pending: 0, cleared: 0, failed: 0 },
-      sideshift: { checked: 0, refreshed: 0, failed: 0 }
+      sideshift: { checked: 0, refreshed: 0, failed: 0 },
+      plans: { checked: 0, advanced: 0, completed: 0, needsReview: 0, discarded: 0, failed: 0 }
     };
     if (!this.lock) return summary;
 
@@ -1545,6 +1627,21 @@ export class DepixWallet {
     } catch (err) {
       summary.sideshift.failed++;
       this.logger.error("could not read the sideshift shift log — skipping its resume", {
+        error: String((err as Error)?.message ?? err)
+      });
+    }
+
+    // Multi-hop plans LAST (PR-C) — deliberately after boltz.resume() and the
+    // shift refresh above, so the per-leg probes read freshly reconciled
+    // provider state. Resumes from the last completed leg (a crash between
+    // legs re-drives the next leg with the previous leg's REAL settled
+    // amount); a started leg is never re-executed. resumeConversionPlans()
+    // never throws — the catch is belt-and-braces like the boltz rail's.
+    try {
+      summary.plans = await resumeConversionPlans(this.intentDeps, this.logger);
+    } catch (err) {
+      summary.plans.failed++;
+      this.logger.error("conversion-plan resume failed — will retry on the next resume", {
         error: String((err as Error)?.message ?? err)
       });
     }
@@ -1628,6 +1725,21 @@ export class DepixWallet {
         createdAt: shift.createdAt ?? null,
         shiftType: shift.type,
         network: shift.network
+      });
+    }
+
+    // Multi-hop conversion plans (PR-C) — a plan on disk is by definition
+    // unfinished (terminal outcomes remove it). Metadata only.
+    for (const plan of await listPendingPlans(this.intentDeps)) {
+      items.push({
+        rail: "plan",
+        id: plan.planId,
+        state: plan.state,
+        createdAt: plan.createdAt,
+        routeId: plan.routeId,
+        hops: plan.hops,
+        currentLeg: plan.currentLegIndex + 1,
+        ...(plan.note !== undefined ? { note: plan.note } : {})
       });
     }
 
@@ -1871,6 +1983,30 @@ export class DepixWallet {
   }
 
   // ─── internals ─────────────────────────────────────────────────────────
+
+  /**
+   * Whether the CURRENT call runs as a legitimate multi-hop plan continuation
+   * (§4.3 count-once, PR-C). True only when ALL hold:
+   *   1. the call is inside the plan-continuation AsyncLocalStorage context —
+   *      enterable ONLY by the multi-hop executor (continuation.ts is not part
+   *      of the public surface, so no agent-driven call can mark itself);
+   *   2. the claimed plan AUTHENTICATES in the encrypted plan store (AES-GCM,
+   *      AAD = planId, seed-derived key — a forged/tampered record fails);
+   *   3. the plan's current leg is strictly PAST its first outflow leg — i.e.
+   *      the intent's value was already counted in full.
+   * Anything else falls back to the full choke point — fail closed.
+   */
+  private async isAuthorizedPlanContinuation(): Promise<boolean> {
+    const continuation = activePlanContinuation();
+    if (!continuation || !this.conversionPlanStore) return false;
+    try {
+      const plan = await this.conversionPlanStore.get(continuation.planId);
+      return isPlanContinuationAuthorized(plan);
+    } catch {
+      // Tampered plan record — never authorizes a guardrail skip.
+      return false;
+    }
+  }
 
   /**
    * Argon2id(passphrase, salt) → raw 32-byte key material, derived at most once

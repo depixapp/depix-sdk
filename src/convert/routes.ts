@@ -3,8 +3,9 @@
 // The trio (from-asset, to-asset, to-network) deterministically enumerates
 // EVERY candidate route, single-hop and multi-hop alike. The SDK never picks
 // among candidates: quote() surfaces them all with estimates and the AGENT
-// chooses (design locked in PR-B; PR-C automates multi-hop execution with a
-// plan + recovery — until then convert() only executes single-hop routes).
+// chooses (design locked in PR-B). convert() executes the chosen route —
+// multi-hop routes run end to end behind a persisted plan + crash recovery
+// (PR-C, src/convert/multihop.ts).
 //
 // A route is a chain of up to three legs over the wallet's home network
 // (Liquid):

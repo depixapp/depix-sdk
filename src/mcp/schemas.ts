@@ -204,6 +204,19 @@ const sideshiftResumeSummary = () =>
     failed: z.number().int().describe("Status refreshes that failed (kept for the next resume)."),
   });
 
+const plansResumeSummary = () =>
+  z.object({
+    checked: z.number().int().describe("In-flight multi-hop conversion plans found in the store."),
+    advanced: z.number().int().describe("Plans that executed at least one leg this pass (from the last completed leg)."),
+    completed: z.number().int().describe("Plans that reached a terminal outcome and were removed."),
+    needs_review: z
+      .number()
+      .int()
+      .describe("Plans parked for manual completion (recovery would have to guess) — see wallet_pending notes."),
+    discarded: z.number().int().describe("Tampered plan records discarded (GCM auth failure) — never acted upon."),
+    failed: z.number().int().describe("Probe/execution failures — plan kept for the next resume."),
+  });
+
 /** Conversion recovery summary (§5) — shared by wallet_status and wallet_recover. */
 const conversionResumeSummary = () =>
   z.object({
@@ -212,6 +225,7 @@ const conversionResumeSummary = () =>
       .describe("Boltz swap reconciliation counters, or null when the wallet has no seed (no Boltz rail)."),
     pegin: peginResumeSummary(),
     sideshift: sideshiftResumeSummary(),
+    plans: plansResumeSummary().describe("Multi-hop conversion plans resumed from the last completed leg (PR-C)."),
   });
 
 export const statusOutput = {
@@ -516,6 +530,9 @@ export const recoverOutput = {
     .describe("Boltz swaps reconciled (re-attach watch / claim / refund), or null when the wallet has no seed."),
   pegin: peginResumeSummary().describe("Tracked SideSwap peg-in reconciliation (§5.2)."),
   sideshift: sideshiftResumeSummary().describe("Non-terminal SideShift shifts refreshed into the local log (§5.4)."),
+  plans: plansResumeSummary().describe(
+    "Multi-hop conversion plans resumed from the last completed leg (PR-C) — a started leg is never re-executed.",
+  ),
 } as const;
 
 export const pendingOutput = {
@@ -523,11 +540,13 @@ export const pendingOutput = {
     .array(
       z.object({
         rail: z
-          .enum(["withdrawal", "boltz", "pegin", "sideshift"])
-          .describe("Which rail the item is in flight on."),
+          .enum(["withdrawal", "boltz", "pegin", "sideshift", "plan"])
+          .describe("Which rail the item is in flight on ('plan' = a multi-hop conversion plan chaining the others)."),
         id: z
           .string()
-          .describe("Rail-scoped id: withdrawal Idempotency-Key, Boltz swap id, SideSwap peg order id, or SideShift shift id."),
+          .describe(
+            "Rail-scoped id: withdrawal Idempotency-Key, Boltz swap id, SideSwap peg order id, SideShift shift id, or conversion plan id.",
+          ),
         state: z.string().describe("Rail-specific state/status string (e.g. requested/signed, locked_up, pending, waiting)."),
         created_at: z.number().int().nullable().describe("Epoch-ms creation time, when tracked."),
         withdrawal_id: z.string().nullable().optional().describe("withdrawal only: provider withdrawal id, when known."),
@@ -540,6 +559,13 @@ export const pendingOutput = {
         recv_addr: z.string().optional().describe("pegin only: OUR Liquid address SideSwap pays L-BTC to."),
         shift_type: z.enum(["send", "receive"]).optional().describe("sideshift only: shift direction."),
         network: z.string().optional().describe("sideshift only: the non-Liquid network of the shift."),
+        route_id: z.string().optional().describe("plan only: the multi-hop route being executed (its id lists every leg)."),
+        hops: z.number().int().optional().describe("plan only: total legs in the route."),
+        current_leg: z.number().int().optional().describe("plan only: 1-based leg currently being driven."),
+        note: z
+          .string()
+          .optional()
+          .describe("plan only: manual instruction when the plan is parked needs_review."),
       }),
     )
     .describe("Everything currently in flight across the four durable stores, newest data as stored. Empty when nothing is pending."),
