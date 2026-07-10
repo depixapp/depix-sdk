@@ -77,6 +77,27 @@ export class GuardrailError extends DepixSdkError {
 }
 
 /**
+ * Merchant light-profile errors (spec §5.6) — raised client-side by
+ * wallet.merchant.update() BEFORE any request. Codes:
+ *   MERCHANT_FIELD_NOT_EDITABLE — a field outside the 5 editable light fields
+ *                                 was passed (details.field names it). The
+ *                                 owner/admin-only fields (liquid_address,
+ *                                 split_address, cnpj, password) are NOT part of
+ *                                 this surface and can never be edited by a key.
+ *   MERCHANT_UPDATE_EMPTY       — update() was called with no field to change.
+ *   MERCHANT_UPDATE_INVALID     — update() was not given a fields object.
+ * A server-side rejection of a light field's VALUE (bad URL, name length) or an
+ * insufficient scope arrives instead as a DepixApiError (validation_error /
+ * insufficient_scope), never as a MerchantError.
+ */
+export class MerchantError extends DepixSdkError {
+  constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {
+    super(code, message, options);
+    this.name = "MerchantError";
+  }
+}
+
+/**
  * Structured `details` block of a DePix API error envelope (spec §7.1).
  * Every field is optional — provider (Eulen) rejections arrive as
  * `validation_error` with NO `details` at all (only `legacyErrorMessage`),

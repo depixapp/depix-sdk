@@ -6,9 +6,9 @@
 //   - Idempotency-Key auto-generated (UUID v4) on the idempotent money-moving
 //     POSTs (deposit/withdraw); a retry reuses the SAME key and receives the
 //     server replay (§7.2). Callers override it for crash-resume (§3.2.9).
-//   - Client-side pacing (§3.4): creation 2/min per (endpoint, key), status
-//     reads 30/min per (endpoint, key). Retries are spaced through the same
-//     throttle.
+//   - Client-side pacing (§3.4): creation 2/min, status reads 30/min, and the
+//     merchant light-profile PATCH 10/min — each per (endpoint, key), mirroring
+//     the server's per-route bucket. Retries are spaced through the same throttle.
 //   - Structured envelope { error: { code, message, request_id, retry_after?,
 //     docs_url, details? } } → DepixApiError, with details.field /
 //     details.required_scope hoisted to first class and the provider PT message
@@ -34,6 +34,11 @@ export const DEFAULT_API_BASE = "https://api.depixapp.com";
 // it never overshoots into a 429 it could have avoided.
 const CREATE_LIMIT_PER_MIN = 2;
 const READ_LIMIT_PER_MIN = 30;
+// PATCH /api/merchants/me lives in its OWN server bucket `merchant-update`
+// (router.js perUser:10) — stricter than the read tier (30) but looser than
+// creation (2). The client mirrors that exact 10/min so it never optimistically
+// fires into a 429 the server would raise at 10 (see patchMerchantProfile).
+const MERCHANT_UPDATE_LIMIT_PER_MIN = 10;
 
 const MAX_RETRY_TRANSIENT = 3; // network + 5xx
 const MAX_RETRY_RATE_LIMITED = 2; // 429
@@ -92,6 +97,56 @@ export interface StatusReadResponse {
   sandbox?: boolean;
 }
 
+// ─── merchant light-profile (§5.6) ───────────────────────────────────────────
+
+/** GET /api/me — merchant identity probe (scope merchant_read). */
+export interface MeWireResponse {
+  merchant_id: string;
+  name: string;
+  username: string | null;
+  merchant_slug: string;
+  is_live: boolean;
+  created_at: string;
+}
+
+/**
+ * PATCH /api/merchants/me body — ONLY the 5 LIGHT fields an API key may edit
+ * (§5.6). liquid_address/split_address/cnpj are deliberately absent: they are
+ * owner/admin-only and rejected by the server on the key path.
+ */
+export interface MerchantUpdateWireBody {
+  // `string | null` across the board: update() forwards an explicit null to
+  // clear a field (the server is authoritative on whether a blank name is
+  // allowed), so the wire type must not skew non-null on business_name alone.
+  business_name?: string | null;
+  website?: string | null;
+  logo_url?: string | null;
+  default_callback_url?: string | null;
+  default_redirect_url?: string | null;
+}
+
+/** PATCH /api/merchants/me success shape. */
+export interface MerchantUpdateWireResponse {
+  success: true;
+  merchant_slug: string;
+}
+
+/**
+ * The ONLY keys PATCH /api/merchants/me accepts (§5.6). Everything else on the
+ * merchant row (liquid_address, split_address, cnpj, password, …) is
+ * owner/admin-only. patchMerchantProfile rejects any excess key BEFORE the
+ * request — a second line of defense so the raw primitive is safe on its own,
+ * even if a consumer bypasses the guarded MerchantNamespace.update() and calls
+ * it directly via `as any`.
+ */
+const MERCHANT_LIGHT_WIRE_FIELDS: ReadonlySet<string> = new Set([
+  "business_name",
+  "website",
+  "logo_url",
+  "default_callback_url",
+  "default_redirect_url"
+]);
+
 // ─── fetch seam ──────────────────────────────────────────────────────────
 
 export interface FetchResponseLike {
@@ -123,7 +178,7 @@ export interface ApiClientOptions {
 }
 
 interface RequestSpec {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "PATCH";
   path: string;
   bucket: string;
   throttle: Throttle;
@@ -140,6 +195,7 @@ export class DepixApiClient {
   private readonly random: () => number;
   private readonly createThrottle: Throttle;
   private readonly readThrottle: Throttle;
+  private readonly merchantUpdateThrottle: Throttle;
 
   constructor(options: ApiClientOptions) {
     if (typeof options.apiKey !== "string" || options.apiKey.length === 0) {
@@ -157,6 +213,11 @@ export class DepixApiClient {
     const now = options.now ?? Date.now;
     this.createThrottle = new Throttle({ limit: CREATE_LIMIT_PER_MIN, now, sleep: this.sleep });
     this.readThrottle = new Throttle({ limit: READ_LIMIT_PER_MIN, now, sleep: this.sleep });
+    this.merchantUpdateThrottle = new Throttle({
+      limit: MERCHANT_UPDATE_LIMIT_PER_MIN,
+      now,
+      sleep: this.sleep
+    });
   }
 
   /** Key mode derived LOCALLY from the prefix — zero /api/me call (§6.2). */
@@ -235,6 +296,59 @@ export class DepixApiClient {
       path: `/api/withdrawals/${encodeURIComponent(id)}`,
       bucket: `withdraw-status:${this.apiKey}`,
       throttle: this.readThrottle
+    });
+    return data;
+  }
+
+  // ─── merchant light-profile (§5.6) ─────────────────────────────────────────
+
+  /**
+   * GET /api/me — the merchant identity behind the key (scope merchant_read).
+   * The read surface wallet.merchant.get() maps to. Shares the read throttle.
+   */
+  async getMe(): Promise<MeWireResponse> {
+    const { data } = await this.request<MeWireResponse>({
+      method: "GET",
+      path: "/api/me",
+      bucket: `me:${this.apiKey}`,
+      throttle: this.readThrottle
+    });
+    return data;
+  }
+
+  /**
+   * PATCH /api/merchants/me — edit the LIGHT profile fields (scope
+   * merchant_write, §5.6). No Idempotency-Key: the update is state-idempotent
+   * (last-write-wins on the same fields), so the generic 5xx retry is safe. The
+   * server rejects any owner-only field (liquid_address/cnpj/password) with a
+   * 400 validation_error and emails the owner on success (G11) — no client work.
+   *
+   * Paced by its OWN throttle: the server route sits in a dedicated
+   * `merchant-update` bucket (perUser:10/min), NOT the read tier (30) — mirroring
+   * it exactly keeps the client from optimistically firing into a 429 the server
+   * raises at 10.
+   *
+   * Defense-in-depth: this primitive is a public export, so it re-validates the
+   * body against the 5 light wire keys and rejects any excess key here too — a
+   * forbidden field never reaches the wire even on a direct `as any` call that
+   * bypasses the guarded MerchantNamespace.update().
+   */
+  async patchMerchantProfile(body: MerchantUpdateWireBody): Promise<MerchantUpdateWireResponse> {
+    for (const key of Object.keys(body)) {
+      if (!MERCHANT_LIGHT_WIRE_FIELDS.has(key)) {
+        throw new TypeError(
+          `patchMerchantProfile: "${key}" is not an editable light field — only ` +
+            `${[...MERCHANT_LIGHT_WIRE_FIELDS].join(", ")} may be sent (§5.6). ` +
+            "Owner-only fields (liquid_address/split_address/cnpj) are never accepted."
+        );
+      }
+    }
+    const { data } = await this.request<MerchantUpdateWireResponse>({
+      method: "PATCH",
+      path: "/api/merchants/me",
+      bucket: `merchant-update:${this.apiKey}`,
+      throttle: this.merchantUpdateThrottle,
+      body
     });
     return data;
   }

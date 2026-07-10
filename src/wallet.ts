@@ -82,6 +82,7 @@ import { GiftcardsNamespace } from "./giftcards/namespace.js";
 import { GiftcardConfigClient, type GiftcardConfigSource } from "./giftcards/config.js";
 import { CryptorefillsClient, type CryptorefillsFetch } from "./giftcards/cryptorefills.js";
 import { GiftcardOrderStore } from "./giftcards/store.js";
+import { MerchantNamespace } from "./merchant.js";
 
 export interface WalletSyncOptions {
   /** Override the Esplora provider chain (default: waterfalls→vanilla §2.6). */
@@ -326,6 +327,8 @@ export class DepixWallet {
   readonly convert: ConvertNamespace;
   /** Gift cards (§5.5): wallet.giftcards.list()/buy()/listOrders(). */
   readonly giftcards: GiftcardsNamespace;
+  /** Merchant light-profile (§5.6): wallet.merchant.get()/update(). */
+  readonly merchant: MerchantNamespace;
   private readonly logger: Logger;
   private readonly passphrase: string | undefined;
   // Pix flows (PR2) — null when no apiKey / no seed. deposit/withdraw/waitFor
@@ -490,6 +493,12 @@ export class DepixWallet {
       store: new GiftcardOrderStore({ dataDir: this.dataDir, logger: this.logger }),
       logger: this.logger
     });
+    // Merchant light-profile (§5.6): get()/update() over the SAME API client as
+    // the Pix flows. A lazy getter (not the client) so a wallet opened without an
+    // apiKey throws the wallet's clear API_KEY_REQUIRED at call time. Only the 5
+    // light fields are exposed; liquid_address/split_address are absent by
+    // construction (see merchant.ts). No money, no signing — pure API surface.
+    this.merchant = new MerchantNamespace(() => this.requireApi());
   }
 
   // ─── lifecycle ─────────────────────────────────────────────────────────
