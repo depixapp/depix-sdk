@@ -17,7 +17,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
 import type { ResumeSummary } from "../wallet.js";
-import { ToolError, mapToolError } from "./errors.js";
+import { ToolError, mapToolError, missingApiKeyError } from "./errors.js";
 import { defaultLogger as logger } from "../logger.js";
 import * as s from "./schemas.js";
 import { MAX_WAIT_SECONDS_CEILING } from "./schemas.js";
@@ -130,6 +130,16 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
     bootResume: opts.bootResume ?? EMPTY_RESUME,
   };
 
+  // The tools that hit the DePix API (deposit/withdraw + their waits) short-circuit
+  // with an ACTIONABLE api_key_required error when DEPIX_API_KEY is absent, instead
+  // of letting the api client surface a generic auth/internal error — the agent
+  // cannot set the key itself, so it needs the one-line remediation (§6.1).
+  const runKeyed = (fn: () => Promise<unknown>): Promise<CallToolResult> =>
+    run(() => {
+      if (!ctx.apiKeyConfigured) throw missingApiKeyError();
+      return fn();
+    });
+
   const server = new McpServer(
     { name: SERVER_NAME, title: SERVER_TITLE, version: opts.version ?? DEFAULT_SERVER_VERSION },
     { instructions: INSTRUCTIONS },
@@ -224,7 +234,7 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
       outputSchema: s.createDepositOutput,
       annotations: write,
     },
-    (args) => run(() => createDepositTool(wallet, args as { amount_cents: number; payer_tax_number: string })),
+    (args) => runKeyed(() => createDepositTool(wallet, args as { amount_cents: number; payer_tax_number: string })),
   );
 
   server.registerTool(
@@ -239,7 +249,7 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
       annotations: read,
     },
     (args) =>
-      run(() =>
+      runKeyed(() =>
         waitDepositTool(
           wallet,
           args as { id: string; interval_seconds?: number; timeout_seconds?: number },
@@ -262,7 +272,7 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
       annotations: money,
     },
     (args) =>
-      run(() =>
+      runKeyed(() =>
         createWithdrawalTool(
           wallet,
           args as {
@@ -287,7 +297,7 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
       annotations: read,
     },
     (args) =>
-      run(() =>
+      runKeyed(() =>
         waitWithdrawalTool(
           wallet,
           args as { id: string; interval_seconds?: number; timeout_seconds?: number },

@@ -70,6 +70,42 @@ describe("createShutdownHandler (idempotent, no hang)", () => {
     errSpy.mockRestore();
   });
 
+  it("hard-exits via the watchdog if close() never settles (failsafe for fast-follow watches)", async () => {
+    vi.useFakeTimers();
+    const errSpy = vi.spyOn(defaultLogger, "error").mockImplementation(() => {});
+    let exited: number | undefined;
+    const shutdown = createShutdownHandler({
+      close: () => new Promise<void>(() => {}), // never settles (wedged watch-cancel)
+      exit: (c) => {
+        exited = c;
+      },
+      logger: defaultLogger,
+      hardExitMs: 1_000,
+    });
+    shutdown(0);
+    expect(exited).toBeUndefined(); // still waiting on close()
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(exited).toBe(1); // failsafe fired a hard exit
+    expect(errSpy).toHaveBeenCalledWith("shutdown_hard_exit", expect.anything());
+    errSpy.mockRestore();
+    vi.useRealTimers();
+  });
+
+  it("clears the watchdog once close() settles (no spurious hard exit)", async () => {
+    vi.useFakeTimers();
+    const exits: number[] = [];
+    const shutdown = createShutdownHandler({
+      close: async () => {},
+      exit: (c) => exits.push(c),
+      logger: defaultLogger,
+      hardExitMs: 1_000,
+    });
+    shutdown(0);
+    await vi.advanceTimersByTimeAsync(2_000); // well past the failsafe window
+    expect(exits).toEqual([0]); // exited once cleanly; watchdog never fired
+    vi.useRealTimers();
+  });
+
   it("a transport close (host disconnect) drives shutdown → wallet close, deterministically", async () => {
     const wallet = new FakeWallet();
     const { server, client } = await connectWallet({ wallet });
