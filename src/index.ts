@@ -167,6 +167,37 @@ export {
   SideSwapNamespace,
   type ConvertNamespaceOptions
 } from "./convert/namespace.js";
+// The high-level intent layer (PR-B): wallet.quote() + callable wallet.convert().
+export {
+  enumerateRoutes,
+  type IntentAsset,
+  type IntentNetwork,
+  type Route,
+  type RouteLeg,
+  type RouteMethod,
+  type RouteProvider,
+  type RouteSelector
+} from "./convert/routes.js";
+export {
+  convertIntent,
+  quoteRoutes,
+  intentDepsFromNamespace,
+  makeConvertFacade,
+  type ConvertFacade,
+  type ConvertFunding,
+  type ConvertIntent,
+  type ConvertIntentOptions,
+  type ConvertParams,
+  type ConvertResult,
+  type ConvertStatus,
+  type IntentBoltz,
+  type IntentDeps,
+  type IntentQuoteStream,
+  type IntentSideshift,
+  type IntentSideswap,
+  type RouteLegQuote,
+  type RouteQuote
+} from "./convert/intent.js";
 export {
   SideSwapMarket,
   SwapQuoteStream,

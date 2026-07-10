@@ -6,6 +6,7 @@ import type { FetchLike } from "../api/client.js";
 import { ConversionError, WalletError } from "../errors.js";
 import type { BoltzConvert } from "./boltz/convert.js";
 import type { ConvertWalletHooks } from "./hooks.js";
+import type { ConvertIntentOptions } from "./intent.js";
 import { PendingPegIn } from "./pending-pegin.js";
 import {
   resolveQuoteStream,
@@ -39,6 +40,8 @@ export interface ConvertNamespaceOptions {
     store?: SideShiftStore;
     sendUsdt?: SendUsdt;
   };
+  /** Intent-layer overrides (PR-B): estimators + settle-poll cadence for wallet.quote()/convert(). */
+  intent?: ConvertIntentOptions;
 }
 
 /**

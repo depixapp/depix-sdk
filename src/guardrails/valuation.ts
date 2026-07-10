@@ -49,7 +49,14 @@ export class BrlValuator {
       throw new GuardrailError(
         "QUOTES_UNAVAILABLE",
         `BRL valuation for ${asset} needs a quote from GET /api/quotes, which is unavailable ` +
-          "(no fresh or stale value) — signing is blocked for non-DePix assets (fail-closed, spec §4.4)."
+          "(no fresh or stale value) — signing is blocked for non-DePix assets (fail-closed, spec §4.4).",
+        {
+          details: {
+            nextStep:
+              "retry in a few seconds — the quote endpoint is usually back quickly. If it persists, check " +
+              "connectivity to the DePix API. DePix-denominated operations still work (the 1:1 BRL peg needs no quote)."
+          }
+        }
       );
     }
 
