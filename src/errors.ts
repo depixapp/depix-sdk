@@ -218,8 +218,15 @@ export class WithdrawContractError extends DepixSdkError {
  * resolved (§2.2). viem is a REGULAR dependency (G5), so this is a defense-in-depth
  * guard for a broken/partial install, never the norm.
  *
- * The remaining codes (CUSTODIAL_NOT_ACKNOWLEDGED, AFFILIATE_ID_MISSING) arrive
- * with the SideShift/affiliate flows.
+ * The SideShift subset (PR5c, §5.4 — USDt cross-network, CUSTODIAL/G4):
+ *   AFFILIATE_ID_MISSING     — the DePix affiliate id was not baked into the build
+ *                              (SIDESHIFT_AFFILIATE_ID unset at publish time), so no
+ *                              shift can be created. Mirrors the frontend's "SideShift
+ *                              is not configured" throw. (G4 dropped the acceptCustodial
+ *                              gate → there is NO CUSTODIAL_NOT_ACKNOWLEDGED code; the
+ *                              custodial nature is signalled in docs + custodial:true.)
+ *   SIDESHIFT_AMOUNT_MISMATCH — the fixed shift's depositAmount does not match (or
+ *                              exceeds) the quoted amount — fail-closed before signing.
  */
 export class ConversionError extends DepixSdkError {
   constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {
@@ -276,6 +283,31 @@ export class CryptorefillsApiError extends DepixSdkError {
   constructor(message: string, init: { status?: number; body?: unknown; cause?: unknown } = {}) {
     super("CRYPTOREFILLS_API_ERROR", message, init.cause !== undefined ? { cause: init.cause } : undefined);
     this.name = "CryptorefillsApiError";
+    if (init.status !== undefined) this.status = init.status;
+    if (init.body !== undefined) this.body = init.body;
+  }
+}
+
+/**
+ * A network/HTTP error from the SideShift REST API (sideshift.ai/api/v2, §5.4).
+ * SideShift replies `{ error: { message } }` with NO machine-readable code, so the
+ * message is upstream (untrusted) text — this is its own DepixSdkError carrying the
+ * upstream status/body (mirrors BoltzApiError / CryptorefillsApiError), NOT a
+ * ConversionError (whose catalog is our OWN closed set of fail-closed guards).
+ *
+ * Kept distinct from `SideSwapError` (the WS provider): SideShift is a REST provider
+ * whose `.message` is set VERBATIM from an upstream body, so mapToolError (§6.2e)
+ * routes it to `data.untrusted_api_message` BY CONSTRUCTION — it is deliberately NOT
+ * in the SDK-authored allowlist, so an injected upstream string can never reach a
+ * tool message.
+ */
+export class SideShiftApiError extends DepixSdkError {
+  readonly status?: number;
+  readonly body?: unknown;
+
+  constructor(message: string, init: { status?: number; body?: unknown; cause?: unknown } = {}) {
+    super("SIDESHIFT_API_ERROR", message, init.cause !== undefined ? { cause: init.cause } : undefined);
+    this.name = "SideShiftApiError";
     if (init.status !== undefined) this.status = init.status;
     if (init.body !== undefined) this.body = init.body;
   }

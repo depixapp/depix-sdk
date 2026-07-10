@@ -33,6 +33,7 @@ export {
   DepixSdkError,
   GuardrailError,
   MerchantError,
+  SideShiftApiError,
   SideSwapError,
   WalletError,
   WithdrawContractError,
@@ -197,6 +198,42 @@ export {
   type PegInRecord
 } from "./convert/pending-pegin.js";
 export type { ConvertWalletHooks } from "./convert/hooks.js";
+// SideShift (§5.4) — USDt cross-network, CUSTODIAL (signalled, G4).
+export {
+  SideShiftNamespace,
+  SIDESHIFT_API_BASE,
+  SIDESHIFT_ORDER_URL,
+  SHIFT_STATUS,
+  USDT_NETWORKS,
+  coinIdForNetwork,
+  getNetwork,
+  validateNetworkAddress,
+  settleDestinationForNetwork,
+  isShiftPending,
+  isShiftTerminal,
+  isShiftInRefund,
+  usdtSatsToDecimal,
+  usdtDecimalToSats,
+  requestQuote,
+  createFixedShift,
+  createVariableShift,
+  fetchShift,
+  setRefundAddressRequest,
+  type SideShiftNamespaceDeps,
+  type SideShiftQuote,
+  type SideShiftSendResult,
+  type SideShiftReceiveResult,
+  type SideShiftStatusResult,
+  type UsdtNetwork,
+  type SendUsdt
+} from "./convert/sideshift.js";
+export {
+  SideShiftStore,
+  SIDESHIFT_SHIFTS_FILE,
+  MAX_STORED_SHIFTS,
+  type StoredSideShift,
+  type ShiftType
+} from "./convert/sideshift-store.js";
 
 // ─── gift cards (§5.5): wallet.giftcards.* ───────────────────────────────────
 export {

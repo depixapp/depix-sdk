@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   DepixSdkError,
   GuardrailError,
+  SideShiftApiError,
   WalletError,
   isDepixSdkError
 } from "../src/errors.js";
@@ -39,6 +40,18 @@ describe("typed error hierarchy (spec §7.1)", () => {
     const cause = new Error("io failure");
     const err = new WalletError("BROADCAST_FAILED", "broadcast failed", { cause });
     expect(err.cause).toBe(cause);
+  });
+
+  it("SideShiftApiError is a provider-transport DepixSdkError carrying status/body (§5.4)", () => {
+    const err = new SideShiftApiError("Below the minimum amount", { status: 400, body: { error: { message: "x" } } });
+    expect(err).toBeInstanceOf(DepixSdkError);
+    expect(err).toBeInstanceOf(SideShiftApiError);
+    expect(err.code).toBe("SIDESHIFT_API_ERROR");
+    expect(err.name).toBe("SideShiftApiError");
+    expect(err.status).toBe(400);
+    expect(err.body).toEqual({ error: { message: "x" } });
+    // Distinct from the WS SideSwapError — different provider, different class.
+    expect(err.constructor.name).toBe("SideShiftApiError");
   });
 
   it("isDepixSdkError discriminates by code", () => {

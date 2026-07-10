@@ -8,7 +8,8 @@
 // from a closed set, numbers, a regex-guarded short `field`) ONLY. Free-form
 // provider text — a DepixApiError's `legacyErrorMessage` / upstream `message`, or
 // the `.message` of a provider-transport error (BoltzApiError,
-// CryptorefillsApiError, SideSwapError, any future third-party error) which is set
+// CryptorefillsApiError, SideSwapError, SideShiftApiError, any future third-party
+// error) which is set
 // VERBATIM from an upstream body — is CONTENT, never code: concatenating it into
 // `message` would open a second-order prompt-injection channel. It is routed to
 // `data.untrusted_api_message`, truncated and (by the field name) explicitly

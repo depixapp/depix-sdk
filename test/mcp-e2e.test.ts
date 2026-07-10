@@ -84,16 +84,17 @@ async function openReal(): Promise<void> {
 }
 
 describe("MCP facade e2e over a real wallet (sandbox, offline)", () => {
-  it("handshakes and lists the 10 MVP + 7 fast-follow tools over a REAL wallet", async () => {
+  it("handshakes and lists the 10 MVP + 8 fast-follow tools over a REAL wallet", async () => {
     await openReal();
     const names = (await client.listTools()).tools.map((t) => t.name);
-    expect(names).toHaveLength(17);
+    expect(names).toHaveLength(18);
     expect(names).toContain("wallet_create_deposit");
     expect(names).toContain("wallet_create_withdrawal");
     // The real DepixWallet satisfies the extended facade → fast-follows registered.
     expect(names).toContain("wallet_swap_quote");
     expect(names).toContain("wallet_pay_lightning_invoice");
     expect(names).toContain("wallet_buy_giftcard");
+    expect(names).toContain("wallet_shift_usdt");
   });
 
   it("wallet_create_deposit returns the sandbox QR", async () => {

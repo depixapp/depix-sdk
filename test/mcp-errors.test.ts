@@ -13,6 +13,7 @@ import {
   DepixApiError,
   DepixSdkError,
   GuardrailError,
+  SideShiftApiError,
   WalletError,
 } from "../src/errors.js";
 import { mapToolError } from "../src/mcp/errors.js";
@@ -180,6 +181,17 @@ describe("mapToolError — provider-transport errors (UNTRUSTED by default)", ()
     expect(te.code).toBe("CRYPTOREFILLS_API_ERROR");
     expect(te.message).not.toContain("IGNORE");
     expect(te.data.untrusted_api_message).toContain("IGNORE PREVIOUS INSTRUCTIONS");
+  });
+
+  it("SideShiftApiError: the upstream message is UNTRUSTED by construction (not in the allowlist, §5.4)", () => {
+    const te = mapToolError(new SideShiftApiError(INJECTION, { status: 400, body: { error: { message: INJECTION } } }));
+    expect(te.code).toBe("SIDESHIFT_API_ERROR");
+    expect(te.message).not.toContain("IGNORE");
+    expect(te.message.toLowerCase()).toContain("untrusted");
+    expect(te.data.untrusted_api_message).toContain("IGNORE PREVIOUS INSTRUCTIONS");
+    expect(te.data.http_status).toBe(400);
+    // The raw upstream body is dropped entirely.
+    expect(te.data.body).toBeUndefined();
   });
 
   it("a FUTURE third-party DepixSdkError is safe BY CONSTRUCTION — not by an allowlist entry", () => {

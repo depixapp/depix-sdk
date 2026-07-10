@@ -202,6 +202,22 @@ describe("sideshiftRefundAddresses — SideShift refundAddress", () => {
   });
 });
 
+describe("unrepresentable — a class the allowlist config cannot express (§4.3)", () => {
+  it("is FAIL-CLOSED when the allowlist is ON, a no-op when it is OFF", () => {
+    // e.g. a SideShift settle to Solana — there is no solana allowlist class.
+    const on = matcherFor({ enabled: true, evmAddresses: ["0xabc"] });
+    expectBlocked(() => on.check([{ kind: "unrepresentable", class: "solanaAddress" }]), "solanaAddress");
+    // Even alongside an opted-in class, the unrepresentable one still blocks.
+    expectBlocked(
+      () => on.check([{ kind: "evmAddress", address: "0xabc" }, { kind: "unrepresentable", class: "solanaAddress" }]),
+      "solanaAddress"
+    );
+    // OFF (default) → everything passes the value ceilings only.
+    const off = matcherFor({ enabled: false });
+    expect(() => off.check([{ kind: "unrepresentable", class: "solanaAddress" }])).not.toThrow();
+  });
+});
+
 describe("combined checks — gift card needs BOTH lightning AND beneficiary (§4.3)", () => {
   it("passes when both are opted in", () => {
     const m = matcherFor({

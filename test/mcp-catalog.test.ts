@@ -40,7 +40,8 @@ const MVP = [
   "wallet_get_guardrails",
 ];
 
-// PR8b fast-follow (§6.2): SideSwap + Boltz Lightning/stablecoin + CryptoRefills.
+// PR8b/PR5c fast-follow (§6.2): SideSwap + Boltz Lightning/stablecoin +
+// CryptoRefills + SideShift (wallet_shift_usdt — the ONE custodial tool, §5.4/G4).
 const FAST_FOLLOW = [
   "wallet_swap_quote",
   "wallet_swap_execute",
@@ -49,11 +50,12 @@ const FAST_FOLLOW = [
   "wallet_to_stablecoin",
   "wallet_buy_giftcard",
   "wallet_list_giftcard_orders",
+  "wallet_shift_usdt",
 ];
 
 const EXPECTED = [...MVP, ...FAST_FOLLOW].sort();
 
-describe("wallet MCP catalog (§6.2 — 10 MVP + 7 fast-follow wallet_* tools)", () => {
+describe("wallet MCP catalog (§6.2 — 10 MVP + 8 fast-follow wallet_* tools)", () => {
   it("initialize handshake succeeds and lists the MVP catalog PLUS the fast-follows", async () => {
     const { client } = await connectWallet({ wallet: new FakeWallet() });
     // The connect above already ran initialize; capability read confirms the handshake.
@@ -61,15 +63,23 @@ describe("wallet MCP catalog (§6.2 — 10 MVP + 7 fast-follow wallet_* tools)",
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(EXPECTED);
-    expect(names.length).toBe(17);
+    expect(names.length).toBe(18);
     // All 10 MVP tools survive; every fast-follow is present.
     for (const n of [...MVP, ...FAST_FOLLOW]) expect(names).toContain(n);
   });
 
-  it("does NOT expose wallet_shift_usdt — SideShift is not on main (custodial, out of scope)", async () => {
+  it("exposes wallet_shift_usdt and marks it CUSTODIAL in the description (§5.4/G4)", async () => {
     const { client } = await connectWallet({ wallet: new FakeWallet() });
-    const names = (await client.listTools()).tools.map((t) => t.name);
-    expect(names).not.toContain("wallet_shift_usdt");
+    const { tools } = await client.listTools();
+    const shift = tools.find((t) => t.name === "wallet_shift_usdt");
+    expect(shift).toBeDefined();
+    expect(shift!.description?.toUpperCase()).toContain("CUSTODIAL");
+    // Unit-explicit input + the custodial marker in the output schema.
+    const input = shift!.inputSchema as { properties?: Record<string, unknown> };
+    expect(input.properties).toHaveProperty("amount_sats");
+    expect(input.properties).not.toHaveProperty("amount");
+    const output = shift!.outputSchema as { properties?: Record<string, unknown> };
+    expect(output.properties).toHaveProperty("custodial");
   });
 
   it("WALLET_TOOL_NAMES matches the registered catalog", async () => {
