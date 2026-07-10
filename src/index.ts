@@ -24,9 +24,11 @@ export {
 } from "./wallet.js";
 
 export {
+  ConversionError,
   DepixApiError,
   DepixSdkError,
   GuardrailError,
+  SideSwapError,
   WalletError,
   WithdrawContractError,
   isDepixSdkError,
@@ -81,3 +83,51 @@ export {
 export { createLogger, registerSecret, type Logger, type LogLevel } from "./logger.js";
 
 export { type RitualIo } from "./backup-ritual.js";
+
+// ─── conversions (§5): wallet.convert.* ──────────────────────────────────────
+export {
+  ConvertNamespace,
+  SideSwapNamespace,
+  type ConvertNamespaceOptions
+} from "./convert/namespace.js";
+export {
+  SideSwapMarket,
+  SwapQuoteStream,
+  assertSwapPsetPaysAndBalances,
+  inspectSwapPset,
+  collectSwapUtxos,
+  selectSwapUtxos,
+  isTransientBlindingError,
+  SS_ERROR,
+  type SideSwapQuote,
+  type SwapQuoteParams,
+  type SwapExecuteResult,
+  type SwapPsetInspection,
+  type SwapValidationExpectation,
+  type NextQuoteOptions
+} from "./convert/sideswap.js";
+export {
+  SideSwapPeg,
+  assertPegOutRecipient,
+  type PegInResult,
+  type PegOutParams,
+  type PegOutResult,
+  type PegOutRecipient,
+  type PegOutRecipientExpectation
+} from "./convert/sideswap-peg.js";
+export {
+  createSideSwapClient,
+  SIDESWAP_WS_URL,
+  type SideSwapClient,
+  type SideSwapClientOptions,
+  type SideSwapUtxo,
+  type SideSwapQuoteEvent,
+  type PegResult,
+  type PegStatusResult
+} from "./convert/sideswap-client.js";
+export {
+  PendingPegIn,
+  PENDING_PEGIN_TTL_MS,
+  type PegInRecord
+} from "./convert/pending-pegin.js";
+export type { ConvertWalletHooks } from "./convert/hooks.js";

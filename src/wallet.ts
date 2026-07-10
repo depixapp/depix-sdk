@@ -73,6 +73,8 @@ import { ensureDir } from "./store/fs-util.js";
 import { SeedStore, type WalletFileV1 } from "./store/seed-store.js";
 import { UpdateStore } from "./store/update-store.js";
 import { SyncEngine, type EsploraClientLike, type EsploraProvider } from "./sync/sync.js";
+import { ConvertNamespace, type ConvertNamespaceOptions } from "./convert/namespace.js";
+import type { ConvertWalletHooks } from "./convert/hooks.js";
 
 export interface WalletSyncOptions {
   /** Override the Esplora provider chain (default: waterfalls→vanilla §2.6). */
@@ -112,6 +114,12 @@ export interface OpenOptions {
    * MCP-only agent has no other path to recover after a crash. Opt out here.
    */
   resumePendingWithdrawalsOnOpen?: boolean;
+  /**
+   * Advanced/testing: inject the SideSwap client factory / foreign-PSET signer /
+   * clock used by wallet.convert.sideswap.* (§5). Default: the real WS client
+   * and lwk signer.
+   */
+  convert?: ConvertNamespaceOptions;
 }
 
 export interface CreateOptions extends OpenOptions {
@@ -270,6 +278,8 @@ interface WalletParts {
   apiKey?: string;
   apiBase?: string;
   apiFetch?: FetchLike;
+  /** SideSwap client/signer/clock injection for wallet.convert.* (§5). */
+  convert?: ConvertNamespaceOptions;
 }
 
 export class DepixWallet {
@@ -279,6 +289,8 @@ export class DepixWallet {
   private readonly syncEngine: SyncEngine;
   private readonly guardrails: Guardrails;
   private readonly valuator: BrlValuator;
+  /** Conversions (§5): wallet.convert.sideswap.* (PR4); PR5 adds .boltz. */
+  readonly convert: ConvertNamespace;
   private readonly logger: Logger;
   private readonly passphrase: string | undefined;
   // Pix flows (PR2) — null when no apiKey / no seed. deposit/withdraw/waitFor
@@ -364,6 +376,25 @@ export class DepixWallet {
             logger: this.logger
           })
         : null;
+    // Conversions (§5) — a narrow seam onto the same choke point (§4.3), BRL
+    // valuator (§4.4), op mutex (§4.3 TOCTOU) and encrypted seed used by
+    // send()/withdraw(). Everything forwarded here already exists on this
+    // instance; the convert flows live under src/convert/.
+    const convertHooks: ConvertWalletHooks = {
+      dataDir: this.dataDir,
+      logger: this.logger,
+      ensureWollet: () => this.ensureWollet(),
+      getReceiveAddress: () => this.getReceiveAddress(),
+      decryptMnemonic: () => this.decryptMnemonic(),
+      valuate: (asset, amountSats) => this.valuator.valuate(asset, amountSats),
+      enforceGuardrails: (intent) => this.guardrails.enforce(intent),
+      recordSpend: (brlCents, kind) => this.guardrails.recordSpend(brlCents, kind),
+      runExclusive: (fn) => this.opMutex.runExclusive(fn),
+      broadcast: (finalized) => this.syncEngine.broadcast(finalized),
+      assertOpen: () => this.assertOpen(),
+      now: () => Date.now()
+    };
+    this.convert = new ConvertNamespace(convertHooks, parts.convert);
   }
 
   // ─── lifecycle ─────────────────────────────────────────────────────────
@@ -415,7 +446,8 @@ export class DepixWallet {
         quotes: options.quotes,
         apiKey,
         apiBase,
-        apiFetch: options.fetch
+        apiFetch: options.fetch,
+        convert: options.convert
       });
     } catch (err) {
       await lock.release();
@@ -493,7 +525,8 @@ export class DepixWallet {
         quotes: options.quotes,
         apiKey: resolveApiKey(options.apiKey),
         apiBase: resolveApiBase(options.apiBase),
-        apiFetch: options.fetch
+        apiFetch: options.fetch,
+        convert: options.convert
       });
       return { mnemonic, descriptor, backupConfirmed, wallet };
     } catch (err) {
@@ -548,7 +581,8 @@ export class DepixWallet {
         quotes: options.quotes,
         apiKey: resolveApiKey(options.apiKey),
         apiBase: resolveApiBase(options.apiBase),
-        apiFetch: options.fetch
+        apiFetch: options.fetch,
+        convert: options.convert
       });
     } catch (err) {
       await lock.release();

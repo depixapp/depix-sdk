@@ -157,6 +157,39 @@ export class WithdrawContractError extends DepixSdkError {
   }
 }
 
+/**
+ * Conversion-flow failures (spec §5 / §7.1). The code list is CLOSED (no
+ * "..."): every conversion outcome maps to one of these. PR4 (SideSwap) uses
+ * SWAP_VALIDATION_FAILED (the fail-closed secondary check, G3 §5.1),
+ * SWAP_LOW_BALANCE (dealer-side insufficient liquidity), SWAP_QUOTE_EXPIRED and
+ * PEG_IN_ALREADY_PENDING (§5.2, one in-flight peg-in at a time). The remaining
+ * codes (LOCKUP_INFLATED, LOCKUP_TREE_MISMATCH, INVOICE_HASH_MISMATCH,
+ * INVOICE_NO_AMOUNT, TIMEOUT_OUT_OF_BOUNDS, CUSTODIAL_NOT_ACKNOWLEDGED,
+ * AFFILIATE_ID_MISSING, GIFTCARDS_DISABLED, GIFTCARD_KYC_CATEGORY,
+ * STABLECOIN_DEPS_MISSING) arrive with PR5/PR6.
+ */
+export class ConversionError extends DepixSdkError {
+  constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {
+    super(code, message, options);
+    this.name = "ConversionError";
+  }
+}
+
+/**
+ * SideSwap WebSocket transport / protocol error (spec §5.1). Kept distinct from
+ * the semantic ConversionError the same way ESPLORA_UNAVAILABLE/BROADCAST_FAILED
+ * are transport WalletErrors, not conversion outcomes. Codes come from
+ * `SS_ERROR` (sideswap-client.ts, frontend parity): NOT_CONNECTED, TIMEOUT,
+ * CONNECTION_LOST, SERVER_ERROR, INVALID_RESPONSE, LOW_BALANCE, NO_MARKET.
+ * Extends DepixSdkError so callers can narrow with isDepixSdkError.
+ */
+export class SideSwapError extends DepixSdkError {
+  constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {
+    super(code, message, options);
+    this.name = "SideSwapError";
+  }
+}
+
 /** Narrow an unknown value to a DepixSdkError, optionally matching a code. */
 export function isDepixSdkError(err: unknown, code?: string): err is DepixSdkError {
   if (!(err instanceof DepixSdkError)) return false;
