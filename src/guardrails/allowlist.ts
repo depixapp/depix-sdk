@@ -37,6 +37,13 @@ export type GuardrailDestination =
   | { kind: "tronAddress"; address: string } // Boltz stablecoin settle (Tron TRC-20, base58 — case-sensitive)
   | { kind: "giftcardBeneficiary"; beneficiary: string } // CryptoRefills beneficiary_account
   | { kind: "sideshiftRefundAddress"; address: string } // SideShift refundAddress
+  // A destination whose network/family has NO representable allowlist class (e.g. a
+  // SideShift settle to Solana — the allowlist has evm/tron classes but no solana
+  // one). Per §4.3 an unrepresentable destination is FAIL-CLOSED when the allowlist
+  // is ON, and (like every class) a no-op when it is OFF. `class` labels it for the
+  // typed error. The honest way to gate a class the config cannot express, instead
+  // of mislabeling it as another class.
+  | { kind: "unrepresentable"; class: string }
   | { kind: "protocolBound"; note?: string }; // verified return-to-self / Eulen — exempt
 
 function allowlistError(destClass: string, message: string): GuardrailError {
@@ -214,6 +221,14 @@ export class AllowlistMatcher {
           );
         }
         return;
+      case "unrepresentable":
+        // A destination class the allowlist config cannot express (e.g. SideShift
+        // settle to Solana). With the allowlist ON this is fail-closed (§4.3); the
+        // enclosing check() already short-circuits when the allowlist is OFF.
+        throw allowlistError(
+          dest.class,
+          `Destination class '${dest.class}' cannot be represented in the allowlist — fail-closed (§4.3).`
+        );
       default: {
         // Exhaustiveness: an unrepresented class with the allowlist ON is
         // fail-closed by construction.

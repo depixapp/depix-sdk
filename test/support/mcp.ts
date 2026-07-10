@@ -6,6 +6,7 @@ import type {
   McpBoltzFacade,
   McpConvertFacade,
   McpGiftcardsFacade,
+  McpSideshiftFacade,
   McpWalletFacade,
 } from "../../src/mcp/tools.js";
 import type { McpSwapQuoteStream } from "../../src/mcp/swap-streams.js";
@@ -29,6 +30,7 @@ import type {
 } from "../../src/convert/boltz/convert.js";
 import type { StablecoinParams } from "../../src/convert/boltz/stablecoin.js";
 import type { SideSwapQuote, SwapExecuteResult, SwapQuoteParams } from "../../src/convert/sideswap.js";
+import type { SideShiftSendResult } from "../../src/convert/sideshift.js";
 import type { BuyGiftcardParams, BuyGiftcardResult } from "../../src/giftcards/namespace.js";
 import type { StoredGiftcardOrder } from "../../src/giftcards/store.js";
 
@@ -151,6 +153,30 @@ export class FakeConvert implements McpConvertFacade {
     if (this.boltzThrows) throw this.boltzThrows;
     return this.boltzImpl;
   }
+
+  sideshiftSendCalls: Array<{ network: string; amountSats: bigint; settleAddress: string; refundAddress?: string }> = [];
+  sideshiftError?: unknown;
+  sideshiftSendResult: SideShiftSendResult = {
+    shiftId: "shift_1",
+    network: "tron",
+    depositAddress: "lq1qshiftdeposit",
+    settleAddress: "TXYZrecipientaddressbase58check000000000",
+    refundAddress: null,
+    depositAmountSats: 1_000_000_000n,
+    settleAmount: "9.9",
+    status: "waiting",
+    txid: "sh".repeat(32),
+    brlCents: 5_000,
+    custodial: true,
+  };
+
+  readonly sideshift: McpSideshiftFacade = {
+    send: async (params): Promise<SideShiftSendResult> => {
+      this.sideshiftSendCalls.push(params);
+      if (this.sideshiftError) throw this.sideshiftError;
+      return this.sideshiftSendResult;
+    },
+  };
 }
 
 /** Configurable wallet.giftcards fake. */

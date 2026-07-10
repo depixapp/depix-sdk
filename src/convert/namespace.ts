@@ -2,6 +2,7 @@
 // PR5 (Boltz) adds sibling sub-trees to the SAME `convert` object the same way.
 // Kept small and additive so a merge of the two PRs conflicts minimally.
 
+import type { FetchLike } from "../api/client.js";
 import { ConversionError, WalletError } from "../errors.js";
 import type { BoltzConvert } from "./boltz/convert.js";
 import type { ConvertWalletHooks } from "./hooks.js";
@@ -22,6 +23,8 @@ import {
   type PegStatusResult
 } from "./sideswap-peg.js";
 import type { SideSwapClient, SideSwapClientOptions } from "./sideswap-client.js";
+import { SideShiftNamespace, type SendUsdt } from "./sideshift.js";
+import { SideShiftStore } from "./sideshift-store.js";
 
 export interface ConvertNamespaceOptions {
   /** Client factory (default: real WS). Tests inject a fake. */
@@ -29,6 +32,13 @@ export interface ConvertNamespaceOptions {
   /** Foreign-PSET signer override (tests). */
   signForeignPset?: SideSwapMarketDeps["signForeignPset"];
   now?: () => number;
+  /** SideShift injection (§5.4) — tests inject fetch / affiliateId / store / signing seam. */
+  sideshift?: {
+    fetchImpl?: FetchLike;
+    affiliateId?: string;
+    store?: SideShiftStore;
+    sendUsdt?: SendUsdt;
+  };
 }
 
 /**
@@ -95,9 +105,11 @@ export class SideSwapNamespace {
   }
 }
 
-/** The `wallet.convert` object. PR5 adds `boltz` alongside `sideswap`. */
+/** The `wallet.convert` object. PR5 adds `boltz`, PR5c `sideshift`, alongside `sideswap`. */
 export class ConvertNamespace {
   readonly sideswap: SideSwapNamespace;
+  /** SideShift USDt cross-network (§5.4) — CUSTODIAL, signalled (G4). */
+  readonly sideshift: SideShiftNamespace;
   // The Boltz Lightning sub-namespace (§5.3) — null on a view-only/wiped wallet
   // (no seed to sign the L-BTC lockup). The wallet constructs the BoltzConvert
   // (it needs the seed store + lockup signer) and injects it here; `.boltz`
@@ -118,6 +130,18 @@ export class ConvertNamespace {
     const pending = new PendingPegIn(hooks.dataDir, { now: options.now, logger: hooks.logger });
     const peg = new SideSwapPeg({ hooks, pending, clientFactory: options.clientFactory });
     this.sideswap = new SideSwapNamespace(market, peg);
+    // SideShift (§5.4) — CUSTODIAL, signalled (G4). Reuses the SAME hooks (choke
+    // point, valuator, op mutex, encrypted seed) as .sideswap; the affiliate id is
+    // baked at build (never env/backend). A view-only/wiped wallet cannot SEND (no
+    // seed), but quote/receive/getStatus are safe — no seed gate at construction.
+    this.sideshift = new SideShiftNamespace({
+      hooks,
+      store: options.sideshift?.store ?? new SideShiftStore({ dataDir: hooks.dataDir, logger: hooks.logger }),
+      ...(options.sideshift?.fetchImpl ? { fetchImpl: options.sideshift.fetchImpl } : {}),
+      ...(options.sideshift?.affiliateId !== undefined ? { affiliateId: options.sideshift.affiliateId } : {}),
+      ...(options.sideshift?.sendUsdt ? { sendUsdt: options.sideshift.sendUsdt } : {}),
+      ...(options.now ? { now: options.now } : {})
+    });
     this.boltzNamespace = boltz;
   }
 

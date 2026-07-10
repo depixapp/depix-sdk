@@ -31,6 +31,7 @@ import type {
 } from "../convert/boltz/convert.js";
 import type { StablecoinAsset, StablecoinParams } from "../convert/boltz/stablecoin.js";
 import type { SwapQuoteParams } from "../convert/sideswap.js";
+import type { SideShiftSendResult } from "../convert/sideshift.js";
 import type { BuyGiftcardParams, BuyGiftcardResult } from "../giftcards/namespace.js";
 import type { StoredGiftcardOrder } from "../giftcards/store.js";
 import type { McpSwapFacade, SwapStreamRegistry } from "./swap-streams.js";
@@ -54,11 +55,26 @@ export interface McpBoltzFacade {
   toStablecoin(params: StablecoinParams): Promise<ToStablecoinResult>;
 }
 
+/**
+ * The `wallet.convert.sideshift` sub-facade (§5.4) — CUSTODIAL, signalled (G4).
+ * `send()` is the money-mover the wallet_shift_usdt tool wraps.
+ */
+export interface McpSideshiftFacade {
+  send(params: {
+    network: string;
+    amountSats: bigint;
+    settleAddress: string;
+    refundAddress?: string;
+  }): Promise<SideShiftSendResult>;
+}
+
 /** The `wallet.convert` sub-facade the fast-follow tools consume (§5). */
 export interface McpConvertFacade {
   readonly sideswap: McpSwapFacade;
   /** Throws WALLET_NOT_FOUND on a view-only/wiped wallet (no seed to sign). */
   readonly boltz: McpBoltzFacade;
+  /** SideShift USDt cross-network (§5.4) — CUSTODIAL. */
+  readonly sideshift: McpSideshiftFacade;
 }
 
 /** The `wallet.giftcards` sub-facade the fast-follow tools consume (§5.5). */
@@ -464,4 +480,36 @@ function giftcardOrderToOutput(o: StoredGiftcardOrder) {
 export async function listGiftcardOrdersTool(wallet: McpWalletFacade) {
   const orders = await wallet.giftcards.listOrders();
   return { orders: orders.map(giftcardOrderToOutput) };
+}
+
+/**
+ * wallet_shift_usdt (§5.4/G4) — the ONE CUSTODIAL tool. Wraps
+ * wallet.convert.sideshift.send(): SEND USDt from Liquid to another network via
+ * SideShift. Zero money logic here — the guardrail choke point + allowlist + signing
+ * live in the wallet method; a SideShiftApiError (upstream text) maps through the
+ * SAME safe-by-default mapToolError (untrusted path) as every provider transport.
+ */
+export async function shiftUsdtTool(
+  wallet: McpWalletFacade,
+  args: { network: string; amount_sats: string; settle_address: string; refund_address?: string },
+) {
+  const r: SideShiftSendResult = await wallet.convert.sideshift.send({
+    network: args.network,
+    amountSats: BigInt(args.amount_sats),
+    settleAddress: args.settle_address,
+    ...(args.refund_address !== undefined ? { refundAddress: args.refund_address } : {}),
+  });
+  return {
+    shift_id: r.shiftId,
+    network: r.network,
+    deposit_address: r.depositAddress,
+    settle_address: r.settleAddress,
+    refund_address: r.refundAddress,
+    deposit_amount_sats: r.depositAmountSats.toString(),
+    settle_amount: r.settleAmount,
+    status: r.status,
+    txid: r.txid,
+    brl_cents: r.brlCents,
+    custodial: r.custodial,
+  };
 }

@@ -25,5 +25,14 @@ export default tseslint.config(
       "@typescript-eslint/no-explicit-any": "off",
       "@typescript-eslint/no-non-null-assertion": "off"
     }
+  },
+  {
+    // Build tooling — plain Node ESM scripts (not shipped in dist). They run under
+    // Node, so `process`/`console` are legitimate globals here (unlike src/, where
+    // console is banned for the stdio JSON-RPC discipline).
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      globals: { process: "readonly", console: "readonly" }
+    }
   }
 );

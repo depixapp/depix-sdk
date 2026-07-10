@@ -33,6 +33,7 @@ import {
   payLightningInvoiceTool,
   receiveLightningTool,
   sendTool,
+  shiftUsdtTool,
   statusTool,
   swapExecuteTool,
   swapQuoteTool,
@@ -52,10 +53,9 @@ export const DEFAULT_SERVER_VERSION = "1.0.0";
 
 /**
  * The full catalog (§6.2), prefixed `wallet_` (G10). Exported for tests/docs.
- * The MVP 10 (PR8) plus the fast-follow conversions + gift cards (PR8b). SideShift
- * (wallet_shift_usdt, §5.4/G4) is intentionally absent: its wallet flow does not
- * exist on main, so there is nothing to wrap without reimplementing a custodial
- * provider (out of scope).
+ * The MVP 10 (PR8) plus the fast-follow conversions + gift cards (PR8b) plus
+ * SideShift (PR5c) — 18 tools. wallet_shift_usdt (§5.4/G4) is the ONE CUSTODIAL
+ * tool: its description says so explicitly (G4 = documentation-signalled, no gate).
  */
 export const WALLET_TOOL_NAMES = [
   "wallet_status",
@@ -75,6 +75,7 @@ export const WALLET_TOOL_NAMES = [
   "wallet_to_stablecoin",
   "wallet_buy_giftcard",
   "wallet_list_giftcard_orders",
+  "wallet_shift_usdt",
 ] as const;
 
 const INSTRUCTIONS = [
@@ -507,6 +508,30 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
       annotations: read,
     },
     () => run(() => listGiftcardOrdersTool(wallet)),
+  );
+
+  server.registerTool(
+    "wallet_shift_usdt",
+    {
+      title: "Shift USDt cross-network (SideShift — CUSTODIAL)",
+      description:
+        "Send USDt from Liquid to another network (Ethereum, Tron, BNB Smart Chain, Polygon, Solana) via SideShift. " +
+        "*** CUSTODIAL ***: this is the ONE flow where funds LEAVE the non-custodial sphere — you send USDt to " +
+        "SideShift's deposit address and THEY pay out from their reserve on the target network (escrow states, " +
+        "possible review/refund). MOVES MONEY: the USDt send passes through the owner's guardrails (value caps; with " +
+        "the allowlist on, BOTH the destination settle_address AND the refund_address must be opted in) BEFORE signing. " +
+        "amount_sats is USDt BASE UNITS. Irreversible once broadcast; the result carries custodial:true.",
+      inputSchema: s.shiftUsdtInput,
+      outputSchema: s.shiftUsdtOutput,
+      annotations: money,
+    },
+    (args) =>
+      run(() =>
+        shiftUsdtTool(
+          wallet,
+          args as { network: string; amount_sats: string; settle_address: string; refund_address?: string },
+        ),
+      ),
   );
 
   return server;

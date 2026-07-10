@@ -25,11 +25,12 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && node scripts/bake-affiliate.mjs",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "SIDESHIFT_AFFILIATE_ID=test-affiliate vitest run",
+    "test:watch": "SIDESHIFT_AFFILIATE_ID=test-affiliate vitest",
+    "prepublishOnly": "node scripts/check-affiliate-env.mjs && npm run build"
   },
   "repository": {
     "type": "git",

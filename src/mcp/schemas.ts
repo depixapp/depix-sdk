@@ -259,10 +259,12 @@ export const getGuardrailsOutput = { ...guardrailBudget().shape } as const;
 //
 // Same two disciplines as the MVP tools: units live in the field name
 // (amount_sats = the asset's BASE UNITS) and every provider that takes funds
-// OUT of the non-custodial sphere says so in its description. NOTE: SideShift
-// (wallet_shift_usdt, §5.4/G4) is intentionally NOT here — its wallet flow
-// (wallet.convert.sideshift.*) does not exist on main, so there is nothing to
-// wrap without reimplementing a custodial provider, which is out of scope.
+// OUT of the non-custodial sphere says so in its description. SideShift
+// (wallet_shift_usdt, §5.4/G4) is the ONE CUSTODIAL flow — its description says so
+// explicitly (G4 = documentation-signalled, no blocking gate).
+
+/** SideShift SEND target networks (mirror of USDT_NETWORKS shiftable ids — parity test). */
+export const SHIFT_NETWORK_IDS = ["ethereum", "tron", "bsc", "polygon", "solana"] as const;
 
 const swapAssetField = () =>
   z.enum(SEND_ASSETS).describe("A Liquid asset: DEPIX (BRL-pegged), LBTC (L-BTC) or USDT (USDt).");
@@ -345,6 +347,31 @@ export const buyGiftcardInput = {
 } as const;
 
 export const listGiftcardOrdersInput = {} as const;
+
+export const shiftUsdtInput = {
+  network: z
+    .enum(SHIFT_NETWORK_IDS)
+    .describe(
+      "Target network to send USDt to: ethereum, tron (TRC-20), bsc (BEP-20), polygon, or solana (SPL). " +
+        "A Liquid→Liquid USDt move needs no shift — use wallet_send for that.",
+    ),
+  amount_sats: amountSatsField(),
+  settle_address: z
+    .string()
+    .min(1)
+    .describe(
+      "FINAL destination address on `network` (0x… for EVM, T… for Tron, base58 for Solana). " +
+        "Checked against the destination allowlist when it is enabled (§4.3).",
+    ),
+  refund_address: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Optional Liquid address SideShift refunds the USDt to if the shift fails. Checked against " +
+        "allowlist.sideshiftRefundAddresses when the allowlist is enabled (§4.3).",
+    ),
+} as const;
 
 // ── outputs ──
 export const swapQuoteOutput = {
@@ -429,4 +456,25 @@ export const listGiftcardOrdersOutput = {
       }),
     )
     .describe("Locally tracked gift-card orders, newest first."),
+} as const;
+
+export const shiftUsdtOutput = {
+  shift_id: z.string().describe("SideShift shift id — track it at sideshift.ai/orders/<id>."),
+  network: z.string().describe("The target network the USDt was shifted to."),
+  deposit_address: z
+    .string()
+    .describe("SideShift's Liquid deposit address the USDt was sent to — CUSTODIAL: this address is theirs."),
+  settle_address: z.string().describe("The FINAL destination address on the target network."),
+  refund_address: z.string().nullable().describe("The refund address, or null when none was set."),
+  deposit_amount_sats: z.string().describe("USDt sent from the wallet (base units, as a decimal string)."),
+  settle_amount: z.string().nullable().describe("USDt that will land on the target network (decimal), when quoted."),
+  status: z.string().describe("SideShift shift status at creation (waiting/pending/…)."),
+  txid: z.string().describe("The broadcast Liquid txid of the USDt send."),
+  brl_cents: z
+    .number()
+    .int()
+    .describe("The USDt sent valued in BRL cents — what was counted against the guardrail (§4.3)."),
+  custodial: z
+    .literal(true)
+    .describe("Always true — SideShift is CUSTODIAL: once sent, the funds are in SideShift's custody, not yours."),
 } as const;
