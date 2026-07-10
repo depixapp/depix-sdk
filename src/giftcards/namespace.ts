@@ -169,8 +169,13 @@ export class GiftcardsNamespace {
 
     // KYC gate BEFORE creating an order (§5.5) — the anonymous Lightning flow
     // cannot fulfil an "e-money" brand; point the owner at the external page.
-    if (params.brand && requiresExternalCheckout(params.brand)) {
-      throw this.kycError(params.brand, countryCode);
+    // When the caller omits `brand`, resolve it from the catalog so the gate is
+    // applied pre-order rather than relying only on the 422 LOGIN_REQUIRED
+    // backstop (best-effort: a catalog lookup failure falls through to that
+    // backstop in mapCryptorefillsError, so it never blocks a fulfillable buy).
+    const brand = params.brand ?? (await this.resolveBrand(params.brandName, countryCode));
+    if (brand && requiresExternalCheckout(brand)) {
+      throw this.kycError(brand, countryCode);
     }
 
     const orderBody = buildLightningOrderBody({
@@ -189,15 +194,24 @@ export class GiftcardsNamespace {
       try {
         await this.cryptorefills.validateOrder(orderBody);
       } catch (err) {
-        throw this.mapCryptorefillsError(err, params.brand, countryCode);
+        throw this.mapCryptorefillsError(err, brand, countryCode);
       }
     }
 
+    // NOTE (§4.3 choke-point ordering): the CryptoRefills order + BOLT11 invoice
+    // are created BEFORE the guardrail/allowlist, which run at the SIGNING choke
+    // point inside boltz.payLightningInvoice → lockupLbtc.enforce (below). This is
+    // deliberate — the guardrail values the L-BTC LOCKUP amount, which only exists
+    // once Boltz has the invoice. A buy() that the caps/allowlist will block still
+    // creates an UNPAID order upstream; it commits no funds and EXPIRES on the
+    // CryptoRefills side (harmless — proven by the guardrail-block tests). A cheap
+    // pre-order allowlist dry-check would need the allowlist exposed through the
+    // Boltz seam (convert.ts), which is out of scope for this PR.
     let order;
     try {
       order = await this.cryptorefills.createOrder(orderBody);
     } catch (err) {
-      throw this.mapCryptorefillsError(err, params.brand, countryCode);
+      throw this.mapCryptorefillsError(err, brand, countryCode);
     }
 
     const orderId = String(order?.id ?? "").trim();
@@ -326,5 +340,26 @@ export class GiftcardsNamespace {
       if (detail === "LOGIN_REQUIRED") return this.kycError(brand ?? {}, countryCode);
     }
     return err;
+  }
+
+  /**
+   * Best-effort catalog lookup of a brand by name — used to apply the KYC
+   * "e-money" gate pre-order when the caller didn't pass `params.brand`. Matches
+   * on brand or family name (case-insensitive). Returns undefined on a catalog
+   * miss/failure, so the 422 LOGIN_REQUIRED mapping stays the backstop and this
+   * never blocks a fulfillable buy.
+   */
+  private async resolveBrand(brandName: string, countryCode: string): Promise<CryptorefillsBrand | undefined> {
+    const want = String(brandName ?? "").trim().toLowerCase();
+    if (!want) return undefined;
+    try {
+      const raw = await this.cryptorefills.listBrands(countryCode);
+      const all = Array.isArray(raw?.all_brands) ? raw.all_brands : [];
+      return all.find(
+        (b) => String(b?.brand ?? "").toLowerCase() === want || String(b?.family ?? "").toLowerCase() === want
+      );
+    } catch {
+      return undefined;
+    }
   }
 }

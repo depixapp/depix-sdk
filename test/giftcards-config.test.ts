@@ -94,4 +94,53 @@ describe("GiftcardConfigClient", () => {
       vi.useRealTimers();
     }
   });
+
+  it("passes an AbortSignal and ABORTS the underlying request on timeout", async () => {
+    vi.useFakeTimers();
+    try {
+      let capturedSignal: AbortSignal | undefined;
+      const fetchImpl: FetchLike = (_url, init) => {
+        capturedSignal = init.signal;
+        return new Promise<FetchResponseLike>(() => {}); // never settles on its own
+      };
+      const c = new GiftcardConfigClient({ fetch: fetchImpl, logger: SILENT, timeoutMs: 30 });
+      const p = c.getGiftcardConfig();
+      expect(capturedSignal).toBeInstanceOf(AbortSignal);
+      expect(capturedSignal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(40);
+      await expect(p).resolves.toMatchObject({ enabled: false });
+      // The timeout aborts the underlying fetch, not just the race.
+      expect(capturedSignal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("FAILS CLOSED once the last successful config is STALE and /api/config is unreachable (§5.5)", async () => {
+    let clock = 1_000_000;
+    let up = true;
+    const fetchImpl: FetchLike = async () => {
+      if (!up) throw new Error("ENOTFOUND");
+      return res(ENABLED_BODY);
+    };
+    const c = new GiftcardConfigClient({ fetch: fetchImpl, logger: SILENT, now: () => clock });
+    // A successful fetch caches enabled:true.
+    await expect(c.getGiftcardConfig()).resolves.toMatchObject({ enabled: true });
+    // Endpoint drops but we are still WITHIN the TTL → the fresh cache tolerates the blip.
+    up = false;
+    clock += 60_000; // +1 min (< 5-min TTL)
+    await expect(c.getGiftcardConfig({ force: true })).resolves.toMatchObject({ enabled: true });
+    // Past the TTL from the last success + still unreachable → fail closed to DISABLED.
+    clock += 5 * 60_000;
+    await expect(c.getGiftcardConfig()).resolves.toMatchObject({ enabled: false, splitAddress: null });
+  });
+
+  it("FAILS CLOSED when giftcardEnabled=true but giftcardSplitAddress is missing (§5.5)", async () => {
+    // A backend that ships enabled:true with no split address would drop the 1%
+    // fee output silently — treat it as broken config and disable.
+    const fetchImpl: FetchLike = async () =>
+      res({ walletEnabled: true, giftcardEnabled: true, giftcardFeeRate: 0.01, giftcardCountryDefault: "BR" });
+    const c = new GiftcardConfigClient({ fetch: fetchImpl, logger: SILENT });
+    await expect(c.getGiftcardConfig()).resolves.toMatchObject({ enabled: false, splitAddress: null });
+  });
 });

@@ -75,11 +75,17 @@ export class GiftcardConfigClient implements GiftcardConfigSource {
     if (!this.inflight) {
       this.inflight = this.fetchFresh()
         .catch((err) => {
-          // Fail-closed (§5.5): keep the previous answer if any, else feature OFF.
-          this.logger.warn("gift-card /api/config unreachable — failing closed (feature treated as OFF)", {
-            error: String((err as Error)?.message ?? err)
-          });
-          return this.cached ?? DISABLED_GIFTCARD_CONFIG;
+          this.logger.warn(
+            "gift-card /api/config unreachable — failing closed (feature OFF unless a still-fresh cache exists)",
+            { error: String((err as Error)?.message ?? err) }
+          );
+          // Fail-closed (§5.5): tolerate a SHORT blip by reusing the last config
+          // only while it is still within the cache TTL. Once the last successful
+          // fetch is stale we can no longer confirm the kill switch is off →
+          // GIFTCARDS_DISABLED. The safe side of a kill switch is OFF when the
+          // backend can't be confirmed (spec: "/api/config inalcançável → DISABLED").
+          if (this.cached && this.now() - this.cachedAt < CACHE_TTL_MS) return this.cached;
+          return DISABLED_GIFTCARD_CONFIG;
         })
         .finally(() => {
           this.inflight = null;
@@ -89,22 +95,46 @@ export class GiftcardConfigClient implements GiftcardConfigSource {
   }
 
   private async fetchFresh(): Promise<ResolvedGiftcardConfig> {
+    // Wire an AbortController (mirrors CryptorefillsClient.crFetch) so the timeout
+    // also CANCELS the underlying request, not just the race — no leaked pending
+    // socket on a hung /api/config.
+    const controller = typeof AbortController === "function" ? new AbortController() : null;
     const res = await this.withTimeout(
-      this.doFetch(this.endpoint, { method: "GET", headers: { Accept: "application/json" } })
+      this.doFetch(this.endpoint, {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        ...(controller ? { signal: controller.signal } : {})
+      }),
+      controller
     );
     if (!res.ok) throw new Error(`config HTTP ${res.status}`);
     const text = await res.text();
     const body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
-    const resolved = resolveGiftcardConfig(body);
+    let resolved = resolveGiftcardConfig(body);
+    // Broken backend config (§5.5): giftcardEnabled=true with NO giftcardSplitAddress
+    // would make buy() compute the 1% fee but DROP the fee output (no address to pay
+    // it to) — a silent under-charge. Fail closed rather than sell without the fee.
+    if (resolved.enabled && !resolved.splitAddress) {
+      this.logger.warn(
+        "gift-card /api/config has giftcardEnabled=true but no giftcardSplitAddress — " +
+          "treating as DISABLED (refusing to sell without the 1% service-fee output)"
+      );
+      resolved = DISABLED_GIFTCARD_CONFIG;
+    }
     this.cached = resolved;
     this.cachedAt = this.now();
     return resolved;
   }
 
-  private async withTimeout<T>(p: Promise<T>): Promise<T> {
+  private async withTimeout<T>(p: Promise<T>, controller?: AbortController | null): Promise<T> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("config request timed out")), this.timeoutMs);
+      timer = setTimeout(() => {
+        // Abort the underlying fetch too (not just the race) so a hung request
+        // is actually released rather than left pending in the background.
+        controller?.abort();
+        reject(new Error("config request timed out"));
+      }, this.timeoutMs);
     });
     try {
       return await Promise.race([p, timeout]);

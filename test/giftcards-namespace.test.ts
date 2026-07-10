@@ -162,6 +162,23 @@ describe("gift cards — KYC (e-money) category is not sellable (§5.5)", () => 
     expect(cr.createOrder).not.toHaveBeenCalled(); // gated BEFORE ordering
   });
 
+  it("resolves the brand from the catalog and KYC-gates e-money even without params.brand (§5.5)", async () => {
+    const cr = fakeCryptorefills({
+      brands: {
+        country_code: "BR",
+        all_brands: [{ brand: "Rewarble", family: "Rewarble", kind: "giftcard", category: "e-money" }],
+        popular_brands: []
+      }
+    });
+    const { wallet: w } = await restore({ cryptorefills: cr });
+    await expect(
+      w.giftcards.buy({ brandName: "Rewarble", denomination: "50", email: EMAIL })
+    ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "GIFTCARD_KYC_CATEGORY"));
+    // Gated pre-order via the catalog lookup — no order was ever created.
+    expect(cr.createOrder).not.toHaveBeenCalled();
+    expect(cr.listBrands).toHaveBeenCalled();
+  });
+
   it("maps a CryptoRefills 422 LOGIN_REQUIRED to GIFTCARD_KYC_CATEGORY", async () => {
     const cr = fakeCryptorefills({
       createOrderImpl: async () => {
