@@ -599,6 +599,14 @@ export class DepixWallet {
   }
 
   private async decryptMnemonic(): Promise<string> {
+    // Seed presence first: a wiped (view-only) wallet reports the truthful
+    // WALLET_NOT_FOUND instead of demanding a passphrase it cannot use.
+    if (!this.file.encryptedSeed) {
+      throw new WalletError(
+        "WALLET_NOT_FOUND",
+        `No wallet seed in ${this.dataDir} (wiped or view-only). Use DepixWallet.restore().`
+      );
+    }
     const mnemonic = await this.seedStore.decryptMnemonic(this.requirePassphrase());
     registerSecret(mnemonic);
     return mnemonic;

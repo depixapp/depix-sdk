@@ -264,6 +264,39 @@ describe("wipe() (spec §2.4 — selective)", () => {
       isDepixSdkError(err, "WALLET_NOT_FOUND")
     );
   });
+
+  it("a wiped wallet reopens view-only WITHOUT a passphrase", async () => {
+    const wallet = track(
+      await DepixWallet.restore({ dataDir, passphrase: PASSPHRASE, mnemonic: KNOWN_MNEMONIC })
+    );
+    const descriptor = wallet.getDescriptor();
+    await wallet.wipe();
+    await wallet.close();
+    const viewOnly = track(await DepixWallet.open({ dataDir })); // no passphrase
+    expect(viewOnly.getDescriptor()).toBe(descriptor);
+    const { balances } = await viewOnly.getBalances();
+    expect(balances.DEPIX).toBe(0n);
+    await expect(viewOnly.exportMnemonic()).rejects.toSatisfy((err: unknown) =>
+      isDepixSdkError(err, "WALLET_NOT_FOUND")
+    );
+  });
+});
+
+describe("backup gate persistence", () => {
+  it("backupConfirmed: false survives a restart — the gate holds after reopen", async () => {
+    const { wallet } = await DepixWallet.create({ dataDir, passphrase: PASSPHRASE });
+    track(wallet);
+    await wallet.close();
+    const reopened = track(await DepixWallet.open({ dataDir, passphrase: PASSPHRASE }));
+    expect(reopened.isBackupConfirmed()).toBe(false);
+    await expect(reopened.getReceiveAddress()).rejects.toSatisfy((err: unknown) =>
+      isDepixSdkError(err, "BACKUP_REQUIRED")
+    );
+    await reopened.confirmBackup();
+    await reopened.close();
+    const third = track(await DepixWallet.open({ dataDir, passphrase: PASSPHRASE }));
+    expect(third.isBackupConfirmed()).toBe(true);
+  });
 });
 
 describe("read surface", () => {

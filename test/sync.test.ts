@@ -183,3 +183,33 @@ describe.skipIf(process.env.DEPIX_SDK_OFFLINE === "1")("mainnet integration (rea
     }
   }, 120_000);
 });
+
+describe("provider fallback with mocked fetch (real EsploraClient, inline mode)", () => {
+  it("walks the whole chain at the network layer and surfaces ESPLORA_UNAVAILABLE", async () => {
+    const realFetch = globalThis.fetch;
+    const seenUrls: string[] = [];
+    // The lwk_node wasm glue resolves HTTP through the global fetch — stub it
+    // so every provider fails at the network layer, no sockets involved.
+    globalThis.fetch = (async (input: Parameters<typeof fetch>[0]) => {
+      seenUrls.push(String(input instanceof Request ? input.url : input));
+      throw new Error("network down (mocked fetch)");
+    }) as typeof fetch;
+    try {
+      const engine = new SyncEngine({
+        descriptor: descriptorFromMnemonic(KNOWN_MNEMONIC),
+        dataDir,
+        updateStore: new UpdateStore(dataDir),
+        worker: false, // inline: the scan runs in-thread where fetch is stubbed
+        syncTimeoutMs: 10_000
+      });
+      await expect(engine.sync(wollet)).rejects.toSatisfy((err: unknown) =>
+        isDepixSdkError(err, "ESPLORA_UNAVAILABLE")
+      );
+      // Both default providers were attempted against the canonical base.
+      expect(seenUrls.length).toBeGreaterThanOrEqual(2);
+      expect(seenUrls.every((url) => url.includes("api.depixapp.com/api/esplora"))).toBe(true);
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+});
