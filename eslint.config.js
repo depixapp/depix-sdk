@@ -7,7 +7,10 @@ import tseslint from "typescript-eslint";
 
 export default tseslint.config(
   {
-    ignores: ["dist/", "node_modules/", "coverage/"]
+    // dist/coverage are build artifacts; scripts/ holds operational Node ESM
+    // helpers (smoke, openapi-diff, publish guard) run directly by `node` — they
+    // are not part of the shipped package source and use Node globals freely.
+    ignores: ["dist/", "node_modules/", "coverage/", "scripts/"]
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,

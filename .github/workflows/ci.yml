@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same ref (keeps the matrix from piling up).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ── Version × platform matrix (spec §8.5) ──────────────────────────────────
+  # The spike only ran on Node 25.2.1, so "zero flags at the 22.4 floor" is
+  # extrapolated until the matrix proves it. Node 22.4 is the engines floor (the
+  # WebSocket-stable minor). Windows is intentionally OUT of the 1.0 matrix
+  # (0600/0700 perms are no-ops there, dataDir lock unvalidated — §2.2); WSL is
+  # the documented path.
+  test:
+    name: node ${{ matrix.node }} · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        node: ["22.4", "24", "latest"] # 22.4 (LTS floor) + 24 (LTS) + current
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+
+      # .npmrc pins `legacy-peer-deps=true` (the boltz peer set) + `save-exact`,
+      # so `npm ci` picks both up without extra flags.
+      - name: Install (npm ci)
+        run: npm ci
+
+      - name: Typecheck (tsc --noEmit)
+        run: npm run typecheck
+
+      - name: Lint (eslint .)
+        run: npm run lint
+
+      - name: Test (offline unit/sandbox/contract suite)
+        env:
+          # Baked-affiliate-id source resolves to a placeholder in tests; offline
+          # skips every live-network integration test (§8.3/§8.5).
+          SIDESHIFT_AFFILIATE_ID: test-affiliate
+          DEPIX_SDK_OFFLINE: "1"
+        run: npm test
+
+      - name: Build (tsc -p tsconfig.build.json)
+        run: npm run build
+
+      # Smoke the COMPILED dist on this Node/OS (spec §8.5): lwk_node wasm init +
+      # Pset.addDetails export, descriptor + addr[0] goldens, and a seed-store
+      # encrypt/decrypt roundtrip (incl. dataDir lock via open()).
+      - name: Smoke (built artifact)
+        run: npm run smoke
+
+  # ── OpenAPI drift — NON-BLOCKING (spec §8.2) ───────────────────────────────
+  # Diffs the vendored fixture (test/fixtures/openapi.json) against the live
+  # document and reports drift LOUDLY without failing the build. No deps needed:
+  # the checker uses only Node built-ins (readFile + fetch).
+  openapi-drift:
+    name: openapi drift (advisory)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "latest"
+      - name: Diff vendored OpenAPI fixture against live
+        run: npm run openapi:diff
