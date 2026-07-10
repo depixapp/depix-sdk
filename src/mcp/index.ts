@@ -22,8 +22,18 @@ export {
 
 export {
   type McpWalletFacade,
+  type McpConvertFacade,
+  type McpBoltzFacade,
+  type McpGiftcardsFacade,
   type ToolContext,
 } from "./tools.js";
+
+export {
+  SwapStreamRegistry,
+  ABANDON_GRACE_MS,
+  type McpSwapFacade,
+  type McpSwapQuoteStream,
+} from "./swap-streams.js";
 
 export {
   MAX_WAIT_SECONDS_CEILING,
@@ -31,6 +41,10 @@ export {
   DEFAULT_POLL_INTERVAL_SECONDS,
   MIN_POLL_INTERVAL_SECONDS,
   SEND_ASSETS,
+  SWAP_QUOTE_DEFAULT_WAIT_SECONDS,
+  SWAP_QUOTE_MAX_WAIT_SECONDS,
+  STABLECOIN_ASSETS,
+  STABLECOIN_NETWORK_IDS,
 } from "./schemas.js";
 
 export {

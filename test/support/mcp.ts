@@ -2,7 +2,13 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createWalletMcpServer, type CreateWalletMcpServerOptions } from "../../src/mcp/server.js";
-import type { McpWalletFacade } from "../../src/mcp/tools.js";
+import type {
+  McpBoltzFacade,
+  McpConvertFacade,
+  McpGiftcardsFacade,
+  McpWalletFacade,
+} from "../../src/mcp/tools.js";
+import type { McpSwapQuoteStream } from "../../src/mcp/swap-streams.js";
 import type {
   DepositParams,
   DepositResult,
@@ -16,10 +22,179 @@ import type {
 } from "../../src/wallet.js";
 import type { StatusReadResponse } from "../../src/api/client.js";
 import type { WaitOptions } from "../../src/flows/status.js";
+import type {
+  PayLightningResult,
+  ReceiveLightningResult,
+  ToStablecoinResult,
+} from "../../src/convert/boltz/convert.js";
+import type { StablecoinParams } from "../../src/convert/boltz/stablecoin.js";
+import type { SideSwapQuote, SwapExecuteResult, SwapQuoteParams } from "../../src/convert/sideswap.js";
+import type { BuyGiftcardParams, BuyGiftcardResult } from "../../src/giftcards/namespace.js";
+import type { StoredGiftcardOrder } from "../../src/giftcards/store.js";
 
 export interface RecordedCall {
   method: keyof McpWalletFacade;
   args: unknown[];
+}
+
+/** A fake SideSwap quote stream: records next/execute/close, no real socket. */
+export class FakeSwapStream implements McpSwapQuoteStream {
+  closed = 0;
+  nextCalls = 0;
+  executeCalls = 0;
+  constructor(
+    public quote: SideSwapQuote,
+    public execResult: SwapExecuteResult,
+    public opts: { nextError?: unknown; executeError?: unknown } = {},
+  ) {}
+  async next(): Promise<SideSwapQuote> {
+    this.nextCalls++;
+    if (this.opts.nextError) throw this.opts.nextError;
+    return this.quote;
+  }
+  async execute(): Promise<SwapExecuteResult> {
+    this.executeCalls++;
+    if (this.opts.executeError) throw this.opts.executeError;
+    return this.execResult;
+  }
+  close(): void {
+    this.closed++;
+  }
+}
+
+function defaultQuote(): SideSwapQuote {
+  return {
+    quoteId: 42,
+    from: "DEPIX",
+    to: "LBTC",
+    sendAmountSats: 100_000n,
+    recvAmountSats: 900n,
+    serverFeeSats: 5n,
+    fixedFeeSats: 26n,
+    feeAsset: null,
+    ttlMs: 20_000,
+    expiresAt: Date.now() + 20_000,
+    receiveAddress: "lq1qrecv",
+  };
+}
+
+/** Configurable wallet.convert fake (SideSwap stream + Boltz namespace). */
+export class FakeConvert implements McpConvertFacade {
+  swapQuoteCalls: SwapQuoteParams[] = [];
+  boltzCalls: Array<{ method: string; args: unknown }> = [];
+  stream = new FakeSwapStream(defaultQuote(), {
+    txid: "swap".padEnd(64, "0"),
+    from: "DEPIX",
+    to: "LBTC",
+    sendAmountSats: 100_000n,
+    recvAmountSats: 900n,
+    brlCents: 10_000,
+  });
+  quoteError?: unknown;
+  /** When set, the `boltz` GETTER throws (view-only/wiped wallet parity). */
+  boltzThrows?: unknown;
+  boltzMethodThrows: Partial<Record<"payLightningInvoice" | "receiveLightning" | "toStablecoin", unknown>> = {};
+
+  payResult: PayLightningResult = {
+    swapId: "sub_1",
+    lockupTxid: "lock".padEnd(64, "0"),
+    expectedAmountSats: 90_000,
+    invoiceSats: 89_000,
+    invoice: "lnbc890...",
+    completion: Promise.resolve({ swapId: "sub_1", status: "paid" }),
+  };
+  receiveResult: ReceiveLightningResult = {
+    swapId: "rev_1",
+    invoice: "lnbc50...",
+    lockupAddress: "lq1qlockup",
+    amountSats: 50_000,
+    // The tools never read completion; keep the fake free of ReverseOutcome plumbing.
+    completion: Promise.resolve(null as never),
+  };
+  stablecoinResult: ToStablecoinResult = {
+    swapId: "chain_1",
+    lockupTxid: "clk".padEnd(64, "0"),
+    lockAmountSats: 120_000,
+    asset: "USDC",
+    networkId: "polygon",
+    claimAddress: "0xrecipient",
+    completion: Promise.resolve({ swapId: "chain_1", status: "settled" }),
+  };
+
+  readonly sideswap = {
+    quote: async (params: SwapQuoteParams): Promise<McpSwapQuoteStream> => {
+      this.swapQuoteCalls.push(params);
+      if (this.quoteError) throw this.quoteError;
+      return this.stream;
+    },
+  };
+
+  private readonly boltzImpl: McpBoltzFacade = {
+    payLightningInvoice: async (params: { invoice: string }): Promise<PayLightningResult> => {
+      this.boltzCalls.push({ method: "payLightningInvoice", args: params });
+      if (this.boltzMethodThrows.payLightningInvoice) throw this.boltzMethodThrows.payLightningInvoice;
+      return this.payResult;
+    },
+    receiveLightning: async (params: { amountSats: number }): Promise<ReceiveLightningResult> => {
+      this.boltzCalls.push({ method: "receiveLightning", args: params });
+      if (this.boltzMethodThrows.receiveLightning) throw this.boltzMethodThrows.receiveLightning;
+      return this.receiveResult;
+    },
+    toStablecoin: async (params: StablecoinParams): Promise<ToStablecoinResult> => {
+      this.boltzCalls.push({ method: "toStablecoin", args: params });
+      if (this.boltzMethodThrows.toStablecoin) throw this.boltzMethodThrows.toStablecoin;
+      return this.stablecoinResult;
+    },
+  };
+
+  get boltz(): McpBoltzFacade {
+    if (this.boltzThrows) throw this.boltzThrows;
+    return this.boltzImpl;
+  }
+}
+
+/** Configurable wallet.giftcards fake. */
+export class FakeGiftcards implements McpGiftcardsFacade {
+  buyCalls: BuyGiftcardParams[] = [];
+  buyError?: unknown;
+  buyResult: BuyGiftcardResult = {
+    orderId: "ord_1",
+    invoice: "lnbc123...",
+    swapId: "gc_sub_1",
+    lockupTxid: "gclk".padEnd(64, "0"),
+    invoiceSats: 25_000,
+    feeSats: 250n,
+    expectedAmountSats: 26_000,
+    totalSats: 26_250n,
+    beneficiaryAccount: "user@example.com",
+    completion: Promise.resolve({ swapId: "gc_sub_1", status: "paid" }),
+  };
+  orders: StoredGiftcardOrder[] = [
+    {
+      orderId: "ord_1",
+      brandName: "Amazon",
+      denomination: "50",
+      beneficiaryAccount: "user@example.com",
+      invoice: "lnbc123...",
+      invoiceSats: 25_000,
+      feeSats: "250",
+      expectedAmountSats: 26_000,
+      swapId: "gc_sub_1",
+      lockupTxid: "gclk".padEnd(64, "0"),
+      phase: "pending",
+      createdAt: 1_720_000_000_000,
+      updatedAt: 1_720_000_050_000,
+    },
+  ];
+
+  async buy(params: BuyGiftcardParams): Promise<BuyGiftcardResult> {
+    this.buyCalls.push(params);
+    if (this.buyError) throw this.buyError;
+    return this.buyResult;
+  }
+  async listOrders(): Promise<StoredGiftcardOrder[]> {
+    return this.orders;
+  }
 }
 
 /**
@@ -30,6 +205,10 @@ export interface RecordedCall {
 export class FakeWallet implements McpWalletFacade {
   calls: RecordedCall[] = [];
   throws: Partial<Record<keyof McpWalletFacade, unknown>> = {};
+
+  /** wallet.convert / wallet.giftcards fakes backing the fast-follow tools. */
+  readonly convert = new FakeConvert();
+  readonly giftcards = new FakeGiftcards();
 
   backupConfirmed = true;
   guardrails: GuardrailReadout = {
