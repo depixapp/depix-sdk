@@ -43,6 +43,8 @@ export interface GuardrailAllowlist {
   btcAddresses?: string[];
   /** settle address of a Boltz stablecoin swap (EVM, PR5b). */
   evmAddresses?: string[];
+  /** settle address of a Boltz stablecoin swap (Tron TRC-20, base58 — case-SENSITIVE, exact match). */
+  tronAddresses?: string[];
   /** beneficiary_account of a CryptoRefills gift card. */
   giftcardBeneficiaries?: string[];
   /** refundAddress of a SideShift shift. */
@@ -65,6 +67,7 @@ export interface ResolvedAllowlist {
   readonly allowLightning: boolean;
   readonly btcAddresses: readonly string[];
   readonly evmAddresses: readonly string[];
+  readonly tronAddresses: readonly string[];
   readonly giftcardBeneficiaries: readonly string[];
   readonly sideshiftRefundAddresses: readonly string[];
 }
@@ -122,6 +125,7 @@ function resolveAllowlist(input: GuardrailAllowlist | undefined): ResolvedAllowl
       allowLightning: false,
       btcAddresses: Object.freeze([]),
       evmAddresses: Object.freeze([]),
+      tronAddresses: Object.freeze([]),
       giftcardBeneficiaries: Object.freeze([]),
       sideshiftRefundAddresses: Object.freeze([])
     });
@@ -139,6 +143,7 @@ function resolveAllowlist(input: GuardrailAllowlist | undefined): ResolvedAllowl
     allowLightning: input.allowLightning === true,
     btcAddresses: asStringArray(input.btcAddresses, "btcAddresses"),
     evmAddresses: asStringArray(input.evmAddresses, "evmAddresses"),
+    tronAddresses: asStringArray(input.tronAddresses, "tronAddresses"),
     giftcardBeneficiaries: asStringArray(input.giftcardBeneficiaries, "giftcardBeneficiaries"),
     sideshiftRefundAddresses: asStringArray(input.sideshiftRefundAddresses, "sideshiftRefundAddresses")
   });

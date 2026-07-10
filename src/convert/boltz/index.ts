@@ -1,4 +1,4 @@
-// Boltz Lightning namespace (spec §5.3) — public surface + internals barrel.
+// Boltz Lightning + stablecoin namespace (spec §5.3) — public surface + internals barrel.
 
 export {
   BoltzConvert,
@@ -7,8 +7,42 @@ export {
   type PayLightningResult,
   type ReceiveLightningResult,
   type SubmarineOutcome,
-  type BoltzResumeSummary
+  type BoltzResumeSummary,
+  type ToStablecoinResult,
+  type StablecoinOutcome
 } from "./convert.js";
+export {
+  boltzVariantKey,
+  checkStablecoinAmount,
+  deriveStablecoinKeys,
+  estimateStablecoinOut,
+  isValidTronAddress,
+  mapChainSwapStatus,
+  // prepareStablecoinRoute / PreparedStablecoinRoute stay internal (return raw
+  // ephemeral key bytes) — reachable only via toStablecoin, never the barrel.
+  executeStablecoinRoute,
+  withEphemeralEvmSigner,
+  buildLocalSigner,
+  loadViem,
+  ensureStablecoinConfig,
+  resetStablecoinConfigForTests,
+  BOLTZ_STABLECOIN_NETWORKS,
+  MAX_CHAIN_TIMEOUT_BLOCKS,
+  STABLECOIN_MAX_FEE_RATIO,
+  STABLECOIN_DECIMALS,
+  type StablecoinAsset,
+  type StablecoinParams,
+  type StablecoinEstimate,
+  type CheckStablecoinAmountResult,
+  type LocalEvmSigner
+} from "./stablecoin.js";
+export {
+  refundChainSwap,
+  buildChainRefundTx,
+  type ChainRefundRecord,
+  type ChainRefundDeps
+} from "./refund.js";
+export { type StoredStablecoinSwap } from "./store.js";
 export { BoltzClient, BOLTZ_API_BASE, BOLTZ_WS_URL, ensureBoltzConfig } from "./client.js";
 export { BoltzApiError, ConversionError } from "../../errors.js";
 export {

@@ -33,7 +33,8 @@ export type GuardrailDestination =
   | { kind: "pixKey"; pixKey: string } // withdraw()
   | { kind: "lightning" } // Boltz submarine / gift-card BOLT11 payee
   | { kind: "btcAddress"; address: string } // SideSwap peg-out recv_addr
-  | { kind: "evmAddress"; address: string } // Boltz stablecoin settle
+  | { kind: "evmAddress"; address: string } // Boltz stablecoin settle (EVM, case-insensitive)
+  | { kind: "tronAddress"; address: string } // Boltz stablecoin settle (Tron TRC-20, base58 — case-sensitive)
   | { kind: "giftcardBeneficiary"; beneficiary: string } // CryptoRefills beneficiary_account
   | { kind: "sideshiftRefundAddress"; address: string } // SideShift refundAddress
   | { kind: "protocolBound"; note?: string }; // verified return-to-self / Eulen — exempt
@@ -89,6 +90,7 @@ export class AllowlistMatcher {
   private readonly pixKeys: ReadonlySet<string>;
   private readonly btcAddresses: ReadonlySet<string>;
   private readonly evmAddresses: ReadonlySet<string>;
+  private readonly tronAddresses: ReadonlySet<string>;
   private readonly giftcardBeneficiaries: ReadonlySet<string>;
   private readonly sideshiftRefundAddresses: ReadonlySet<string>;
 
@@ -109,6 +111,8 @@ export class AllowlistMatcher {
     this.pixKeys = new Set(allowlist.pixKeys.map(normPixKey));
     this.btcAddresses = new Set(allowlist.btcAddresses.map(normBtcAddress));
     this.evmAddresses = new Set(allowlist.evmAddresses.map(normEvm));
+    // base58check is case-SENSITIVE — store exact (normExact = trim only), never normEvm.
+    this.tronAddresses = new Set(allowlist.tronAddresses.map(normExact));
     this.giftcardBeneficiaries = new Set(allowlist.giftcardBeneficiaries.map(normExact));
     this.sideshiftRefundAddresses = new Set(allowlist.sideshiftRefundAddresses.map(normExact));
   }
@@ -182,6 +186,15 @@ export class AllowlistMatcher {
           throw allowlistError(
             "evmAddress",
             `EVM destination is not in the allowlist (allowlist.evmAddresses): ${dest.address}`
+          );
+        }
+        return;
+      case "tronAddress":
+        // base58check is case-SENSITIVE — EXACT match (trim only), never lowercased.
+        if (!this.tronAddresses.has(normExact(dest.address))) {
+          throw allowlistError(
+            "tronAddress",
+            `Tron destination is not in the allowlist (allowlist.tronAddresses): ${dest.address}`
           );
         }
         return;

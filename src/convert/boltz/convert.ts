@@ -14,11 +14,15 @@
 
 import type { GuardrailDestination } from "../../guardrails/allowlist.js";
 import type { Logger } from "../../logger.js";
+import { hex } from "@scure/base";
 import { BoltzClient } from "./client.js";
 import { deriveReverseSecrets } from "./keys.js";
 import { mapSubmarineStatus } from "./lightning.js";
 import {
+  refundChainSwap,
   refundSubmarineSwap,
+  type ChainRefundDeps,
+  type ChainRefundRecord,
   type RefundDeps,
   type RefundResult,
   type SubmarineRefundRecord
@@ -31,11 +35,23 @@ import {
   type ReverseOutcome,
   type ReverseSwapRecord
 } from "./reverse.js";
+import {
+  CHAIN_SWAP_FAILURE_STATUSES,
+  executeStablecoinRoute,
+  getStablecoinNetwork,
+  mapChainSwapStatus,
+  prepareStablecoinRoute,
+  type ExecuteStablecoinDeps,
+  type PrepareStablecoinDeps,
+  type StablecoinAsset,
+  type StablecoinParams
+} from "./stablecoin.js";
 import { prepareSubmarineSwap } from "./submarine.js";
 import type { assertLockupAddressBindsToUser } from "./verify-lockup.js";
 import {
   BoltzSwapStore,
   type StoredReverseSwap,
+  type StoredStablecoinSwap,
   type StoredSubmarineSwap
 } from "./store.js";
 
@@ -86,6 +102,20 @@ export interface BoltzConvertDeps {
   reverseCreate?: ReverseDeps["createReverseSwap"];
   getReversePairHash?: () => Promise<string>;
   maxTimeoutBlocks?: number;
+  /**
+   * Stablecoin (L-BTC → USDC/USDT EVM) overrides (§5.3, PR5b) so the flow never
+   * touches real viem/Boltz route execution in tests.
+   */
+  stablecoin?: {
+    /** createRoute / verifyLockup / deriveKeys / isKnownTokenAddress / viemImporter / getChainHeight / buildSigner overrides. */
+    prepare?: PrepareStablecoinDeps;
+    /** executeRoute / buildSigner / viemImporter / ensureConfig overrides. */
+    execute?: Omit<ExecuteStablecoinDeps, "waitForServerLockup">;
+    /** Injected chain refund driver (default refundChainSwap). */
+    refundChain?: (record: ChainRefundRecord, deps: ChainRefundDeps) => Promise<RefundResult>;
+    /** How long to wait for Boltz's destination lockup before giving up (ms). */
+    serverLockupTimeoutMs?: number;
+  };
 }
 
 export interface SubmarineOutcome {
@@ -113,10 +143,31 @@ export interface ReceiveLightningResult {
   completion: Promise<ReverseOutcome>;
 }
 
+export interface StablecoinOutcome {
+  swapId: string;
+  /** settled = delivered; pending = post-lockup failure left for resume/refund. */
+  status: "settled" | "refunded" | "refund_pending" | "pending" | "failed";
+  claimTransactionId?: string;
+  refundTxId?: string | null;
+}
+
+export interface ToStablecoinResult {
+  swapId: string;
+  lockupTxid: string;
+  lockAmountSats: number;
+  asset: StablecoinAsset;
+  networkId: string;
+  claimAddress: string;
+  /** Resolves when the swap settles (delivered) or is left pending for recovery. */
+  completion: Promise<StablecoinOutcome>;
+}
+
 export interface BoltzResumeSummary {
   submarineResumed: number;
   submarineRefunded: number;
   reverseResumed: number;
+  stablecoinResumed: number;
+  stablecoinRefunded: number;
   discarded: number;
   removed: number;
   failed: number;
@@ -384,6 +435,253 @@ export class BoltzConvert {
     }
   }
 
+  // ─── STABLECOIN (L-BTC → USDC/USDT EVM, chain swap) ──────────────────────
+
+  /**
+   * Convert L-BTC to USDC/USDT delivered to an external EVM/Tron address (§5.3,
+   * G5). Creates + verifies the Boltz chain-swap route (fail-closed cadence),
+   * persists the crash-safe refund/resume material BEFORE funding, then signs the
+   * L-BTC lockup through the guardrail choke point (the lockup amount is valued in
+   * BRL; the FINAL EVM settle address is checked against allowlist.evmAddresses —
+   * a protocol-bound lockup does NOT exempt it, §4.3). Once funded, the EVM legs
+   * (claim → DEX → bridge → deliver) run in the background signed by an EPHEMERAL
+   * viem account, gas paid by the hosted sponsor (sponsor.ccxp.space).
+   */
+  async toStablecoin(params: StablecoinParams): Promise<ToStablecoinResult> {
+    const prepared = await prepareStablecoinRoute(params, {
+      ...(this.deps.stablecoin?.prepare ?? {})
+    });
+
+    // Persist the crash-safe resume/refund material BEFORE anything is funded — a
+    // crash after the lockup broadcasts must still be recoverable (refund the
+    // L-BTC or finish the swap). The ephemeral EVM key rides in the ENCRYPTED
+    // record; the in-memory copy is zeroed right after (below).
+    const record: StoredStablecoinSwap = {
+      type: "stablecoin",
+      swapId: prepared.swapId,
+      asset: prepared.asset,
+      networkId: prepared.networkId,
+      claimAddress: prepared.claimAddress,
+      lockupAddress: prepared.lockupAddress,
+      lockAmountSats: prepared.lockAmountSats,
+      serverPublicKey: prepared.serverPublicKey,
+      swapTree: prepared.swapTree,
+      ...(prepared.blindingKey !== undefined ? { blindingKey: prepared.blindingKey } : {}),
+      timeoutBlockHeight: prepared.timeoutBlockHeight,
+      refundPrivateKeyHex: prepared.refundPrivateKeyHex,
+      refundPublicKeyHex: prepared.refundPublicKeyHex,
+      preimageHex: prepared.preimageHex,
+      evmPrivateKeyHex: hex.encode(prepared.evmPrivateKey),
+      createdSwap: prepared.createdSwap,
+      plan: prepared.plan,
+      state: "prepared",
+      createdAt: Date.now()
+    };
+    await this.ctx.store.put(record);
+    // The encrypted store copy is now the source of truth — zero the in-memory
+    // ephemeral EVM key immediately (frontend zeroInMemory parity). Every later
+    // use (execute/resume) decodes a fresh copy from the record and zeroes it too.
+    prepared.evmPrivateKey.fill(0);
+    // Also DROP the plaintext hex STRING from the long-lived in-memory record: the
+    // store already encrypted a shallow copy at rest, so this reference is the only
+    // remaining cleartext key that would otherwise linger through the (potentially
+    // slow) lockup + guardrail step below. JS strings are immutable and can't be
+    // wiped in place; the best we can do is release the reference so it is
+    // GC-eligible immediately. (The transient 0x-hex string viem materializes per
+    // signing session inside withEphemeralEvmSigner is inherent to viem and cannot
+    // be avoided.) `record` is not read again after this point.
+    record.evmPrivateKeyHex = "";
+
+    // Guardrail choke point + L-BTC lockup signing (in the wallet). The FINAL
+    // destination is the agent-chosen settle address. Dispatch by address family:
+    // EVM targets use the case-INsensitive `evmAddress` class; Tron (TRC-20) is
+    // base58check — case-SENSITIVE — so it must use the exact-match `tronAddress`
+    // class, never `evmAddress` (lowercasing a base58 identifier is semantically
+    // wrong and could, in principle, fail OPEN on a lowercased collision).
+    const settleDestination: GuardrailDestination =
+      getStablecoinNetwork(prepared.networkId)?.family === "tron"
+        ? { kind: "tronAddress", address: prepared.claimAddress }
+        : { kind: "evmAddress", address: prepared.claimAddress };
+    let lockupTxid: string;
+    try {
+      const res = await this.ctx.lockupLbtc({
+        address: prepared.lockupAddress,
+        amountSats: BigInt(prepared.lockAmountSats),
+        destinations: [settleDestination]
+      });
+      lockupTxid = res.txid;
+    } catch (err) {
+      // Same rollback rule as the submarine path: drop the record ONLY when the
+      // wallet PROVES nothing was locked (`nothingLocked`). A broadcast-stage error
+      // may arrive AFTER the L-BTC lockup propagated, and this record is the SOLE
+      // holder of `refundPrivateKeyHex` — keep it so resume() can refund.
+      const nothingLocked =
+        err !== null && typeof err === "object" && (err as { nothingLocked?: boolean }).nothingLocked === true;
+      if (nothingLocked) {
+        await this.ctx.store.remove(prepared.swapId).catch(() => {});
+      }
+      throw err;
+    }
+
+    await this.ctx.store.patch(prepared.swapId, (r) => {
+      (r as StoredStablecoinSwap).lockupTxid = lockupTxid;
+      (r as StoredStablecoinSwap).state = "locked_up";
+    });
+
+    const completion = this.executeStablecoin(prepared.swapId);
+    completion.catch(() => {});
+
+    return {
+      swapId: prepared.swapId,
+      lockupTxid,
+      lockAmountSats: prepared.lockAmountSats,
+      asset: prepared.asset,
+      networkId: prepared.networkId,
+      claimAddress: prepared.claimAddress,
+      completion
+    };
+  }
+
+  /**
+   * Finish a funded stablecoin swap: wait for Boltz's confirmed destination
+   * lockup, then run the claim → DEX → bridge with the ephemeral viem signer
+   * (zeroed after). On success the record is dropped; on a post-lockup failure the
+   * record is LEFT for resume()/refund — the L-BTC is safe either way.
+   */
+  private async executeStablecoin(swapId: string): Promise<StablecoinOutcome> {
+    let stored: StoredStablecoinSwap | null;
+    try {
+      const rec = await this.ctx.store.get(swapId);
+      stored = rec && rec.type === "stablecoin" ? rec : null;
+    } catch (err) {
+      this.logger.error("boltz stablecoin execute: could not read the swap record", {
+        swapId,
+        error: String((err as Error)?.message ?? err)
+      });
+      return { swapId, status: "pending" };
+    }
+    if (!stored) return { swapId, status: "failed" };
+
+    const executeDeps: ExecuteStablecoinDeps = {
+      waitForServerLockup: (id) => this.waitForServerLockup(id),
+      ...(this.deps.stablecoin?.execute ?? {})
+    };
+    try {
+      const { claimTransactionId } = await executeStablecoinRoute(
+        {
+          swapId: stored.swapId,
+          claimAddress: stored.claimAddress,
+          createdSwap: stored.createdSwap,
+          plan: stored.plan,
+          preimageHex: stored.preimageHex,
+          evmPrivateKeyHex: stored.evmPrivateKeyHex
+        },
+        executeDeps
+      );
+      await this.ctx.store.remove(swapId).catch(() => {});
+      return { swapId, status: "settled", claimTransactionId };
+    } catch (err) {
+      // Post-lockup failure — the L-BTC lockup is safe (refundable) and the
+      // persisted record lets resume() finish or refund. This is "pending", not a
+      // lost-funds error.
+      this.logger.error("boltz stablecoin execution failed — recovery will resume/refund on next open()", {
+        swapId,
+        error: String((err as Error)?.message ?? err)
+      });
+      return { swapId, status: "pending" };
+    }
+  }
+
+  // How long to wait for Boltz to lock the destination after our L-BTC lockup
+  // broadcasts (zero-conf is seconds; a rejected zeroconf needs ~1 L-BTC block).
+  private static readonly SERVER_LOCKUP_TIMEOUT_MS = 20 * 60_000;
+
+  /**
+   * Resolve once Boltz CONFIRMS its destination lockup ("transaction.server.
+   * confirmed"), reject on a chain-swap failure status or timeout. executeRoute
+   * does NOT poll, so calling it before the server lockup exists reverts — this
+   * mirrors the frontend's waitForServerLockup. Uses the tracked subscription so
+   * close() tears the socket + reconnect timer down.
+   */
+  private waitForServerLockup(swapId: string): Promise<void> {
+    const timeoutMs = this.deps.stablecoin?.serverLockupTimeoutMs ?? BoltzConvert.SERVER_LOCKUP_TIMEOUT_MS;
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      let unsubscribe: () => void = () => {};
+      function finish(fn: () => void): void {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try {
+          unsubscribe();
+        } catch {
+          // noop
+        }
+        fn();
+      }
+      const timer = setTimeout(
+        () => finish(() => reject(new Error("timed out waiting for the Boltz destination lockup"))),
+        timeoutMs
+      );
+      try {
+        unsubscribe = this.trackedSubscribe(swapId, (raw) => {
+          if (raw === "transaction.server.confirmed") {
+            finish(resolve);
+          } else if (CHAIN_SWAP_FAILURE_STATUSES.has(raw)) {
+            finish(() => reject(new Error(`chain swap failed before execution: ${raw}`)));
+          }
+        });
+      } catch (err) {
+        finish(() => reject(err as Error));
+      }
+    });
+  }
+
+  /**
+   * Refund one stablecoin (chain) L-BTC lockup. On success the record is dropped;
+   * on RefundPendingError (timeout not reached) it is marked refund_pending +
+   * outcome:refund so resume() retries and never re-attempts execution.
+   */
+  private async refundStablecoin(
+    record: StoredStablecoinSwap
+  ): Promise<{ refunded: boolean; refundTxId?: string | null }> {
+    const refundFn = this.deps.stablecoin?.refundChain ?? refundChainSwap;
+    const refundDeps: ChainRefundDeps = {
+      getRefundAddress: () => this.ctx.getReceiveAddress(),
+      getBlockHeight: () => this.client.getChainHeight("L-BTC")
+    };
+    try {
+      const res = await refundFn(
+        {
+          swapId: record.swapId,
+          serverPublicKey: record.serverPublicKey,
+          swapTree: record.swapTree,
+          ...(record.blindingKey !== undefined ? { blindingKey: record.blindingKey } : {}),
+          timeoutBlockHeight: record.timeoutBlockHeight,
+          refundPrivateKeyHex: record.refundPrivateKeyHex,
+          refundPublicKeyHex: record.refundPublicKeyHex
+        },
+        refundDeps
+      );
+      await this.ctx.store.remove(record.swapId).catch(() => {});
+      return { refunded: true, refundTxId: res.refundTxId };
+    } catch (err) {
+      if ((err as { refundPending?: boolean }).refundPending) {
+        await this.ctx.store
+          .patch(record.swapId, (r) => {
+            (r as StoredStablecoinSwap).state = "refund_pending";
+            (r as StoredStablecoinSwap).outcome = "refund";
+          })
+          .catch(() => {});
+        this.logger.warn("boltz stablecoin refund pending (timeout not reached) — will retry on resume", {
+          swapId: record.swapId
+        });
+        return { refunded: false };
+      }
+      throw err;
+    }
+  }
+
   // ─── LN RECEIVE (reverse) ────────────────────────────────────────────────
 
   /**
@@ -457,6 +755,8 @@ export class BoltzConvert {
       submarineResumed: 0,
       submarineRefunded: 0,
       reverseResumed: 0,
+      stablecoinResumed: 0,
+      stablecoinRefunded: 0,
       discarded: 0,
       removed: 0,
       failed: 0
@@ -482,6 +782,8 @@ export class BoltzConvert {
       try {
         if (record.type === "submarine") {
           await this.resumeSubmarine(record, summary);
+        } else if (record.type === "stablecoin") {
+          await this.resumeStablecoin(record, summary);
         } else {
           await this.resumeReverse(record, summary);
         }
@@ -556,5 +858,42 @@ export class BoltzConvert {
       })
     );
     summary.reverseResumed++;
+  }
+
+  private async resumeStablecoin(record: StoredStablecoinSwap, summary: BoltzResumeSummary): Promise<void> {
+    // Reconcile with Boltz to decide finish (server-locked → execute) vs refund
+    // (failed/expired) vs still-pending. A swap we've already decided will refund
+    // (outcome:refund) never re-attempts execution — straight to refund.
+    let bucket: ReturnType<typeof mapChainSwapStatus>;
+    try {
+      const status = await this.client.getSwapStatus(record.swapId);
+      bucket = mapChainSwapStatus(status?.status);
+    } catch {
+      bucket = null;
+    }
+
+    if (bucket === "done") {
+      await this.ctx.store.remove(record.swapId).catch(() => {});
+      summary.removed++;
+      return;
+    }
+    if (record.outcome === "refund" || bucket === "refund" || record.state === "refund_pending") {
+      const r = await this.refundStablecoin(record);
+      if (r.refunded) summary.stablecoinRefunded++;
+      else summary.stablecoinResumed++; // refund_pending — will retry next resume
+      return;
+    }
+    if (bucket === "resume" || record.state === "locked_up") {
+      // Server-locked (or funded, awaiting) — finish the swap in the background.
+      const completion = this.executeStablecoin(record.swapId);
+      completion.catch(() => {});
+      summary.stablecoinResumed++;
+      return;
+    }
+    // Still pending (user lockup not yet server-locked) — re-attach execution,
+    // which waits for the server lockup before claiming.
+    const completion = this.executeStablecoin(record.swapId);
+    completion.catch(() => {});
+    summary.stablecoinResumed++;
   }
 }

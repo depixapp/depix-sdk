@@ -157,6 +157,19 @@ describe("evmAddresses — Boltz stablecoin settle (case-insensitive)", () => {
   });
 });
 
+describe("tronAddresses — Boltz stablecoin settle (Tron TRC-20, base58 case-SENSITIVE)", () => {
+  const TRON = "TJRabPrwbZy45sbavfcjinPJC18kjpRTv8";
+  it("matches EXACTLY and never lowercases (base58check is case-significant)", () => {
+    const m = matcherFor({ enabled: true, tronAddresses: [TRON] });
+    expect(() => m.check([{ kind: "tronAddress", address: TRON }])).not.toThrow();
+    // Same address lower-cased is a DIFFERENT (invalid) base58 string — must NOT match.
+    expectBlocked(() => m.check([{ kind: "tronAddress", address: TRON.toLowerCase() }]), "tronAddress");
+    expectBlocked(() => m.check([{ kind: "tronAddress", address: "TOtherAddress0000000000000000000000" }]), "tronAddress");
+    const none = matcherFor({ enabled: true });
+    expectBlocked(() => none.check([{ kind: "tronAddress", address: TRON }]), "tronAddress");
+  });
+});
+
 describe("giftcardBeneficiaries — CryptoRefills beneficiary_account", () => {
   it("passes an opted-in beneficiary, blocks others and non-opt-in", () => {
     const m = matcherFor({ enabled: true, giftcardBeneficiaries: ["acct-123"] });

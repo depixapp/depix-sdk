@@ -67,7 +67,28 @@ export {
   type ReverseOutcome,
   type StoredBoltzSwap,
   type StoredSubmarineSwap,
-  type StoredReverseSwap
+  type StoredReverseSwap,
+  // Boltz stablecoin (§5.3, PR5b — L-BTC → USDC/USDT EVM)
+  boltzVariantKey,
+  checkStablecoinAmount,
+  estimateStablecoinOut,
+  isValidTronAddress,
+  mapChainSwapStatus,
+  // prepareStablecoinRoute / PreparedStablecoinRoute are intentionally NOT
+  // re-exported (kept internal): the primitive returns the raw ephemeral EVM key
+  // bytes, a footgun on the public surface. The public entry point is toStablecoin.
+  refundChainSwap,
+  BOLTZ_STABLECOIN_NETWORKS,
+  MAX_CHAIN_TIMEOUT_BLOCKS,
+  STABLECOIN_MAX_FEE_RATIO,
+  type StablecoinAsset,
+  type StablecoinParams,
+  type ToStablecoinResult,
+  type StablecoinOutcome,
+  type StablecoinEstimate,
+  type CheckStablecoinAmountResult,
+  type StoredStablecoinSwap,
+  type ChainRefundRecord
 } from "./convert/boltz/index.js";
 
 export {
