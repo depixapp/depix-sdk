@@ -608,7 +608,9 @@ export class DepixWallet {
     // point inside the provider methods. wallet.convert stays the home of the
     // advanced namespaces AND becomes callable with a high-level intent.
     this.intentDeps = intentDepsFromNamespace(convertNs, parts.convert?.intent);
-    this.convert = makeConvertFacade(convertNs, this.intentDeps);
+    // Pass assertOpen so the callable facade fails fast on a closed wallet — parity
+    // with wallet.quote() (§ money methods all assertOpen() first).
+    this.convert = makeConvertFacade(convertNs, this.intentDeps, () => this.assertOpen());
     // Gift cards (§5.5): browse + buy via CryptoRefills, paid over Lightning by
     // REUSING the same BoltzConvert instance as wallet.convert.boltz (so the
     // guardrail choke point + refund/watch machinery is shared, not duplicated).

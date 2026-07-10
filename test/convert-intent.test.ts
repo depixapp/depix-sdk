@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ASSETS } from "../src/assets.js";
 import { isDepixSdkError } from "../src/errors.js";
-import { convertIntent, quoteRoutes, type IntentDeps } from "../src/convert/intent.js";
+import { convertIntent, quoteRoutes, makeConvertFacade, type IntentDeps } from "../src/convert/intent.js";
 import type { SideSwapQuote, SwapExecuteResult } from "../src/convert/sideswap.js";
 
 const ROUTE_DEPIX_BOLTZ =
@@ -546,6 +546,8 @@ describe("convertIntent — sideswap pegs", () => {
     expect(res.status).toBe("pending");
     expect(res.txids).toEqual(["lbtc_send_txid"]);
     expect(res.nextStep).toMatch(/pegStatus/);
+    // Non-terminal: the BTC is not paid out yet — never report the order estimate.
+    expect(res.receivedSats).toBe(null);
   });
 
   it("pegOut with wait:false returns right after the L-BTC send", async () => {
@@ -556,6 +558,7 @@ describe("convertIntent — sideswap pegs", () => {
     );
     expect(ss.pegStatusCalls).toHaveLength(0);
     expect(res.status).toBe("pending");
+    expect(res.receivedSats).toBe(null);
   });
 
   it("pegIn returns the BTC funding address immediately (inflow never blocks)", async () => {
@@ -707,6 +710,30 @@ describe("convertIntent — sideshift (polling hidden, custodial signalled)", ()
     expect(shift.sendCalls[0]).toMatchObject({ refundAddress: "lq1refund" });
     expect(res.status).toBe("pending");
     expect(res.nextStep).toMatch(/getStatus|status/i);
+    // CUSTODIAL mid-flight: the quoted settleAmount must NOT surface as a receipt.
+    expect(res.receivedSats).toBe(null);
+  });
+
+  it("send with wait:false returns pending WITHOUT a received amount (custodial mid-flight, not delivered)", async () => {
+    const { deps, shift } = makeDeps();
+    const res = await convertIntent(
+      {
+        from: "USDT",
+        to: "USDT",
+        network: "ethereum",
+        amount: 2_000_000_000n,
+        address: "0xdest",
+        wait: false
+      },
+      deps
+    );
+    expect(res.status).toBe("pending");
+    expect(res.custodial).toBe(true);
+    // The shift only just deposited — SideShift still holds the USDt. The quoted
+    // settleAmount must not read as delivered.
+    expect(res.receivedSats).toBe(null);
+    // wait:false short-circuits BEFORE any getStatus poll.
+    expect(shift.statusCalls).toHaveLength(0);
   });
 
   it("receive returns the external deposit address immediately (inflow, custodial)", async () => {
@@ -731,5 +758,30 @@ describe("convertIntent — sideshift (polling hidden, custodial signalled)", ()
     await expect(
       convertIntent({ from: "USDT", to: "USDT", network: "liquid", amount: 1n }, deps)
     ).rejects.toSatisfy((e) => isDepixSdkError(e, "MULTIPLE_ROUTES_AVAILABLE"));
+  });
+});
+
+describe("makeConvertFacade — sub-namespace getters are non-enumerable", () => {
+  it("incidental enumeration (spread/keys) does NOT invoke the throwing .boltz getter on a view-only wallet", () => {
+    // View-only wallet: the `.boltz` getter throws WALLET_NOT_FOUND (gate by design).
+    const ns = {
+      get sideswap() {
+        return { tag: "sideswap" };
+      },
+      get sideshift() {
+        return { tag: "sideshift" };
+      },
+      get boltz(): never {
+        throw new Error("view-only WALLET_NOT_FOUND");
+      }
+    } as unknown as Parameters<typeof makeConvertFacade>[0];
+    const facade = makeConvertFacade(ns, {} as IntentDeps);
+    // Spreading / walking own enumerable keys must NOT trip the throwing getter…
+    expect(() => ({ ...facade })).not.toThrow();
+    expect(Object.keys(facade)).not.toContain("boltz");
+    // …but explicit property access still gates as designed…
+    expect(() => facade.boltz).toThrow(/view-only/);
+    // …and the non-throwing namespaces remain reachable by property access.
+    expect((facade.sideswap as unknown as { tag: string }).tag).toBe("sideswap");
   });
 });

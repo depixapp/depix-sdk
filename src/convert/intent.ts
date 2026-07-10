@@ -250,6 +250,24 @@ function legAsConvertCall(leg: RouteLeg): string {
   return `convert({ from: '${leg.from}', to: '${leg.to}', network: '${leg.network}'${fromNetwork}, amount: <bigint> })`;
 }
 
+/**
+ * Narrow a bigint sats amount to the `number` a boltz provider method expects.
+ * These legs are LBTC-denominated (BTC sats), so the value stays far below 2^53
+ * (~90M BTC) — safe in practice. This is the ONLY place the otherwise-bigint
+ * pipeline drops to float, so guard the bound explicitly rather than let a
+ * precision cliff pass silently.
+ */
+function toProviderAmount(amountSats: bigint): number {
+  if (amountSats > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new WalletError("INVALID_AMOUNT", `amount ${amountSats} exceeds the provider's safe-integer bound`, {
+      details: {
+        nextStep: `split the conversion into smaller amounts (max ${Number.MAX_SAFE_INTEGER} sats per leg).`
+      }
+    });
+  }
+  return Number(amountSats);
+}
+
 function validateIntent(intent: ConvertIntent): void {
   if (typeof intent.amount !== "bigint" || intent.amount <= 0n) {
     throw new WalletError("INVALID_AMOUNT", "amount must be a positive bigint (8-decimal base units of `from`)", {
@@ -361,8 +379,19 @@ async function estimateLeg(leg: RouteLeg, amountIn: bigint, deps: IntentDeps): P
         networkId: leg.network,
         amountSats: Number(amountIn)
       });
-      // Normalize the EVM-decimals receipt to the SDK's 8-decimal base units.
-      const scale = 10n ** BigInt(Math.max(0, 8 - est.decimals));
+      // Normalize the EVM-decimals receipt to the SDK's 8-decimal base units by
+      // UP-scaling. Every boltz stablecoin is ≤8-decimal today (STABLECOIN_DECIMALS=6),
+      // so 8 - decimals ≥ 0. A >8-decimal token would need DOWN-scaling (divide); the
+      // former Math.max(0, …) clamp would instead leave scale=1 and SILENTLY over-report
+      // the receipt by 10^(decimals-8). Fail loud if a future boltz variant breaks the
+      // assumption (estimate-only path — surfaced upstream as a route note, never a
+      // bad number). None exists today.
+      if (est.decimals > 8) {
+        throw new Error(
+          `stablecoin decimals ${est.decimals} > 8 not supported: up-scaling would over-report the receipt`
+        );
+      }
+      const scale = 10n ** BigInt(8 - est.decimals);
       const percentFee =
         typeof est.boltzPercent === "number" && est.boltzPercent > 0
           ? BigInt(Math.ceil((Number(amountIn) * est.boltzPercent) / 100))
@@ -488,19 +517,32 @@ function resolveSingleRoute(params: ConvertParams): Route {
     // to resolve: the agent compares via quote() and passes `route`.
     const singleHop = routes.filter((r) => r.hops === 1);
     if (singleHop.length !== 1) {
-      throw conversionError(
-        "MULTIPLE_ROUTES_AVAILABLE",
-        `${routes.length} candidate route(s) resolve this intent — the SDK does not choose for you.`,
-        {
-          routes: routes.map(routeForDetails),
-          nextStep:
-            "call wallet.quote({ from, to, network, amount }) to compare estimates (fees, receipts, custodial " +
-            "flags), then pass your choice back: wallet.convert({ ..., route: '<route id>' }). A multi-hop " +
-            "candidate is not yet automated — run each leg as its own single-hop convert() " +
-            "(a leg's received amount feeds the next leg's amount)."
-        }
-      );
+      // Two shapes reach here: (a) >1 candidate — genuine ambiguity the SDK won't
+      // resolve; (b) exactly ONE candidate that happens to be multi-hop — nothing
+      // to choose between, it simply needs >1 hop. Same error code (the recourse is
+      // identical: quote() then per-leg convert()), but a clearer message for (b) so
+      // "1 candidate route(s) … the SDK does not choose for you" doesn't confuse.
+      const onlyMultiHop = routes.length === 1;
+      const message = onlyMultiHop
+        ? `The only route for this intent needs ${routes[0]!.hops} hops — the SDK does not auto-run ` +
+          `multi-hop conversions; run each leg as its own single-hop convert().`
+        : `${routes.length} candidate route(s) resolve this intent — the SDK does not choose for you.`;
+      throw conversionError("MULTIPLE_ROUTES_AVAILABLE", message, {
+        routes: routes.map(routeForDetails),
+        nextStep:
+          "call wallet.quote({ from, to, network, amount }) to compare estimates (fees, receipts, custodial " +
+          "flags), then pass your choice back: wallet.convert({ ..., route: '<route id>' }). A multi-hop " +
+          "candidate is not yet automated — run each leg as its own single-hop convert() " +
+          "(a leg's received amount feeds the next leg's amount)."
+      });
     }
+    // Custodial single-hop auto-executes BY DESIGN. For USDT-liquid → USDT-external
+    // the only single-hop row is `sideshift.send` (custodial), so convert() runs it
+    // without an explicit `route` — the "one single-hop row ⇒ execute it" rule is
+    // provider-agnostic; there is no allowCustodial opt-in. Custody is DISCLOSED, not
+    // gated: quote() surfaces `custodial:true` per route BEFORE running, and the
+    // ConvertResult carries `custodial:true` AFTER. An integrator who wants a
+    // non-custodial path passes the multi-hop boltz route id to convert({ route }).
     route = singleHop[0]!;
   }
 
@@ -604,14 +646,19 @@ async function executePegOut(
   const base = {
     route: ctx.route,
     custodial: false,
-    trackingId: peg.orderId,
-    receivedSats: peg.recvAmount !== null ? BigInt(peg.recvAmount) : null
+    trackingId: peg.orderId
   };
+  // `peg.recvAmount` is the ORDER-TIME estimate, not a confirmed receipt. Only
+  // report it once the peg-out is actually "Done" — on pending/timeout the BTC
+  // has NOT been paid out yet, so receivedSats stays null (parity with the boltz
+  // executors + the ConvertResult.receivedSats contract: "Actual receipt ... when
+  // the provider reports it"). A non-terminal result must never read as delivered.
+  const settledReceivedSats = peg.recvAmount !== null ? BigInt(peg.recvAmount) : null;
   const pendingNextStep =
     `the L-BTC was sent (txid ${peg.txid}); SideSwap pays the BTC out-of-band. Poll ` +
     `wallet.convert.sideswap.pegStatus({ orderId: '${peg.orderId}', pegIn: false }) until status "Done".`;
   if (!ctx.wait) {
-    return { ...base, status: "pending", txids: [peg.txid], nextStep: pendingNextStep };
+    return { ...base, status: "pending", txids: [peg.txid], receivedSats: null, nextStep: pendingNextStep };
   }
   const { last, timedOut } = await pollUntil(
     () => deps.sideswap.pegStatus({ orderId: peg.orderId, pegIn: false }),
@@ -619,12 +666,13 @@ async function executePegOut(
     { timeoutMs: ctx.timeoutMs, intervalMs: ctx.intervalMs }
   );
   if (timedOut) {
-    return { ...base, status: "pending", txids: [peg.txid], nextStep: pendingNextStep };
+    return { ...base, status: "pending", txids: [peg.txid], receivedSats: null, nextStep: pendingNextStep };
   }
   return {
     ...base,
     status: "settled",
-    txids: last.txid ? [peg.txid, last.txid] : [peg.txid]
+    txids: last.txid ? [peg.txid, last.txid] : [peg.txid],
+    receivedSats: settledReceivedSats
   };
 }
 
@@ -680,7 +728,7 @@ async function executeReceiveLightning(
   deps: IntentDeps,
   ctx: ExecuteContext
 ): Promise<ConvertResult> {
-  const swap = await deps.getBoltz().receiveLightning({ amountSats: Number(params.amount) });
+  const swap = await deps.getBoltz().receiveLightning({ amountSats: toProviderAmount(params.amount) });
   // An INFLOW: the invoice must reach the payer before anything can settle, so
   // convert() never blocks here — `wait` does not apply.
   return {
@@ -708,7 +756,7 @@ async function executeToStablecoin(
   const swap = await deps.getBoltz().toStablecoin({
     asset: leg.to as StablecoinAsset,
     networkId: leg.network,
-    amountSats: Number(params.amount),
+    amountSats: toProviderAmount(params.amount),
     claimAddress: address
   });
   const base = { route: ctx.route, custodial: false, trackingId: swap.swapId, receivedSats: null };
@@ -758,12 +806,18 @@ async function executeSideshiftSend(
   const pendingNextStep =
     `the USDt deposit was sent (txid ${shift.txid}); SideShift settles on ${leg.network} — CUSTODIAL mid-flight. ` +
     `Poll wallet.convert.sideshift.getStatus('${shift.shiftId}') until it is terminal.`;
+  // CUSTODIAL leg: on any non-terminal (pending/timeout) status the USDt is still
+  // mid-flight in SideShift custody. `shift.settleAmount` is only the QUOTED amount
+  // (the shift is "waiting" and could settle for less / refund / expire), so we must
+  // NOT surface it as receivedSats — which reads as "delivered". receivedSats is
+  // populated ONLY once the shift is terminally "settled", from the actual settled
+  // amount. Parity with the boltz executors + the ConvertResult.receivedSats contract.
   if (!ctx.wait) {
     return {
       ...base,
       status: "pending",
       txids: [shift.txid],
-      receivedSats: receivedOf(shift.settleAmount),
+      receivedSats: null,
       nextStep: pendingNextStep
     };
   }
@@ -772,9 +826,8 @@ async function executeSideshiftSend(
     (s) => s.terminal,
     { timeoutMs: ctx.timeoutMs, intervalMs: ctx.intervalMs }
   );
-  const receivedSats = receivedOf(last.settleAmount ?? shift.settleAmount);
   if (timedOut) {
-    return { ...base, status: "pending", txids: [shift.txid], receivedSats, nextStep: pendingNextStep };
+    return { ...base, status: "pending", txids: [shift.txid], receivedSats: null, nextStep: pendingNextStep };
   }
   const status: ConvertStatus =
     last.status === "settled" ? "settled" : last.inRefund ? "refunded" : "failed";
@@ -782,7 +835,7 @@ async function executeSideshiftSend(
     ...base,
     status,
     txids: [shift.txid],
-    receivedSats: status === "settled" ? receivedSats : null,
+    receivedSats: status === "settled" ? receivedOf(last.settleAmount ?? shift.settleAmount) : null,
     ...(status === "failed"
       ? {
           nextStep:
@@ -895,10 +948,27 @@ export function intentDepsFromNamespace(ns: ConvertNamespace, options: ConvertIn
  * exposed via getters so `.boltz`'s view-only WALLET_NOT_FOUND gate is
  * preserved verbatim.
  */
-export function makeConvertFacade(ns: ConvertNamespace, deps: IntentDeps): ConvertFacade {
-  const facade = ((params: ConvertParams) => convertIntent(params, deps)) as ConvertFacade;
-  Object.defineProperty(facade, "sideswap", { get: () => ns.sideswap, enumerable: true });
-  Object.defineProperty(facade, "sideshift", { get: () => ns.sideshift, enumerable: true });
-  Object.defineProperty(facade, "boltz", { get: () => ns.boltz, enumerable: true });
+export function makeConvertFacade(
+  ns: ConvertNamespace,
+  deps: IntentDeps,
+  assertOpen?: () => void
+): ConvertFacade {
+  // Parity with wallet.quote(): assert the wallet is open at the facade boundary so
+  // a closed/view-only wallet fails fast with a clear WALLET_NOT_FOUND instead of
+  // only tripping deep inside an outbound provider leg (inflow legs that just mint a
+  // funding address may not assert at all). `async` so a thrown assertOpen surfaces
+  // as a rejected promise — matching how quote() behaves.
+  const facade = (async (params: ConvertParams): Promise<ConvertResult> => {
+    assertOpen?.();
+    return convertIntent(params, deps);
+  }) as ConvertFacade;
+  // Non-enumerable getters: `.boltz` throws WALLET_NOT_FOUND on a view-only/wiped
+  // wallet (gate preserved by design). Keeping them non-enumerable means incidental
+  // enumeration — object spread `{ ...wallet.convert }`, structuredClone, a logger or
+  // serializer walking own enumerable keys — does NOT invoke the throwing getter.
+  // Direct property access (wallet.convert.boltz) still works and still gates.
+  Object.defineProperty(facade, "sideswap", { get: () => ns.sideswap, enumerable: false });
+  Object.defineProperty(facade, "sideshift", { get: () => ns.sideshift, enumerable: false });
+  Object.defineProperty(facade, "boltz", { get: () => ns.boltz, enumerable: false });
   return facade;
 }

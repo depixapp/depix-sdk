@@ -46,6 +46,19 @@ describe("wallet.convert is callable AND keeps the advanced sub-namespaces", () 
   });
 });
 
+describe("wallet.convert() asserts the wallet is open at the facade boundary (parity with quote())", () => {
+  it("convert() on a closed wallet rejects WALLET_NOT_FOUND, like quote()", async () => {
+    wallet = await open({ dataDir, passphrase: PASSPHRASE, mnemonic: KNOWN_MNEMONIC, quotes: QUOTES });
+    await wallet.close();
+    await expect(
+      wallet.convert({ from: "DEPIX", to: "LBTC", network: "liquid", amount: 1_000n })
+    ).rejects.toSatisfy((e) => isDepixSdkError(e, "WALLET_NOT_FOUND"));
+    await expect(
+      wallet.quote({ from: "DEPIX", to: "LBTC", network: "liquid", amount: 1_000n })
+    ).rejects.toSatisfy((e) => isDepixSdkError(e, "WALLET_NOT_FOUND"));
+  });
+});
+
 describe("wallet.convert() respects the guardrail choke point (§4.3) — never bypassed", () => {
   it("a peg-out route is blocked by the allowlist BEFORE any WebSocket", async () => {
     const client = new FakeSideSwapClient();
