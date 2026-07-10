@@ -250,6 +250,46 @@ describe("receiveLightning — returns the invoice for the payer (INFLOW, no gua
   });
 });
 
+describe("close() cancels in-flight Boltz watches (§5.3 resource hygiene)", () => {
+  it("tears down a reverse claim watch's subscription (status socket + reconnect timer) on close()", async () => {
+    const unsubscribe = vi.fn();
+    const subscribeSwap = vi.fn(() => unsubscribe);
+    const client = fakeClient({ subscribeSwap });
+    const deps: BoltzConvertDeps = {
+      client,
+      getReversePairHash: async () => "rev-pair",
+      deriveSecrets: () => ({
+        preimage: new Uint8Array(32).fill(9),
+        preimageHash: hex.decode(TEST_PAYMENT_HASH),
+        claimKeys: { privateKey: new Uint8Array(32).fill(1), publicKey: new Uint8Array(33).fill(2) }
+      }),
+      reverseCreate: async () => ({
+        id: "rev-1",
+        invoice: TEST_INVOICE,
+        lockupAddress: "lq1revlockup",
+        onchainAmount: 200_000,
+        swapTree: {},
+        refundPublicKey: "03" + "cc".repeat(32),
+        blindingKey: "dd".repeat(32),
+        timeoutBlockHeight: 1_000_100
+      })
+    };
+    const w = await restore({ boltz: deps });
+    const res = await w.convert.boltz.receiveLightning({ amountSats: 250_000 });
+    res.completion.catch(() => {}); // stays pending after close — must not surface as unhandled
+
+    // The watch is live: it subscribed (a real status WebSocket + reconnect timer
+    // in prod) and nothing has torn it down yet.
+    expect(subscribeSwap).toHaveBeenCalledTimes(1);
+    expect(unsubscribe).not.toHaveBeenCalled();
+
+    await w.close();
+    // close() disposed the namespace → the subscription (socket + timer) is gone.
+    // Without this, a closed wallet keeps reconnecting to Boltz forever.
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("resume() — recovers claim/refund from boltz-swaps.json after a crash (§5.3)", () => {
   it("refunds an expired submarine lockup and re-attaches a reverse claim watch", async () => {
     const refundSpy = vi.fn<(record: SubmarineRefundRecord, deps: RefundDeps) => Promise<RefundResult>>(

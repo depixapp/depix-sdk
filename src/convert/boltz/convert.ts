@@ -118,12 +118,57 @@ export class BoltzConvert {
   private readonly client: BoltzClient;
   private readonly deps: BoltzConvertDeps;
   private readonly logger: Logger;
+  /** Teardown handles for every in-flight watch (status socket + reconnect timer). */
+  private readonly activeUnsubs = new Set<() => void>();
+  private disposed = false;
 
   constructor(ctx: BoltzWalletContext, deps: BoltzConvertDeps = {}) {
     this.ctx = ctx;
     this.deps = deps;
     this.client = deps.client ?? new BoltzClient();
     this.logger = ctx.logger;
+  }
+
+  /**
+   * Subscribe to a swap's status through a tracked handle so every in-flight
+   * watch can be torn down on dispose(). Without this a reverse/submarine watch
+   * keeps its WebSocket + reconnect backoff timer alive after wallet.close()
+   * (§5.3 resource hygiene). Deregisters itself when the watch unsubscribes.
+   */
+  private trackedSubscribe(swapId: string, onRaw: (raw: string) => void): () => void {
+    if (this.disposed) return () => {};
+    const raw = this.client.subscribeSwap(swapId, onRaw);
+    let cleared = false;
+    const wrapped = (): void => {
+      if (cleared) return;
+      cleared = true;
+      this.activeUnsubs.delete(wrapped);
+      try {
+        raw();
+      } catch {
+        // noop
+      }
+    };
+    this.activeUnsubs.add(wrapped);
+    return wrapped;
+  }
+
+  /**
+   * Cancel every in-flight watch — closes each status WebSocket and clears its
+   * reconnect timer. Called by wallet.close() so a closed wallet leaves no live
+   * socket/timer behind (an agent that opens a receive then closes must not keep
+   * reconnecting to Boltz forever). Idempotent; blocks new watches afterward.
+   */
+  dispose(): void {
+    this.disposed = true;
+    for (const unsub of [...this.activeUnsubs]) {
+      try {
+        unsub();
+      } catch {
+        // noop
+      }
+    }
+    this.activeUnsubs.clear();
   }
 
   // ─── LN SEND (submarine) ─────────────────────────────────────────────────
@@ -253,7 +298,7 @@ export class BoltzConvert {
       };
 
       try {
-        unsubscribe = this.client.subscribeSwap(swapId, onRaw);
+        unsubscribe = this.trackedSubscribe(swapId, onRaw);
       } catch (err) {
         this.logger.error("boltz submarine watch could not subscribe", {
           swapId,
@@ -335,7 +380,7 @@ export class BoltzConvert {
     const reverseDeps: ReverseDeps = {
       deriveSecrets: async () => (this.deps.deriveSecrets ?? deriveReverseSecrets)(),
       getClaimAddress: () => this.ctx.getReceiveAddress(),
-      subscribe: (id, onRaw) => this.client.subscribeSwap(id, onRaw),
+      subscribe: (id, onRaw) => this.trackedSubscribe(id, onRaw),
       persist: async (rec) => {
         const stored: StoredReverseSwap = { ...rec, type: "reverse", state: "awaiting_payment", createdAt: Date.now() };
         // Awaited (durability §5.3) but best-effort: a persist failure logs and
@@ -461,7 +506,7 @@ export class BoltzConvert {
     const reverseDeps: ReverseDeps = {
       deriveSecrets: async () => (this.deps.deriveSecrets ?? deriveReverseSecrets)(),
       getClaimAddress: () => this.ctx.getReceiveAddress(),
-      subscribe: (id, onRaw) => this.client.subscribeSwap(id, onRaw),
+      subscribe: (id, onRaw) => this.trackedSubscribe(id, onRaw),
       persist: (rec) => {
         void this.ctx.store
           .patch(rec.swapId, (r) => {

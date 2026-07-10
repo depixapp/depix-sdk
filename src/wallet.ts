@@ -643,6 +643,15 @@ export class DepixWallet {
 
   /** Release the dataDir lock and free wasm resources. */
   async close(): Promise<void> {
+    // Cancel any in-flight Boltz watches (status WebSocket + reconnect timer)
+    // BEFORE freeing anything — otherwise a reverse/submarine watch keeps a socket
+    // and its backoff timer alive past close(), reconnecting to Boltz forever
+    // (§5.3 resource hygiene).
+    try {
+      this.convertNamespace?.boltz.dispose();
+    } catch {
+      // best effort
+    }
     if (this.wollet) {
       try {
         this.wollet.free();
