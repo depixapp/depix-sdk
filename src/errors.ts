@@ -178,9 +178,17 @@ export class WithdrawContractError extends DepixSdkError {
  *                           ceiling to lock against, §5.3).
  *   TIMEOUT_OUT_OF_BOUNDS — the refund timeout height is out of the sane bound
  *                           (MAX_SUBMARINE_TIMEOUT_BLOCKS, §5.3).
+ *
+ * The gift-card PR6 subset:
+ *   GIFTCARDS_DISABLED     — the backend has the CryptoRefills integration OFF
+ *                            (/api/config `giftcardEnabled` is false, or the
+ *                            config is unreachable → fail-closed, §5.5).
+ *   GIFTCARD_KYC_CATEGORY  — the selected brand is a KYC-gated "e-money" product
+ *                            (Rewarble VISA/PayPal, iCash, …) the anonymous
+ *                            browser-direct Lightning flow cannot fulfil; the
+ *                            typed error carries the external deep-link (§5.5).
  * The remaining codes (CUSTODIAL_NOT_ACKNOWLEDGED, AFFILIATE_ID_MISSING,
- * GIFTCARDS_DISABLED, GIFTCARD_KYC_CATEGORY, STABLECOIN_DEPS_MISSING) arrive
- * with PR6.
+ * STABLECOIN_DEPS_MISSING) arrive with the SideShift/stablecoin flows.
  */
 export class ConversionError extends DepixSdkError {
   constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {
@@ -217,6 +225,26 @@ export class BoltzApiError extends DepixSdkError {
   constructor(message: string, init: { status?: number; body?: unknown; cause?: unknown } = {}) {
     super("BOLTZ_API_ERROR", message, init.cause !== undefined ? { cause: init.cause } : undefined);
     this.name = "BoltzApiError";
+    if (init.status !== undefined) this.status = init.status;
+    if (init.body !== undefined) this.body = init.body;
+  }
+}
+
+/**
+ * A network/HTTP error from the CryptoRefills REST API (api.cryptorefills.com,
+ * §5.5). Distinct from ConversionError (the closed catalog of our OWN gift-card
+ * guards) — a catalog/order transport failure is not one of those codes, so it
+ * is its own DepixSdkError with the upstream status/body attached (mirrors
+ * BoltzApiError). A 422 `LOGIN_REQUIRED` body is mapped by the gift-card
+ * namespace to the typed GIFTCARD_KYC_CATEGORY (not surfaced raw).
+ */
+export class CryptorefillsApiError extends DepixSdkError {
+  readonly status?: number;
+  readonly body?: unknown;
+
+  constructor(message: string, init: { status?: number; body?: unknown; cause?: unknown } = {}) {
+    super("CRYPTOREFILLS_API_ERROR", message, init.cause !== undefined ? { cause: init.cause } : undefined);
+    this.name = "CryptorefillsApiError";
     if (init.status !== undefined) this.status = init.status;
     if (init.body !== undefined) this.body = init.body;
   }

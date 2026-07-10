@@ -10,6 +10,7 @@ export {
   type CreateResult,
   type DepositParams,
   type DepositResult,
+  type GiftcardsWalletOptions,
   type MnemonicBackup,
   type OpenOptions,
   type RestoreOptions,
@@ -26,6 +27,7 @@ export {
 export {
   BoltzApiError,
   ConversionError,
+  CryptorefillsApiError,
   DepixApiError,
   DepixSdkError,
   GuardrailError,
@@ -161,3 +163,58 @@ export {
   type PegInRecord
 } from "./convert/pending-pegin.js";
 export type { ConvertWalletHooks } from "./convert/hooks.js";
+
+// ─── gift cards (§5.5): wallet.giftcards.* ───────────────────────────────────
+export {
+  GiftcardsNamespace,
+  type BuyGiftcardParams,
+  type BuyGiftcardResult,
+  type GiftcardCatalog,
+  type GiftcardsNamespaceDeps,
+  type ListGiftcardsParams
+} from "./giftcards/namespace.js";
+export {
+  CryptorefillsClient,
+  CRYPTOREFILLS_API_BASE,
+  DEFAULT_COUNTRY,
+  LIGHTNING_PAYMENT,
+  SUPPORTED_BRAND_KINDS,
+  EXTERNAL_CHECKOUT_CATEGORIES,
+  computeGiftcardFeeSats,
+  buildLightningOrderBody,
+  beneficiaryOf,
+  extractLightningInvoice,
+  extractDelivery,
+  mapOrderStatus,
+  normalizeBrands,
+  filterBrands,
+  isRangeProduct,
+  orderDenomination,
+  requiresExternalCheckout,
+  cryptorefillsBrandUrl,
+  isLightningRailAvailable,
+  type CryptorefillsBrand,
+  type CryptorefillsBrandsRaw,
+  type CryptorefillsClientOptions,
+  type CryptorefillsFetch,
+  type CryptorefillsFetchResponse,
+  type CryptorefillsOrder,
+  type LightningOrderBodyParams,
+  type NormalizedBrands,
+  type OrderDelivery,
+  type OrderPhase
+} from "./giftcards/cryptorefills.js";
+export {
+  GiftcardConfigClient,
+  resolveGiftcardConfig,
+  DISABLED_GIFTCARD_CONFIG,
+  type GiftcardConfigClientOptions,
+  type GiftcardConfigSource,
+  type ResolvedGiftcardConfig
+} from "./giftcards/config.js";
+export {
+  GiftcardOrderStore,
+  GIFTCARD_ORDERS_FILE,
+  MAX_STORED_ORDERS,
+  type StoredGiftcardOrder
+} from "./giftcards/store.js";

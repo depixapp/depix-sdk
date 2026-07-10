@@ -78,6 +78,10 @@ import type { ConvertWalletHooks } from "./convert/hooks.js";
 import type { GuardrailDestination } from "./guardrails/allowlist.js";
 import { BoltzConvert, type BoltzConvertDeps } from "./convert/boltz/convert.js";
 import { BoltzSwapStore } from "./convert/boltz/store.js";
+import { GiftcardsNamespace } from "./giftcards/namespace.js";
+import { GiftcardConfigClient, type GiftcardConfigSource } from "./giftcards/config.js";
+import { CryptorefillsClient, type CryptorefillsFetch } from "./giftcards/cryptorefills.js";
+import { GiftcardOrderStore } from "./giftcards/store.js";
 
 export interface WalletSyncOptions {
   /** Override the Esplora provider chain (default: waterfalls→vanilla §2.6). */
@@ -129,6 +133,22 @@ export interface OpenOptions {
    * flows never touch real Boltz or WASM (§5.3).
    */
   boltz?: BoltzConvertDeps;
+  /**
+   * Advanced/testing: inject the gift-card providers (fake CryptoRefills REST
+   * client + /api/config source) so wallet.giftcards.* never touches the network
+   * (§5.5). Default: real clients on global fetch / apiBase.
+   */
+  giftcards?: GiftcardsWalletOptions;
+}
+
+/** Injection points for wallet.giftcards.* (spec §5.5). */
+export interface GiftcardsWalletOptions {
+  /** Inject the CryptoRefills REST client (tests). Default: real client, global fetch. */
+  cryptorefills?: CryptorefillsClient;
+  /** Inject the /api/config gift-card source (tests). Default: GiftcardConfigClient. */
+  config?: GiftcardConfigSource;
+  /** Fetch impl for the default CryptoRefills client (ignored if `cryptorefills` given). */
+  cryptorefillsFetch?: CryptorefillsFetch;
 }
 
 export interface CreateOptions extends OpenOptions {
@@ -291,6 +311,8 @@ interface WalletParts {
   convert?: ConvertNamespaceOptions;
   /** Injected Boltz conversion deps (§5.3) — advanced/testing. */
   boltz?: BoltzConvertDeps;
+  /** Injected gift-card providers (§5.5) — advanced/testing. */
+  giftcards?: GiftcardsWalletOptions;
 }
 
 export class DepixWallet {
@@ -302,6 +324,8 @@ export class DepixWallet {
   private readonly valuator: BrlValuator;
   /** Conversions (§5): wallet.convert.sideswap.* (PR4); PR5 adds .boltz. */
   readonly convert: ConvertNamespace;
+  /** Gift cards (§5.5): wallet.giftcards.list()/buy()/listOrders(). */
+  readonly giftcards: GiftcardsNamespace;
   private readonly logger: Logger;
   private readonly passphrase: string | undefined;
   // Pix flows (PR2) — null when no apiKey / no seed. deposit/withdraw/waitFor
@@ -443,6 +467,29 @@ export class DepixWallet {
       parts.convert,
       this.convertNamespace?.boltz ?? null
     );
+    // Gift cards (§5.5): browse + buy via CryptoRefills, paid over Lightning by
+    // REUSING the same BoltzConvert instance as wallet.convert.boltz (so the
+    // guardrail choke point + refund/watch machinery is shared, not duplicated).
+    // The catalog + config are unauthenticated (CryptoRefills is browser-direct;
+    // /api/config is public); buy() additionally needs the seed (null boltz on a
+    // view-only/wiped wallet → WALLET_NOT_FOUND at buy time).
+    this.giftcards = new GiftcardsNamespace({
+      config:
+        parts.giftcards?.config ??
+        new GiftcardConfigClient({
+          ...(parts.apiBase !== undefined ? { apiBase: parts.apiBase } : {}),
+          ...(parts.apiFetch ? { fetch: parts.apiFetch } : {}),
+          logger: this.logger
+        }),
+      cryptorefills:
+        parts.giftcards?.cryptorefills ??
+        new CryptorefillsClient(
+          parts.giftcards?.cryptorefillsFetch ? { fetchImpl: parts.giftcards.cryptorefillsFetch } : {}
+        ),
+      boltz: this.convertNamespace?.boltz ?? null,
+      store: new GiftcardOrderStore({ dataDir: this.dataDir, logger: this.logger }),
+      logger: this.logger
+    });
   }
 
   // ─── lifecycle ─────────────────────────────────────────────────────────
@@ -496,7 +543,8 @@ export class DepixWallet {
         apiBase,
         apiFetch: options.fetch,
         convert: options.convert,
-        boltz: options.boltz
+        boltz: options.boltz,
+        giftcards: options.giftcards
       });
     } catch (err) {
       await lock.release();
@@ -576,7 +624,8 @@ export class DepixWallet {
         apiBase: resolveApiBase(options.apiBase),
         apiFetch: options.fetch,
         convert: options.convert,
-        boltz: options.boltz
+        boltz: options.boltz,
+        giftcards: options.giftcards
       });
       return { mnemonic, descriptor, backupConfirmed, wallet };
     } catch (err) {
@@ -633,7 +682,8 @@ export class DepixWallet {
         apiBase: resolveApiBase(options.apiBase),
         apiFetch: options.fetch,
         convert: options.convert,
-        boltz: options.boltz
+        boltz: options.boltz,
+        giftcards: options.giftcards
       });
     } catch (err) {
       await lock.release();
@@ -905,16 +955,26 @@ export class DepixWallet {
    * (e.g. `lightning` for a Boltz submarine payee), NOT `liquidAddress`: the
    * lockup being protocol-bound does NOT exempt the final destination (§4.3).
    * The internal seam wallet.convert.boltz uses to fund a lockup.
+   *
+   * `feeSplit` (gift cards, §5.5): an OPTIONAL second L-BTC output in the SAME
+   * transaction paying the 1% DePix service fee to the config `splitAddress`. It
+   * is NOT counted by the guardrail (only `amountSats` — the lockup — is valued,
+   * per §4.3 "idem") and is NOT an allowlist destination (it pays DePix's own
+   * authenticated-config address, protocol-bound by construction). `kind` labels
+   * the spend for the rolling-24h accountant (default "boltz-submarine").
    */
   private async lockupLbtc(params: {
     address: string;
     amountSats: bigint;
     destinations: readonly GuardrailDestination[];
+    feeSplit?: { address: string; amountSats: bigint };
+    kind?: string;
   }): Promise<{ txid: string }> {
     this.assertOpen();
     if (typeof params.amountSats !== "bigint" || params.amountSats <= 0n) {
       throw new WalletError("INVALID_AMOUNT", "lockup amountSats must be a positive bigint");
     }
+    const spendKind = params.kind ?? "boltz-submarine";
     let address: InstanceType<typeof Address>;
     try {
       address = new Address(params.address);
@@ -922,6 +982,20 @@ export class DepixWallet {
       throw new WalletError("INVALID_ADDRESS", `Not a valid Liquid address: ${params.address}`, {
         cause: err
       });
+    }
+    // Parse the fee-split address up front (INVALID_ADDRESS before any signing).
+    let feeAddress: InstanceType<typeof Address> | null = null;
+    if (params.feeSplit) {
+      if (typeof params.feeSplit.amountSats !== "bigint" || params.feeSplit.amountSats <= 0n) {
+        throw new WalletError("INVALID_AMOUNT", "feeSplit amountSats must be a positive bigint");
+      }
+      try {
+        feeAddress = new Address(params.feeSplit.address);
+      } catch (err) {
+        throw new WalletError("INVALID_ADDRESS", `Not a valid fee-split Liquid address: ${params.feeSplit.address}`, {
+          cause: err
+        });
+      }
     }
 
     return this.opMutex.runExclusive(async () => {
@@ -937,7 +1011,7 @@ export class DepixWallet {
         // /api/quotes and fails CLOSED with QUOTES_UNAVAILABLE (§4.4/G6).
         const brlCents = await this.valuator.valuate("LBTC", params.amountSats);
         await this.guardrails.enforce({
-          kind: "boltz-submarine",
+          kind: spendKind,
           brlCents,
           destinations: params.destinations
         });
@@ -947,6 +1021,12 @@ export class DepixWallet {
         let builder = new TxBuilder(network);
         try {
           builder = builder.addLbtcRecipient(address, params.amountSats);
+          // Optional service-fee output in the SAME tx (gift card, §5.5). It pays
+          // DePix's own config splitAddress — protocol-bound, not an allowlist
+          // destination, and not counted by the guardrail above.
+          if (feeAddress && params.feeSplit) {
+            builder = builder.addLbtcRecipient(feeAddress, params.feeSplit.amountSats);
+          }
         } catch (err) {
           throw new WalletError("INVALID_ADDRESS", "Recipient rejected by the transaction builder", {
             cause: err
@@ -980,7 +1060,7 @@ export class DepixWallet {
         }
 
         // Accounted at SIGNING time, not settlement (§4.5).
-        await this.guardrails.recordSpend(brlCents, "boltz-submarine");
+        await this.guardrails.recordSpend(brlCents, spendKind);
 
         const finalized = wollet.finalize(signed);
         // Crossing into the network stage — an error from here on may leave the
