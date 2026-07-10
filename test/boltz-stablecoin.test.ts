@@ -98,6 +98,9 @@ function baseDeps(over: Partial<PrepareStablecoinDeps> = {}): { deps: PrepareSta
     createRoute,
     isKnownTokenAddress: () => false,
     verifyLockup: verify as unknown as PrepareStablecoinDeps["verifyLockup"],
+    // Permissive economic pre-check by default (viem-free, no real quote engine):
+    // the test amounts (10_000 / 20_000 sats) sit inside these chain-swap limits.
+    estimate: async () => ({ minSats: 1000, maxSats: 100_000_000 }),
     ...over
   };
   return { deps, verify, evmKey };
@@ -289,6 +292,87 @@ describe("prepareStablecoinRoute — fail-closed guard cadence (§5.3)", () => {
     await expect(
       prepareStablecoinRoute({ asset: "USDC", networkId: "arbitrum", amountSats: 10_000, claimAddress: VALID_EVM }, deps)
     ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "LOCKUP_INFLATED"));
+  });
+
+  it("rejects a NON-POSITIVE lockup amount (≤0) → LOCKUP_INFLATED (review low, lower bound)", async () => {
+    const { fn: createRoute } = fakeCreateRoute({ amount: 0 }); // buggy/hostile route returns 0
+    const { deps } = baseDeps({ createRoute });
+    await expect(
+      prepareStablecoinRoute({ asset: "USDC", networkId: "arbitrum", amountSats: 10_000, claimAddress: VALID_EVM }, deps)
+    ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "LOCKUP_INFLATED"));
+  });
+
+  it("rejects a DUST amount below the route minimum BEFORE creating any swap (review medium — economic guard wired)", async () => {
+    const createRoute = vi.fn();
+    const { deps } = baseDeps({
+      createRoute: createRoute as never,
+      estimate: async () => ({ minSats: 50_000, maxSats: 100_000_000 }) // amount 10_000 < 50_000
+    });
+    await expect(
+      prepareStablecoinRoute({ asset: "USDC", networkId: "arbitrum", amountSats: 10_000, claimAddress: VALID_EVM }, deps)
+    ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "SWAP_VALIDATION_FAILED"));
+    // Fail-closed BEFORE the swap is created → no L-BTC can be locked.
+    expect(createRoute).not.toHaveBeenCalled();
+  });
+
+  it("rejects an amount above the route maximum before creating any swap (economic guard)", async () => {
+    const createRoute = vi.fn();
+    const { deps } = baseDeps({
+      createRoute: createRoute as never,
+      estimate: async () => ({ minSats: 1000, maxSats: 5000 }) // amount 10_000 > 5000
+    });
+    await expect(
+      prepareStablecoinRoute({ asset: "USDC", networkId: "arbitrum", amountSats: 10_000, claimAddress: VALID_EVM }, deps)
+    ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "SWAP_VALIDATION_FAILED"));
+    expect(createRoute).not.toHaveBeenCalled();
+  });
+
+  it("REJECTS a route whose returned claim address is not our ephemeral signer (review medium — sponsor trust boundary)", async () => {
+    // createRoute echoes a FOREIGN tBTC claim EOA — the SDK must refuse to fund it.
+    const createRoute = vi.fn(async (): Promise<CreatedStablecoinRoute> => ({
+      createdSwap: {
+        id: "chain-swap-1",
+        claimDetails: { claimAddress: "0xATTACKER00000000000000000000000000000000" },
+        lockupDetails: {
+          lockupAddress: "lq1lockupaddr",
+          amount: 10_000,
+          timeoutBlockHeight: 1_000_050,
+          swapTree: { chainLeaf: {} },
+          serverPublicKey: "03" + "cc".repeat(32),
+          blindingKey: "dd".repeat(32)
+        }
+      },
+      plan: { legs: [] }
+    }));
+    const { deps } = baseDeps({ createRoute });
+    await expect(
+      prepareStablecoinRoute({ asset: "USDC", networkId: "arbitrum", amountSats: 10_000, claimAddress: VALID_EVM }, deps)
+    ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "SWAP_VALIDATION_FAILED"));
+  });
+
+  it("ACCEPTS a route whose returned claim address matches our ephemeral signer (case-insensitive)", async () => {
+    const createRoute = vi.fn(async (): Promise<CreatedStablecoinRoute> => ({
+      createdSwap: {
+        id: "chain-swap-1",
+        // fakeViem's privateKeyToAccount address, upper-cased — must still match.
+        claimDetails: { claimAddress: "0xEPHEMERALSIGNER0000000000000000000000000".toUpperCase() },
+        lockupDetails: {
+          lockupAddress: "lq1lockupaddr",
+          amount: 10_000,
+          timeoutBlockHeight: 1_000_050,
+          swapTree: { chainLeaf: {} },
+          serverPublicKey: "03" + "cc".repeat(32),
+          blindingKey: "dd".repeat(32)
+        }
+      },
+      plan: { legs: [] }
+    }));
+    const { deps } = baseDeps({ createRoute });
+    const prepared = await prepareStablecoinRoute(
+      { asset: "USDC", networkId: "arbitrum", amountSats: 10_000, claimAddress: VALID_EVM },
+      deps
+    );
+    expect(prepared.swapId).toBe("chain-swap-1");
   });
 
   it("rejects a refund timeout outside the safe window → TIMEOUT_OUT_OF_BOUNDS", async () => {

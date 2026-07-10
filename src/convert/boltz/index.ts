@@ -18,7 +18,8 @@ export {
   estimateStablecoinOut,
   isValidTronAddress,
   mapChainSwapStatus,
-  prepareStablecoinRoute,
+  // prepareStablecoinRoute / PreparedStablecoinRoute stay internal (return raw
+  // ephemeral key bytes) — reachable only via toStablecoin, never the barrel.
   executeStablecoinRoute,
   withEphemeralEvmSigner,
   buildLocalSigner,
@@ -31,7 +32,6 @@ export {
   STABLECOIN_DECIMALS,
   type StablecoinAsset,
   type StablecoinParams,
-  type PreparedStablecoinRoute,
   type StablecoinEstimate,
   type CheckStablecoinAmountResult,
   type LocalEvmSigner

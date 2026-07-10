@@ -38,6 +38,7 @@ import {
 import {
   CHAIN_SWAP_FAILURE_STATUSES,
   executeStablecoinRoute,
+  getStablecoinNetwork,
   mapChainSwapStatus,
   prepareStablecoinRoute,
   type ExecuteStablecoinDeps,
@@ -481,15 +482,32 @@ export class BoltzConvert {
     // ephemeral EVM key immediately (frontend zeroInMemory parity). Every later
     // use (execute/resume) decodes a fresh copy from the record and zeroes it too.
     prepared.evmPrivateKey.fill(0);
+    // Also DROP the plaintext hex STRING from the long-lived in-memory record: the
+    // store already encrypted a shallow copy at rest, so this reference is the only
+    // remaining cleartext key that would otherwise linger through the (potentially
+    // slow) lockup + guardrail step below. JS strings are immutable and can't be
+    // wiped in place; the best we can do is release the reference so it is
+    // GC-eligible immediately. (The transient 0x-hex string viem materializes per
+    // signing session inside withEphemeralEvmSigner is inherent to viem and cannot
+    // be avoided.) `record` is not read again after this point.
+    record.evmPrivateKeyHex = "";
 
     // Guardrail choke point + L-BTC lockup signing (in the wallet). The FINAL
-    // destination is the agent-chosen EVM settle address → the `evmAddress` class.
+    // destination is the agent-chosen settle address. Dispatch by address family:
+    // EVM targets use the case-INsensitive `evmAddress` class; Tron (TRC-20) is
+    // base58check — case-SENSITIVE — so it must use the exact-match `tronAddress`
+    // class, never `evmAddress` (lowercasing a base58 identifier is semantically
+    // wrong and could, in principle, fail OPEN on a lowercased collision).
+    const settleDestination: GuardrailDestination =
+      getStablecoinNetwork(prepared.networkId)?.family === "tron"
+        ? { kind: "tronAddress", address: prepared.claimAddress }
+        : { kind: "evmAddress", address: prepared.claimAddress };
     let lockupTxid: string;
     try {
       const res = await this.ctx.lockupLbtc({
         address: prepared.lockupAddress,
         amountSats: BigInt(prepared.lockAmountSats),
-        destinations: [{ kind: "evmAddress", address: prepared.claimAddress }]
+        destinations: [settleDestination]
       });
       lockupTxid = res.txid;
     } catch (err) {

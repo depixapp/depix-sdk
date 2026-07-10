@@ -74,7 +74,9 @@ export {
   estimateStablecoinOut,
   isValidTronAddress,
   mapChainSwapStatus,
-  prepareStablecoinRoute,
+  // prepareStablecoinRoute / PreparedStablecoinRoute are intentionally NOT
+  // re-exported (kept internal): the primitive returns the raw ephemeral EVM key
+  // bytes, a footgun on the public surface. The public entry point is toStablecoin.
   refundChainSwap,
   BOLTZ_STABLECOIN_NETWORKS,
   MAX_CHAIN_TIMEOUT_BLOCKS,
@@ -83,7 +85,6 @@ export {
   type StablecoinParams,
   type ToStablecoinResult,
   type StablecoinOutcome,
-  type PreparedStablecoinRoute,
   type StablecoinEstimate,
   type CheckStablecoinAmountResult,
   type StoredStablecoinSwap,

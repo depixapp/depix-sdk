@@ -306,6 +306,10 @@ export async function withEphemeralEvmSigner<T>(
   use: (signer: LocalEvmSigner) => Promise<T>,
   deps: { buildSigner?: (hex0x: `0x${string}`) => Promise<LocalEvmSigner>; importer?: ViemImporter; rpc?: string } = {}
 ): Promise<T> {
+  // viem's privateKeyToAccount requires a 0x-hex STRING; JS strings are immutable
+  // and cannot be wiped, so this copy is an inherent, TRANSIENT residual — it is
+  // materialized only for this signing session and released when the call returns
+  // (GC-eligible). The authoritative buffer (keyBytes) IS zeroed in `finally`.
   const hex0x = (`0x${hex.encode(keyBytes)}`) as `0x${string}`;
   try {
     const build =
@@ -359,6 +363,12 @@ export function deriveStablecoinKeys(): StablecoinKeys {
 export interface CreatedStablecoinRoute {
   createdSwap: {
     id: string;
+    /**
+     * The tBTC (claim-side) details Boltz commits. Its `claimAddress`, when
+     * present, MUST equal our ephemeral signer EOA — the strongest recipient
+     * check the SDK can make against returned data (see prepareStablecoinRoute).
+     */
+    claimDetails?: { claimAddress?: string };
     lockupDetails: {
       lockupAddress: string;
       amount: number | string;
@@ -410,6 +420,16 @@ export interface PrepareStablecoinDeps {
   /** Build the ephemeral signer (tests) — default buildLocalSigner. */
   buildSigner?: (hex0x: `0x${string}`) => Promise<LocalEvmSigner>;
   rpc?: string;
+  /**
+   * Economic / dust pre-check source (default: estimateStablecoinOut, viem-free).
+   * Supplies the chain-swap min/max (both in L-BTC sats) that checkStablecoinAmount
+   * uses to reject an amount the route cannot settle BEFORE any L-BTC is locked.
+   */
+  estimate?: (p: {
+    asset: StablecoinAsset;
+    networkId: string;
+    amountSats: number;
+  }) => Promise<Pick<StablecoinEstimate, "minSats" | "maxSats">>;
 }
 
 /**
@@ -453,6 +473,10 @@ const LBTC_VIA_ASSET = "L-BTC";
  *
  * The chain swap commits the EPHEMERAL signer's address as its own claim address;
  * the user's destination is only ever executeRoute's `recipient` (§5.3).
+ *
+ * @internal Returns the raw ephemeral EVM key BYTES in `PreparedStablecoinRoute`,
+ * so it is NOT part of the public surface (not re-exported from the barrels). Use
+ * `wallet.convert.boltz.toStablecoin`, which owns and zeroes the key.
  */
 export async function prepareStablecoinRoute(
   params: StablecoinParams,
@@ -503,12 +527,56 @@ export async function prepareStablecoinRoute(
     );
   }
 
+  // Economic / dust guard (§5.3): reject an amount the chain-swap + DEX (+ bridge)
+  // route cannot settle BEFORE locking any L-BTC. A sub-minimum lock would strand
+  // funds in a forced refund cycle (wasted lockup + refund fees; principal is
+  // refundable). Boltz's own chain-swap min/max already encodes the route's
+  // fixed-cost floor, and both bounds are in L-BTC sats (same unit as amountSats),
+  // so they are the reliable input; USD/bridge-fee sub-checks would need same-unit
+  // data the read-only estimate doesn't surface. Fail-closed.
+  const estimate =
+    deps.estimate ??
+    ((p: { asset: StablecoinAsset; networkId: string; amountSats: number }) =>
+      estimateStablecoinOut(p, {
+        ...(deps.ensureConfig ? { ensureConfig: deps.ensureConfig } : {}),
+        ...(deps.getPairs ? { getPairs: deps.getPairs } : {})
+      }));
+  const limits = await estimate({
+    asset: params.asset,
+    networkId: params.networkId,
+    amountSats: params.amountSats
+  });
+  const econ = checkStablecoinAmount({
+    amountSats: params.amountSats,
+    ...(typeof limits.minSats === "number" ? { minSats: limits.minSats } : {}),
+    ...(typeof limits.maxSats === "number" ? { maxSats: limits.maxSats } : {})
+  });
+  if (!econ.ok) {
+    const detail =
+      econ.reason === "below_min"
+        ? `below the route minimum of ${econ.minSats} sats`
+        : econ.reason === "above_max"
+          ? `above the route maximum of ${econ.maxSats} sats`
+          : econ.reason === "bridge_fee"
+            ? `at or under the bridge fee (need ~${econ.suggestedMinSats} sats)`
+            : econ.reason === "fee_ratio"
+              ? `uneconomical — fees exceed ${Math.round(STABLECOIN_MAX_FEE_RATIO * 100)}% of the amount`
+              : "not a positive amount";
+    throw new ConversionError(
+      "SWAP_VALIDATION_FAILED",
+      `Amount ${params.amountSats} sats cannot settle to ${params.asset} on ${params.networkId}: ${detail} — no L-BTC was locked.`
+    );
+  }
+
   const keys = (deps.deriveKeys ?? deriveStablecoinKeys)();
 
   // The chain swap commits the SIGNER's EOA as its claim address (the EIP-712
   // claim signature comes from this key). Derive that address without keeping a
   // live signer — the ephemeral key is rebuilt + zeroed only inside the execute
   // session (withEphemeralEvmSigner). The user's destination stays the recipient.
+  // Transient 0x-hex string (viem requirement, immutable/non-wipeable) — used only
+  // to derive the signer address, then goes out of scope. The persisted copy is the
+  // ENCRYPTED record; the caller zeroes the key BYTES (keys.evmPrivateKey) after use.
   const evmHex0x = (`0x${hex.encode(keys.evmPrivateKey)}`) as `0x${string}`;
   const { accounts } = await loadViem(deps.viemImporter);
   const signerAddress =
@@ -534,11 +602,33 @@ export async function prepareStablecoinRoute(
     throw new ConversionError("SWAP_VALIDATION_FAILED", "Boltz createRoute returned an incomplete swap");
   }
 
+  // Sponsor / boltz-swaps trust boundary (§5.3, G5): treat the returned route as
+  // untrusted. The strongest recipient check the SDK can make against RETURNED
+  // data is to bind the chain-swap CLAIM side to OUR ephemeral EOA: when Boltz
+  // echoes a claim address, it MUST be exactly the signer address we committed —
+  // this refuses a hostile/compromised route that advertises a foreign tBTC
+  // claimer. The FINAL DEX/bridge delivery to the user's `claimAddress` is built
+  // inside boltz-swaps and is NOT exposed for SDK inspection (RoutePlan carries
+  // only asset/chain metadata, no address), so that leg stays the accepted G5
+  // dependency risk — bounded: the ephemeral key never leaves the device and the
+  // EOA only ever holds this one swap's tBTC. A missing field is best-effort
+  // skipped (never fail-OPEN on a PRESENT mismatch).
+  const returnedClaim = createdSwap.claimDetails?.claimAddress;
+  if (typeof returnedClaim === "string" && returnedClaim.trim().toLowerCase() !== signerAddress.trim().toLowerCase()) {
+    throw new ConversionError(
+      "SWAP_VALIDATION_FAILED",
+      `Boltz route claim address ${returnedClaim} does not match our ephemeral signer ${signerAddress} — refusing to fund a route that would claim to a foreign EOA.`
+    );
+  }
+
   // Guard 1: the lockup must never exceed what the caller agreed to send (a buggy
   // /compromised route response trying to drain extra L-BTC). A smaller amount is
   // safe and allowed. Mirrors the submarine assertLockupNotInflated.
+  // Bound the lock amount BOTH ways: an inflated lock drains extra L-BTC, and a
+  // zero/negative lock from a buggy/hostile response must be rejected here rather
+  // than relying solely on the downstream guardrail's fail-closed arithmetic.
   const lockAmount = Number(ld.amount);
-  if (!Number.isFinite(lockAmount) || lockAmount > params.amountSats) {
+  if (!Number.isFinite(lockAmount) || lockAmount <= 0 || lockAmount > params.amountSats) {
     throw new ConversionError(
       "LOCKUP_INFLATED",
       `Boltz route asks to lock ${String(ld.amount)} sats, more than the requested ${params.amountSats}`

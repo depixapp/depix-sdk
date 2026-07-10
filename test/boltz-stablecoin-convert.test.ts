@@ -14,6 +14,8 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { base58 } from "@scure/base";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { DepixWallet } from "../src/wallet.js";
 import {
   BoltzConvert,
@@ -36,6 +38,18 @@ const KNOWN_MNEMONIC =
 const LOCKUP_ADDRESS =
   "lq1qqfk0uw9vlmqlggzs7cxmw49x8ks37l87udspmpt3ssgxjrkqqlww63xvus3c5gaz89r2kd393c4fvurwxf06qj87y2kd3vsln";
 const VALID_EVM = "0x1234567890AbcdEF1234567890aBcdef12345678";
+/** A valid Tron base58check address (0x41 prefix + 20-byte payload + double-SHA256 checksum). */
+function makeTronAddress(payload20: Uint8Array): string {
+  const body = new Uint8Array(21);
+  body[0] = 0x41;
+  body.set(payload20, 1);
+  const checksum = sha256(sha256(body)).slice(0, 4);
+  const full = new Uint8Array(25);
+  full.set(body, 0);
+  full.set(checksum, 21);
+  return base58.encode(full);
+}
+const VALID_TRON = makeTronAddress(new Uint8Array(20).fill(0x22));
 const SALT_B64 = Buffer.from(new Uint8Array(16).fill(7)).toString("base64");
 const SILENT_LOGGER: Logger = { debug() {}, info() {}, warn() {}, error() {} };
 
@@ -99,7 +113,9 @@ function stablecoinDeps(over: Partial<NonNullable<BoltzConvertDeps["stablecoin"]
         }),
         createRoute: stablecoinCreateRoute(),
         isKnownTokenAddress: () => false,
-        verifyLockup: passVerify
+        verifyLockup: passVerify,
+        // Permissive economic pre-check (viem-free) — 10_000 sats is within bounds.
+        estimate: async () => ({ minSats: 1000, maxSats: 100_000_000 })
       },
       ...over
     }
@@ -264,6 +280,70 @@ describe("toStablecoin — funded happy path: chain → DEX → bridge, sponsor 
     expect(seenSignerHex).toBe(("0x" + "42".repeat(32)) as `0x${string}`);
     // Settled → the crash-safe record is gone.
     expect(await store.get("chain-swap-1")).toBeNull();
+  });
+
+  it("routes a Tron destination through the case-SENSITIVE `tronAddress` guardrail class (review low)", async () => {
+    const { deps } = stablecoinDeps();
+    let seenDestKind: string | null = null;
+    let seenDestAddress: string | null = null;
+    const { convert } = await convertOver({
+      lockupLbtc: async ({ destinations }) => {
+        const d = destinations[0] as { kind: string; address?: string };
+        seenDestKind = d.kind;
+        seenDestAddress = d.address ?? null;
+        // Fail after capture so the completion path doesn't need a full execute mock.
+        throw Object.assign(new Error("stop after guardrail capture"), { nothingLocked: true });
+      },
+      deps
+    });
+    await convert
+      .toStablecoin({ asset: "USDT", networkId: "tron", amountSats: 10_000, claimAddress: VALID_TRON })
+      .catch(() => {});
+    // Tron (base58) must NOT be lowercased through the evmAddress class.
+    expect(seenDestKind).toBe("tronAddress");
+    expect(seenDestAddress).toBe(VALID_TRON);
+  });
+
+  it("routes an EVM destination through the `evmAddress` guardrail class", async () => {
+    const { deps } = stablecoinDeps();
+    let seenDestKind: string | null = null;
+    const { convert } = await convertOver({
+      lockupLbtc: async ({ destinations }) => {
+        seenDestKind = (destinations[0] as { kind: string }).kind;
+        throw Object.assign(new Error("stop"), { nothingLocked: true });
+      },
+      deps
+    });
+    await convert
+      .toStablecoin({ asset: "USDC", networkId: "arbitrum", amountSats: 10_000, claimAddress: VALID_EVM })
+      .catch(() => {});
+    expect(seenDestKind).toBe("evmAddress");
+  });
+
+  it("DROPS the plaintext ephemeral-key hex from the in-memory record right after persisting it (review medium)", async () => {
+    const { deps } = stablecoinDeps();
+    let persistedRecord: StoredStablecoinSwap | null = null;
+    const { convert, store } = await convertOver({
+      lockupLbtc: async () => {
+        // Capture AFTER put+zeroing has run (put resolved, record.evmPrivateKeyHex nulled).
+        throw Object.assign(new Error("stop after persist"), { nothingLocked: false });
+      },
+      deps
+    });
+    const putSpy = vi.spyOn(store, "put").mockImplementation(async function (this: BoltzSwapStore, rec) {
+      persistedRecord = rec as StoredStablecoinSwap;
+      return BoltzSwapStore.prototype.put.call(this, rec);
+    });
+    await convert
+      .toStablecoin({ asset: "USDC", networkId: "arbitrum", amountSats: 10_000, claimAddress: VALID_EVM })
+      .catch(() => {});
+    putSpy.mockRestore();
+    // The long-lived in-memory record no longer holds the cleartext key string.
+    expect(persistedRecord).not.toBeNull();
+    expect(persistedRecord!.evmPrivateKeyHex).toBe("");
+    // The ENCRYPTED store copy still carries the key (recovery/refund needs it).
+    const stored = (await store.get("chain-swap-1")) as StoredStablecoinSwap | null;
+    expect(stored!.evmPrivateKeyHex).toBe("42".repeat(32));
   });
 
   it("PRESERVES the record when lockupLbtc fails at/after broadcast (no `nothingLocked`)", async () => {
