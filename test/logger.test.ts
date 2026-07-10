@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createLogger, redactSecrets, registerSecret, clearRegisteredSecrets } from "../src/logger.js";
 
 describe("logger redaction (spec §6.1)", () => {

@@ -263,6 +263,10 @@ export class SyncEngine {
   private runWorkerScan(provider: EsploraProvider, timeoutMs: number): Promise<Uint8Array | null> {
     return new Promise<Uint8Array | null>((resolve, reject) => {
       const worker = new Worker(new URL("./worker.js", import.meta.url), {
+        // Do NOT inherit the parent's execArgv: flags like --input-type or
+        // REPL/eval artifacts break worker bootstrap, and the self-contained
+        // worker needs no CLI options.
+        execArgv: [],
         workerData: {
           descriptor: this.descriptor,
           dataDir: this.dataDir,

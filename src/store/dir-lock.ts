@@ -75,7 +75,7 @@ export async function acquireDirLock(dataDir: string): Promise<DirLock> {
     }
 
     // Lock exists. Stale (dead PID / unparseable) → break it and retry once.
-    let ownerPid: number | null = null;
+    let ownerPid: number | null;
     try {
       const content = await readFile(lockPath, "utf8");
       const parsed = Number.parseInt(content, 10);
