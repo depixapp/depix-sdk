@@ -6,7 +6,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DepixApiClient } from "../src/api/client.js";
+import { DepixApiClient, type MerchantUpdateWireBody } from "../src/api/client.js";
 import { MerchantNamespace, type MerchantUpdateFields } from "../src/merchant.js";
 import { DepixApiError, MerchantError, isDepixSdkError } from "../src/errors.js";
 import { DepixWallet } from "../src/wallet.js";
@@ -79,6 +79,14 @@ describe("wallet.merchant.update() — light fields only (§5.6)", () => {
     expect(JSON.parse(mock.calls[0]!.body!)).toEqual({ website: null });
   });
 
+  it("forwards businessName: null on the wire (type allows it — no type/runtime skew)", async () => {
+    const mock = mockFetch([{ json: { success: true, merchant_slug: "loja-teste" } }]);
+    // businessName is typed `string | null` like the other four fields, so an
+    // explicit null is a plain typed call (no cast) and is forwarded, not dropped.
+    await ns(mock).update({ businessName: null });
+    expect(JSON.parse(mock.calls[0]!.body!)).toEqual({ business_name: null });
+  });
+
   it("rejects a forbidden field (liquid_address) BEFORE any request", async () => {
     const mock = mockFetch([]);
     await expect(
@@ -98,6 +106,33 @@ describe("wallet.merchant.update() — light fields only (§5.6)", () => {
     await expect(
       ns(mock).update({ splitAddress: "ex1qsplit" } as unknown as MerchantUpdateFields)
     ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "MERCHANT_FIELD_NOT_EDITABLE"));
+    expect(mock.calls.length).toBe(0);
+  });
+
+  it("rejects a GENERIC unknown key (foo) — the guard is not address-specific", async () => {
+    // The rejection mechanism is any-key-outside-FIELD_MAP, not a special-case on
+    // address fields; a plain unknown key locks in that generality.
+    const mock = mockFetch([]);
+    await expect(
+      ns(mock).update({ foo: "x" } as unknown as MerchantUpdateFields)
+    ).rejects.toSatisfy(
+      (e: unknown) =>
+        e instanceof MerchantError &&
+        e.code === "MERCHANT_FIELD_NOT_EDITABLE" &&
+        (e.details as { field?: string } | undefined)?.field === "foo"
+    );
+    expect(mock.calls.length).toBe(0);
+  });
+
+  it("patchMerchantProfile primitive rejects an owner-only key before any request (defense-in-depth)", async () => {
+    // Second line of defense: even bypassing the guarded namespace and calling
+    // the public client primitive directly with an excess key must not reach the
+    // wire — the forbidden field is rejected client-side.
+    const mock = mockFetch([]);
+    const client = makeClient(mock);
+    await expect(
+      client.patchMerchantProfile({ liquid_address: "ex1qexample" } as unknown as MerchantUpdateWireBody)
+    ).rejects.toBeInstanceOf(TypeError);
     expect(mock.calls.length).toBe(0);
   });
 

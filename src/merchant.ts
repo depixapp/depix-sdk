@@ -39,7 +39,11 @@ export interface MerchantProfile {
  * runtime for untyped/agent-generated inputs.
  */
 export interface MerchantUpdateFields {
-  businessName?: string;
+  /**
+   * null is forwarded like the other fields (no type/runtime skew); the server
+   * is authoritative on whether a blank business name is accepted.
+   */
+  businessName?: string | null;
   /** null/empty string clears it. */
   logoUrl?: string | null;
   /** null/empty string clears it. */
