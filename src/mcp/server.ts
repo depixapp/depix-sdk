@@ -22,25 +22,41 @@ import { defaultLogger as logger } from "../logger.js";
 import * as s from "./schemas.js";
 import { MAX_WAIT_SECONDS_CEILING } from "./schemas.js";
 import {
+  buyGiftcardTool,
   createDepositTool,
   createWithdrawalTool,
   getAddressTool,
   getBalancesTool,
   getGuardrailsTool,
+  listGiftcardOrdersTool,
   listTransactionsTool,
+  payLightningInvoiceTool,
+  receiveLightningTool,
   sendTool,
   statusTool,
+  swapExecuteTool,
+  swapQuoteTool,
+  toStablecoinTool,
   waitDepositTool,
   waitWithdrawalTool,
   type McpWalletFacade,
   type ToolContext,
 } from "./tools.js";
+import { SwapStreamRegistry } from "./swap-streams.js";
+import type { StablecoinAsset } from "../convert/boltz/stablecoin.js";
+import type { AssetKey } from "../assets.js";
 
 export const SERVER_NAME = "com.depixapp/wallet";
 export const SERVER_TITLE = "DePix Wallet";
 export const DEFAULT_SERVER_VERSION = "1.0.0";
 
-/** The exact MVP catalog (§6.2), prefixed `wallet_` (G10). Exported for tests/docs. */
+/**
+ * The full catalog (§6.2), prefixed `wallet_` (G10). Exported for tests/docs.
+ * The MVP 10 (PR8) plus the fast-follow conversions + gift cards (PR8b). SideShift
+ * (wallet_shift_usdt, §5.4/G4) is intentionally absent: its wallet flow does not
+ * exist on main, so there is nothing to wrap without reimplementing a custodial
+ * provider (out of scope).
+ */
 export const WALLET_TOOL_NAMES = [
   "wallet_status",
   "wallet_get_address",
@@ -52,6 +68,13 @@ export const WALLET_TOOL_NAMES = [
   "wallet_create_withdrawal",
   "wallet_wait_withdrawal",
   "wallet_get_guardrails",
+  "wallet_swap_quote",
+  "wallet_swap_execute",
+  "wallet_pay_lightning_invoice",
+  "wallet_receive_lightning",
+  "wallet_to_stablecoin",
+  "wallet_buy_giftcard",
+  "wallet_list_giftcard_orders",
 ] as const;
 
 const INSTRUCTIONS = [
@@ -144,6 +167,20 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
     { name: SERVER_NAME, title: SERVER_TITLE, version: opts.version ?? DEFAULT_SERVER_VERSION },
     { instructions: INSTRUCTIONS },
   );
+
+  // Holds the OPEN SideSwap quote streams that wallet_swap_quote creates and
+  // wallet_swap_execute runs on (the quote_id is socket-bound). Unlike the Boltz
+  // watches — which wallet.close() disposes (§5.3) — these streams are owned by
+  // the MCP layer, so server.close() must tear them down: we wrap close() to
+  // disposeAll() FIRST, so a shutdown with a quote in flight leaves no live socket
+  // (the deferral-critical guarantee, §6.1). disposeAll() is synchronous, so it
+  // never makes shutdown hang; the runtime hard-exit watchdog is the backstop.
+  const swapStreams = new SwapStreamRegistry();
+  const baseClose = server.close.bind(server);
+  server.close = async (): Promise<void> => {
+    swapStreams.disposeAll();
+    await baseClose();
+  };
 
   const read: ToolAnnotations = { readOnlyHint: true, openWorldHint: true };
   const write: ToolAnnotations = { readOnlyHint: false, openWorldHint: true };
@@ -318,6 +355,148 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
       annotations: read,
     },
     () => run(() => getGuardrailsTool(wallet)),
+  );
+
+  // ── fast-follow: conversions + gift cards (§6.2 fast-follow, §5). Client-direct
+  // providers (SideSwap/Boltz/CryptoRefills) — NOT gated on DEPIX_API_KEY. ──
+
+  server.registerTool(
+    "wallet_swap_quote",
+    {
+      title: "Quote a SideSwap market swap",
+      description:
+        "Get a live SideSwap market-swap quote between DePix, L-BTC and USDt (NON-custodial — the swap pays back into " +
+        "your OWN wallet). Returns a single-use swap_quote_id to pass to wallet_swap_execute before expires_at_ms. " +
+        "amount_sats and the quoted amounts are BASE UNITS. Opens a short-lived quote socket held server-side until you " +
+        "execute, it expires, or the server shuts down. Moves no money by itself.",
+      inputSchema: s.swapQuoteInput,
+      outputSchema: s.swapQuoteOutput,
+      annotations: write,
+    },
+    (args) =>
+      run(() =>
+        swapQuoteTool(
+          wallet,
+          swapStreams,
+          args as { from: AssetKey; to: AssetKey; amount_sats: string; timeout_seconds?: number },
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "wallet_swap_execute",
+    {
+      title: "Execute a SideSwap quote",
+      description:
+        "Execute a quote from wallet_swap_quote by its swap_quote_id (must run before the quote expires). MOVES MONEY: " +
+        "validates the swap PSET pays your own receive address, signs, and lets SideSwap broadcast. Passes the SENT side " +
+        "through the owner's value guardrails BEFORE signing (market swaps are allowlist-exempt — funds return to your " +
+        "wallet). Irreversible once broadcast.",
+      inputSchema: s.swapExecuteInput,
+      outputSchema: s.swapExecuteOutput,
+      annotations: money,
+    },
+    (args) => run(() => swapExecuteTool(swapStreams, args as { swap_quote_id: string })),
+  );
+
+  server.registerTool(
+    "wallet_pay_lightning_invoice",
+    {
+      title: "Pay a Lightning invoice",
+      description:
+        "Pay a BOLT11 Lightning invoice by locking L-BTC via a Boltz submarine swap (NON-custodial; L-BTC only, never " +
+        "DePix). MOVES MONEY: the L-BTC lockup passes through the owner's guardrails (value caps; the Lightning payee is " +
+        "checked against the allowlist when it is enabled) BEFORE signing. Returns once the lockup is broadcast; Boltz " +
+        "then pays the invoice, or the lockup auto-refunds on failure (watched in the background, cancelled cleanly on " +
+        "shutdown). Amounts are base units (sats).",
+      inputSchema: s.payLightningInvoiceInput,
+      outputSchema: s.payLightningInvoiceOutput,
+      annotations: money,
+    },
+    (args) => run(() => payLightningInvoiceTool(wallet, args as { invoice: string })),
+  );
+
+  server.registerTool(
+    "wallet_receive_lightning",
+    {
+      title: "Receive over Lightning",
+      description:
+        "Receive over Lightning INTO this wallet via a Boltz reverse swap (NON-custodial). Returns a BOLT11 invoice for " +
+        "a payer to pay; once paid, the L-BTC is claimed into your wallet in the background (watched, cancelled cleanly " +
+        "on shutdown). An INFLOW — no guardrail. amount_sats is base units.",
+      inputSchema: s.receiveLightningInput,
+      outputSchema: s.receiveLightningOutput,
+      annotations: write,
+    },
+    (args) => run(() => receiveLightningTool(wallet, args as { amount_sats: string })),
+  );
+
+  server.registerTool(
+    "wallet_to_stablecoin",
+    {
+      title: "Convert L-BTC to USDC/USDT",
+      description:
+        "Convert L-BTC to USDC/USDT delivered to an external EVM or Tron address via a Boltz chain swap (NON-custodial " +
+        "on the Liquid side; the L-BTC lockup is refundable). MOVES MONEY: the L-BTC lockup passes through the owner's " +
+        "guardrails (value caps; the destination claim_address is checked against the allowlist when it is enabled) " +
+        "BEFORE signing. The EVM legs run in the background after funding. amount_sats is L-BTC base units.",
+      inputSchema: s.toStablecoinInput,
+      outputSchema: s.toStablecoinOutput,
+      annotations: money,
+    },
+    (args) =>
+      run(() =>
+        toStablecoinTool(
+          wallet,
+          args as { asset: StablecoinAsset; network_id: string; amount_sats: string; claim_address: string },
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "wallet_buy_giftcard",
+    {
+      title: "Buy a gift card",
+      description:
+        "Buy a gift card or mobile top-up from CryptoRefills and pay it over Lightning via Boltz (NON-custodial). MOVES " +
+        "MONEY: the L-BTC lockup passes through the owner's guardrails (value caps; with the allowlist on, BOTH the " +
+        "Lightning payee AND the gift-card beneficiary must be opted in) BEFORE signing, plus a 1% DePix service fee. " +
+        "Delivery goes to `email` (or beneficiary_account). Returns once the lockup is broadcast; Boltz then pays the " +
+        "invoice in the background. Amounts are base units (sats).",
+      inputSchema: s.buyGiftcardInput,
+      outputSchema: s.buyGiftcardOutput,
+      annotations: money,
+    },
+    (args) =>
+      run(() =>
+        buyGiftcardTool(
+          wallet,
+          args as {
+            brand_name: string;
+            denomination: string;
+            email: string;
+            beneficiary_account?: string;
+            country_code?: string;
+            product_value?: string;
+            quantity?: number;
+            validate?: boolean;
+          },
+        ),
+      ),
+  );
+
+  server.registerTool(
+    "wallet_list_giftcard_orders",
+    {
+      title: "List gift-card orders",
+      description:
+        "List the locally tracked gift-card orders (newest first): order id, brand, denomination, beneficiary, amounts " +
+        "and last-known phase. Read-only — no network, no config gate. Moves no money.",
+      inputSchema: s.listGiftcardOrdersInput,
+      outputSchema: s.listGiftcardOrdersOutput,
+      annotations: read,
+    },
+    () => run(() => listGiftcardOrdersTool(wallet)),
   );
 
   return server;

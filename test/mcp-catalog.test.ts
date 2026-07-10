@@ -27,7 +27,7 @@ const REMOTE_TOOLS = [
   "get_withdrawal_status",
 ];
 
-const EXPECTED = [
+const MVP = [
   "wallet_status",
   "wallet_get_address",
   "wallet_get_balances",
@@ -38,17 +38,38 @@ const EXPECTED = [
   "wallet_create_withdrawal",
   "wallet_wait_withdrawal",
   "wallet_get_guardrails",
-].sort();
+];
 
-describe("wallet MCP catalog (§6.2 — 10 wallet_* tools)", () => {
-  it("initialize handshake succeeds and lists exactly the MVP catalog", async () => {
+// PR8b fast-follow (§6.2): SideSwap + Boltz Lightning/stablecoin + CryptoRefills.
+const FAST_FOLLOW = [
+  "wallet_swap_quote",
+  "wallet_swap_execute",
+  "wallet_pay_lightning_invoice",
+  "wallet_receive_lightning",
+  "wallet_to_stablecoin",
+  "wallet_buy_giftcard",
+  "wallet_list_giftcard_orders",
+];
+
+const EXPECTED = [...MVP, ...FAST_FOLLOW].sort();
+
+describe("wallet MCP catalog (§6.2 — 10 MVP + 7 fast-follow wallet_* tools)", () => {
+  it("initialize handshake succeeds and lists the MVP catalog PLUS the fast-follows", async () => {
     const { client } = await connectWallet({ wallet: new FakeWallet() });
     // The connect above already ran initialize; capability read confirms the handshake.
     expect(client.getServerVersion()?.name).toBe("com.depixapp/wallet");
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(EXPECTED);
-    expect(names.length).toBe(10);
+    expect(names.length).toBe(17);
+    // All 10 MVP tools survive; every fast-follow is present.
+    for (const n of [...MVP, ...FAST_FOLLOW]) expect(names).toContain(n);
+  });
+
+  it("does NOT expose wallet_shift_usdt — SideShift is not on main (custodial, out of scope)", async () => {
+    const { client } = await connectWallet({ wallet: new FakeWallet() });
+    const names = (await client.listTools()).tools.map((t) => t.name);
+    expect(names).not.toContain("wallet_shift_usdt");
   });
 
   it("WALLET_TOOL_NAMES matches the registered catalog", async () => {
@@ -123,5 +144,28 @@ describe("wallet MCP catalog (§6.2 — 10 wallet_* tools)", () => {
   it("has NO tool that exports the seed, mutates guardrails, or pays a checkout (§6.2)", () => {
     const forbidden = /mnemonic|seed|descriptor|export|set_guardrail|liquid_address|split_address|checkout/i;
     for (const n of WALLET_TOOL_NAMES) expect(n).not.toMatch(forbidden);
+  });
+
+  it("fast-follow money fields carry their UNIT and the swap tools are unit-explicit", async () => {
+    const { client } = await connectWallet({ wallet: new FakeWallet() });
+    const { tools } = await client.listTools();
+    const props = (name: string) =>
+      (tools.find((t) => t.name === name)!.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+
+    // swap / stablecoin move on-chain base units — amount_sats, never a bare amount.
+    for (const name of ["wallet_swap_quote", "wallet_receive_lightning", "wallet_to_stablecoin"]) {
+      expect(props(name), name).toHaveProperty("amount_sats");
+      expect(props(name), name).not.toHaveProperty("amount");
+      expect(props(name), name).not.toHaveProperty("amount_cents");
+    }
+  });
+});
+
+describe("stablecoin schema enums mirror the source of truth (no drift)", () => {
+  it("STABLECOIN_ASSETS matches StablecoinAsset and STABLECOIN_NETWORK_IDS matches BOLTZ_STABLECOIN_NETWORKS", async () => {
+    const { STABLECOIN_ASSETS, STABLECOIN_NETWORK_IDS } = await import("../src/mcp/schemas.js");
+    const { BOLTZ_STABLECOIN_NETWORKS } = await import("../src/convert/boltz/stablecoin.js");
+    expect([...STABLECOIN_ASSETS].sort()).toEqual(["USDC", "USDT"]);
+    expect([...STABLECOIN_NETWORK_IDS].sort()).toEqual(BOLTZ_STABLECOIN_NETWORKS.map((n) => n.id).sort());
   });
 });
