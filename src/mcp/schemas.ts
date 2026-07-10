@@ -167,6 +167,53 @@ const guardrailBudget = () =>
     allowlist_enabled: z.boolean().describe("Whether the owner turned the destination allowlist on (§4.3)."),
   });
 
+/** Withdrawals crash-resume counters (§3.2.9) — shared by wallet_status and wallet_recover. */
+const withdrawalsResumeSummary = () =>
+  z.object({
+    resumed: z.number().int(),
+    rebroadcast: z.number().int(),
+    reposted: z.number().int(),
+    discarded: z.number().int(),
+    failed: z.number().int(),
+  });
+
+/** Boltz conversion-resume counters (§5.3) — nullable: a view-only wallet has no Boltz rail. */
+const boltzResumeSummary = () =>
+  z.object({
+    submarine_resumed: z.number().int(),
+    submarine_refunded: z.number().int(),
+    reverse_resumed: z.number().int(),
+    stablecoin_resumed: z.number().int(),
+    stablecoin_refunded: z.number().int(),
+    discarded: z.number().int(),
+    removed: z.number().int(),
+    failed: z.number().int(),
+  });
+
+const peginResumeSummary = () =>
+  z.object({
+    pending: z.number().int().describe("In-flight peg-ins still tracked after reconciliation."),
+    cleared: z.number().int().describe("Tracked peg-ins SideSwap reported Done — cleared."),
+    failed: z.number().int().describe("Reconciliation attempts that failed (kept for the next resume)."),
+  });
+
+const sideshiftResumeSummary = () =>
+  z.object({
+    checked: z.number().int().describe("Non-terminal tracked shifts found in the local log."),
+    refreshed: z.number().int().describe("Shifts whose status was refreshed from SideShift."),
+    failed: z.number().int().describe("Status refreshes that failed (kept for the next resume)."),
+  });
+
+/** Conversion recovery summary (§5) — shared by wallet_status and wallet_recover. */
+const conversionResumeSummary = () =>
+  z.object({
+    boltz: boltzResumeSummary()
+      .nullable()
+      .describe("Boltz swap reconciliation counters, or null when the wallet has no seed (no Boltz rail)."),
+    pegin: peginResumeSummary(),
+    sideshift: sideshiftResumeSummary(),
+  });
+
 export const statusOutput = {
   mode: z
     .enum(["live", "test", "unknown"])
@@ -174,15 +221,12 @@ export const statusOutput = {
   api_key_configured: z.boolean().describe("Whether an API key is set (deposit/withdraw need one)."),
   backup_confirmed: z.boolean().describe("Whether the seed backup was confirmed — receive is gated until true (§2.9)."),
   guardrails: guardrailBudget(),
-  pending_withdrawals: z
-    .object({
-      resumed: z.number().int(),
-      rebroadcast: z.number().int(),
-      reposted: z.number().int(),
-      discarded: z.number().int(),
-      failed: z.number().int(),
-    })
-    .describe("Crash-recovery summary from boot (§3.2.9): auto-resumed/re-broadcast/discarded records."),
+  pending_withdrawals: withdrawalsResumeSummary().describe(
+    "Crash-recovery summary from boot (§3.2.9): auto-resumed/re-broadcast/discarded records.",
+  ),
+  pending_conversions: conversionResumeSummary().describe(
+    "Conversion crash-recovery summary from boot (§5): Boltz swaps reconciled, peg-in reconciled, SideShift shifts refreshed.",
+  ),
 } as const;
 
 export const getAddressOutput = {
@@ -456,6 +500,49 @@ export const listGiftcardOrdersOutput = {
       }),
     )
     .describe("Locally tracked gift-card orders, newest first."),
+} as const;
+
+// ── recovery wiring: wallet_recover + wallet_pending (fund-safety) ────────────
+
+export const recoverInput = {} as const;
+export const pendingInput = {} as const;
+
+export const recoverOutput = {
+  withdrawals: withdrawalsResumeSummary().describe(
+    "Pix withdrawals re-driven (§3.2.9): re-broadcast SAME bytes / re-POST same Idempotency-Key — never a double-pay.",
+  ),
+  boltz: boltzResumeSummary()
+    .nullable()
+    .describe("Boltz swaps reconciled (re-attach watch / claim / refund), or null when the wallet has no seed."),
+  pegin: peginResumeSummary().describe("Tracked SideSwap peg-in reconciliation (§5.2)."),
+  sideshift: sideshiftResumeSummary().describe("Non-terminal SideShift shifts refreshed into the local log (§5.4)."),
+} as const;
+
+export const pendingOutput = {
+  pending: z
+    .array(
+      z.object({
+        rail: z
+          .enum(["withdrawal", "boltz", "pegin", "sideshift"])
+          .describe("Which rail the item is in flight on."),
+        id: z
+          .string()
+          .describe("Rail-scoped id: withdrawal Idempotency-Key, Boltz swap id, SideSwap peg order id, or SideShift shift id."),
+        state: z.string().describe("Rail-specific state/status string (e.g. requested/signed, locked_up, pending, waiting)."),
+        created_at: z.number().int().nullable().describe("Epoch-ms creation time, when tracked."),
+        withdrawal_id: z.string().nullable().optional().describe("withdrawal only: provider withdrawal id, when known."),
+        txid: z.string().nullable().optional().describe("withdrawal only: broadcast Liquid txid, when known."),
+        swap_type: z
+          .enum(["submarine", "reverse", "stablecoin"])
+          .optional()
+          .describe("boltz only: which swap kind is in flight."),
+        peg_addr: z.string().optional().describe("pegin only: the BTC address the owner funds externally."),
+        recv_addr: z.string().optional().describe("pegin only: OUR Liquid address SideSwap pays L-BTC to."),
+        shift_type: z.enum(["send", "receive"]).optional().describe("sideshift only: shift direction."),
+        network: z.string().optional().describe("sideshift only: the non-Liquid network of the shift."),
+      }),
+    )
+    .describe("Everything currently in flight across the four durable stores, newest data as stored. Empty when nothing is pending."),
 } as const;
 
 export const shiftUsdtOutput = {

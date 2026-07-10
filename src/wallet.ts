@@ -76,8 +76,9 @@ import { SyncEngine, type EsploraClientLike, type EsploraProvider } from "./sync
 import { ConvertNamespace, type ConvertNamespaceOptions } from "./convert/namespace.js";
 import type { ConvertWalletHooks } from "./convert/hooks.js";
 import type { GuardrailDestination } from "./guardrails/allowlist.js";
-import { BoltzConvert, type BoltzConvertDeps } from "./convert/boltz/convert.js";
+import { BoltzConvert, type BoltzConvertDeps, type BoltzResumeSummary } from "./convert/boltz/convert.js";
 import { BoltzSwapStore } from "./convert/boltz/store.js";
+import { isShiftTerminal } from "./convert/sideshift.js";
 import { GiftcardsNamespace } from "./giftcards/namespace.js";
 import { GiftcardConfigClient, type GiftcardConfigSource } from "./giftcards/config.js";
 import { CryptorefillsClient, type CryptorefillsFetch } from "./giftcards/cryptorefills.js";
@@ -122,6 +123,13 @@ export interface OpenOptions {
    * MCP-only agent has no other path to recover after a crash. Opt out here.
    */
   resumePendingWithdrawalsOnOpen?: boolean;
+  /**
+   * Auto-run resumePendingConversions() on open() (§5 recovery): reconcile
+   * in-flight Boltz swaps (re-attach watch / claim / refund), the tracked
+   * SideSwap peg-in, and non-terminal SideShift shifts. Default true — the
+   * same fund-safety rationale as the withdrawals resume. Opt out here.
+   */
+  resumePendingConversionsOnOpen?: boolean;
   /**
    * Advanced/testing: inject the SideSwap client factory / foreign-PSET signer /
    * clock used by wallet.convert.sideswap.* (§5). Default: the real WS client
@@ -277,6 +285,90 @@ export interface ResumeSummary {
   failed: number;
 }
 
+/** Peg-in leg of resumePendingConversions() (§5.2 — tracking reconciliation). */
+export interface PegInResumeSummary {
+  /** In-flight peg-ins still tracked after reconciliation. */
+  pending: number;
+  /** Tracked peg-ins SideSwap reported Done — cleared from the store. */
+  cleared: number;
+  /** Reconciliation attempts that failed (record kept for the next resume). */
+  failed: number;
+}
+
+/** SideShift leg of resumePendingConversions() (§5.4 — status refresh). */
+export interface SideShiftResumeSummary {
+  /** Non-terminal tracked shifts found in the local log. */
+  checked: number;
+  /** Shifts whose status was refreshed from SideShift into the log. */
+  refreshed: number;
+  /** Status refreshes that failed (record kept, retried on the next resume). */
+  failed: number;
+}
+
+/**
+ * resumePendingConversions() result (§5 recovery): one entry per conversion
+ * rail. Auto-run by open() (opt-out via resumePendingConversionsOnOpen) and
+ * re-run by wallet.recover().
+ */
+export interface ConversionResumeSummary {
+  /** convert.boltz.resume() summary; null when the wallet has no seed (no Boltz rail). */
+  boltz: BoltzResumeSummary | null;
+  pegin: PegInResumeSummary;
+  sideshift: SideShiftResumeSummary;
+}
+
+/** wallet.recover() result — every rail's recovery summary (§3.2.9 + §5). */
+export interface RecoverySummary extends ConversionResumeSummary {
+  withdrawals: ResumeSummary;
+}
+
+/** Common shape of one in-flight item from wallet.getPending(). */
+export interface PendingItemBase {
+  /** Which rail the item is in flight on. */
+  rail: "withdrawal" | "boltz" | "pegin" | "sideshift";
+  /** Rail-scoped id: Idempotency-Key | Boltz swapId | peg orderId | shift id. */
+  id: string;
+  /** Rail-specific state/status string. */
+  state: string;
+  createdAt: number | null;
+}
+
+export interface PendingWithdrawalItem extends PendingItemBase {
+  rail: "withdrawal";
+  withdrawalId: string | null;
+  txid: string | null;
+}
+
+export interface PendingBoltzSwapItem extends PendingItemBase {
+  rail: "boltz";
+  swapType: "submarine" | "reverse" | "stablecoin";
+}
+
+export interface PendingPegInItem extends PendingItemBase {
+  rail: "pegin";
+  /** BTC address the owner funds externally. */
+  pegAddr: string;
+  /** OUR Liquid receive address SideSwap pays L-BTC to. */
+  recvAddr: string;
+}
+
+export interface PendingSideShiftItem extends PendingItemBase {
+  rail: "sideshift";
+  shiftType: "send" | "receive";
+  network: string;
+}
+
+/**
+ * One in-flight item from wallet.getPending() — a unified, read-only view over
+ * the four durable stores (§3.2.9 withdrawals, §5.3 Boltz swaps, §5.2 peg-in,
+ * §5.4 SideShift shifts). Metadata only — NEVER key material.
+ */
+export type PendingItem =
+  | PendingWithdrawalItem
+  | PendingBoltzSwapItem
+  | PendingPegInItem
+  | PendingSideShiftItem;
+
 function resolveDataDir(explicit?: string): string {
   return explicit ?? process.env.DEPIX_WALLET_DIR ?? join(homedir(), ".depix-wallet");
 }
@@ -358,6 +450,10 @@ export class DepixWallet {
   // handle lets close() dispose its in-flight watches (.sideswap lives on the
   // ConvertNamespace `convert` field).
   private readonly convertNamespace: { boltz: BoltzConvert } | null;
+  // The SAME BoltzSwapStore instance wired into BoltzConvert — held so
+  // getPending() can read the in-flight swaps without expanding BoltzConvert's
+  // public surface (reads are metadata-only; records carry swap-scoped keys).
+  private readonly boltzSwapStore: BoltzSwapStore | null;
   private file: WalletFileV1;
   private lock: DirLock | null;
   private wollet: Wollet | null = null;
@@ -444,25 +540,28 @@ export class DepixWallet {
     // Held as a private field (not just inside .convert) so close() can dispose
     // its in-flight watches (§5.3 resource hygiene) — the SAME instance is wired
     // into the convert namespace below as wallet.convert.boltz.
-    this.convertNamespace =
+    this.boltzSwapStore =
       parts.passphrase && parts.file.salt
-        ? {
-            boltz: new BoltzConvert(
-              {
-                store: new BoltzSwapStore({
-                  dataDir: parts.dataDir,
-                  passphrase: parts.passphrase,
-                  saltB64: parts.file.salt,
-                  logger: this.logger
-                }),
-                logger: this.logger,
-                lockupLbtc: (p) => this.lockupLbtc(p),
-                getReceiveAddress: () => this.getReceiveAddress()
-              },
-              parts.boltz ?? {}
-            )
-          }
+        ? new BoltzSwapStore({
+            dataDir: parts.dataDir,
+            passphrase: parts.passphrase,
+            saltB64: parts.file.salt,
+            logger: this.logger
+          })
         : null;
+    this.convertNamespace = this.boltzSwapStore
+      ? {
+          boltz: new BoltzConvert(
+            {
+              store: this.boltzSwapStore,
+              logger: this.logger,
+              lockupLbtc: (p) => this.lockupLbtc(p),
+              getReceiveAddress: () => this.getReceiveAddress()
+            },
+            parts.boltz ?? {}
+          )
+        }
+      : null;
     // Conversions (§5) — a narrow seam onto the same choke point (§4.3), BRL
     // valuator (§4.4), op mutex (§4.3 TOCTOU) and encrypted seed used by
     // send()/withdraw(). Everything forwarded here already exists on this
@@ -582,6 +681,16 @@ export class DepixWallet {
     // failures), so a stuck resume can never block opening the wallet.
     if (options.resumePendingWithdrawalsOnOpen !== false) {
       await wallet.resumePendingWithdrawals().catch(() => {
+        /* resume already logs; never fail open() on it */
+      });
+    }
+    // Auto-resume in-flight CONVERSIONS the same way (§5 recovery wiring):
+    // Boltz swaps (re-attach watch / claim / refund), the tracked peg-in and
+    // non-terminal SideShift shifts. resumePendingConversions() never throws
+    // (per-rail failures are logged); the extra catch keeps even a pathological
+    // failure from ever blocking open().
+    if (options.resumePendingConversionsOnOpen !== false) {
+      await wallet.resumePendingConversions().catch(() => {
         /* resume already logs; never fail open() on it */
       });
     }
@@ -1316,6 +1425,177 @@ export class DepixWallet {
 
     summary.resumed = summary.rebroadcast + summary.reposted;
     return summary;
+  }
+
+  /**
+   * Recover in-flight CONVERSIONS (§5) — the counterpart of
+   * resumePendingWithdrawals() for the three conversion rails:
+   *   Boltz (§5.3): convert.boltz.resume() reconciles submarine/reverse/
+   *     stablecoin swaps with Boltz — re-attach the watch, claim, or refund.
+   *   Peg-in (§5.2): the store load TTL-prunes stale records; a live one is
+   *     reconciled with SideSwap and cleared once Done (the L-BTC lands on our
+   *     own descriptor address regardless — this is tracking hygiene).
+   *   SideShift (§5.4): every non-terminal tracked shift has its status
+   *     refreshed into sideshift-shifts.json (CUSTODIAL — nothing to sign; a
+   *     stuck receive still needs setRefundAddress() by the caller).
+   * Auto-run by open() (opt-out via resumePendingConversionsOnOpen). NEVER
+   * throws — per-rail failures are logged and retried on the next
+   * open()/recover().
+   */
+  async resumePendingConversions(): Promise<ConversionResumeSummary> {
+    const summary: ConversionResumeSummary = {
+      boltz: null,
+      pegin: { pending: 0, cleared: 0, failed: 0 },
+      sideshift: { checked: 0, refreshed: 0, failed: 0 }
+    };
+    if (!this.lock) return summary;
+
+    // Boltz — only when the wallet has seed material (a view-only/wiped wallet
+    // has no swap store / lockup signer). resume() itself never throws; the
+    // try/catch here is belt-and-braces so no rail can abort the sweep.
+    if (this.convertNamespace) {
+      try {
+        summary.boltz = await this.convertNamespace.boltz.resume();
+      } catch (err) {
+        this.logger.error("boltz conversion resume failed — will retry on the next resume", {
+          error: String((err as Error)?.message ?? err)
+        });
+      }
+    }
+
+    try {
+      const pegin = await this.convert.sideswap.getPendingPegIn();
+      if (pegin) {
+        try {
+          const status = await this.convert.sideswap.pegStatus({ orderId: pegin.orderId, pegIn: true });
+          if (status.status === "Done") {
+            await this.convert.sideswap.clearPendingPegIn();
+            summary.pegin.cleared++;
+          } else {
+            summary.pegin.pending++;
+          }
+        } catch (err) {
+          summary.pegin.pending++;
+          summary.pegin.failed++;
+          this.logger.error("pending peg-in reconciliation failed — kept for the next resume", {
+            orderId: pegin.orderId,
+            error: String((err as Error)?.message ?? err)
+          });
+        }
+      }
+    } catch (err) {
+      summary.pegin.failed++;
+      this.logger.error("could not read the pending peg-in — skipping its resume", {
+        error: String((err as Error)?.message ?? err)
+      });
+    }
+
+    try {
+      const shifts = await this.convert.sideshift.listShifts();
+      for (const shift of shifts) {
+        if (isShiftTerminal(shift.status)) continue;
+        summary.sideshift.checked++;
+        try {
+          await this.convert.sideshift.getStatus(shift.id);
+          summary.sideshift.refreshed++;
+        } catch (err) {
+          summary.sideshift.failed++;
+          this.logger.error("sideshift status refresh failed — kept for the next resume", {
+            shiftId: shift.id,
+            error: String((err as Error)?.message ?? err)
+          });
+        }
+      }
+    } catch (err) {
+      summary.sideshift.failed++;
+      this.logger.error("could not read the sideshift shift log — skipping its resume", {
+        error: String((err as Error)?.message ?? err)
+      });
+    }
+
+    return summary;
+  }
+
+  /**
+   * Re-run crash recovery for EVERYTHING pending, across all rails —
+   * withdrawals (§3.2.9) + Boltz + peg-in + SideShift (§5) — mid-session.
+   * Idempotent (each rail's resume re-drives the SAME persisted bytes/keys and
+   * removes what completed) and safe to call repeatedly; it only completes or
+   * refunds PREVIOUSLY authorized operations, never starts a new payment.
+   */
+  async recover(): Promise<RecoverySummary> {
+    this.assertOpen();
+    const withdrawals = await this.resumePendingWithdrawals();
+    const conversions = await this.resumePendingConversions();
+    return { withdrawals, ...conversions };
+  }
+
+  /**
+   * Unified read-only view of everything IN FLIGHT across the four durable
+   * stores (§3.2.9 pending withdrawals, §5.3 Boltz swaps, §5.2 the tracked
+   * peg-in, §5.4 non-terminal SideShift shifts). No network, no signing, no
+   * mutation (beyond the peg-in store's own TTL prune-on-read) — and NO key
+   * material: Boltz/withdrawal records carry secrets, so only rail/id/state
+   * metadata is surfaced here. Use recover() to re-drive these items.
+   */
+  async getPending(): Promise<PendingItem[]> {
+    this.assertOpen();
+    const items: PendingItem[] = [];
+
+    if (this.pending) {
+      // Tampered records are resume's job (discard + loud log) — skip here.
+      const { records } = await this.pending.readAll();
+      for (const record of records) {
+        items.push({
+          rail: "withdrawal",
+          id: record.idempotencyKey,
+          state: record.state,
+          createdAt: record.createdAt ?? null,
+          withdrawalId: record.withdrawalId ?? null,
+          txid: record.txid ?? null
+        });
+      }
+    }
+
+    if (this.boltzSwapStore) {
+      const { records } = await this.boltzSwapStore.readAll();
+      for (const record of records) {
+        items.push({
+          rail: "boltz",
+          id: record.swapId,
+          state: record.state,
+          createdAt: record.createdAt ?? null,
+          swapType: record.type
+        });
+      }
+    }
+
+    const pegin = await this.convert.sideswap.getPendingPegIn();
+    if (pegin) {
+      items.push({
+        rail: "pegin",
+        id: pegin.orderId,
+        state: "pending",
+        createdAt: null,
+        pegAddr: pegin.pegAddr,
+        recvAddr: pegin.recvAddr
+      });
+    }
+
+    const shifts = await this.convert.sideshift.listShifts();
+    for (const shift of shifts) {
+      if (isShiftTerminal(shift.status)) continue;
+      items.push({
+        rail: "sideshift",
+        id: shift.id,
+        state: shift.status,
+        createdAt: shift.createdAt ?? null,
+        shiftType: shift.type,
+        network: shift.network
+      });
+    }
+
+    return items;
   }
 
   /**

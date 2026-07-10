@@ -183,11 +183,13 @@ npx -p @depixapp/sdk depix-wallet-mcp
 Tools: `wallet_status`, `wallet_get_address`, `wallet_get_balances`,
 `wallet_list_transactions`, `wallet_send`, `wallet_create_deposit`,
 `wallet_wait_deposit`, `wallet_create_withdrawal`, `wallet_wait_withdrawal`,
-`wallet_get_guardrails`, plus swap/lightning/gift-card fast-follows. Monetary
-fields name their unit (`amount_cents` for Pix/BRL, `amount_sats` for
-sends/swaps). There is **no** tool that exports the seed/mnemonic or changes
-guardrails — those are never reachable by a tool call, even from a fully
-injected model.
+`wallet_get_guardrails`, plus swap/lightning/gift-card fast-follows and the
+recovery pair `wallet_recover` / `wallet_pending` (re-drive everything pending
+across all rails; list what is in flight — crash recovery also runs
+automatically at boot). Monetary fields name their unit (`amount_cents` for
+Pix/BRL, `amount_sats` for sends/swaps). There is **no** tool that exports the
+seed/mnemonic or changes guardrails — those are never reachable by a tool call,
+even from a fully injected model.
 
 > **Two hosts, one wallet dir?** Each host spawns its own process; a second
 > process on the same `DEPIX_WALLET_DIR` fails fast with `WALLET_DIR_LOCKED`.

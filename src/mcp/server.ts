@@ -16,7 +16,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult, ToolAnnotations } from "@modelcontextprotocol/sdk/types.js";
-import type { ResumeSummary } from "../wallet.js";
+import type { ConversionResumeSummary, ResumeSummary } from "../wallet.js";
 import { ToolError, mapToolError, missingApiKeyError } from "./errors.js";
 import { defaultLogger as logger } from "../logger.js";
 import * as s from "./schemas.js";
@@ -31,7 +31,9 @@ import {
   listGiftcardOrdersTool,
   listTransactionsTool,
   payLightningInvoiceTool,
+  pendingTool,
   receiveLightningTool,
+  recoverTool,
   sendTool,
   shiftUsdtTool,
   statusTool,
@@ -54,8 +56,10 @@ export const DEFAULT_SERVER_VERSION = "1.0.0";
 /**
  * The full catalog (§6.2), prefixed `wallet_` (G10). Exported for tests/docs.
  * The MVP 10 (PR8) plus the fast-follow conversions + gift cards (PR8b) plus
- * SideShift (PR5c) — 18 tools. wallet_shift_usdt (§5.4/G4) is the ONE CUSTODIAL
- * tool: its description says so explicitly (G4 = documentation-signalled, no gate).
+ * SideShift (PR5c) plus the recovery pair (wallet_recover / wallet_pending —
+ * fund-safety wiring) — 20 tools. wallet_shift_usdt (§5.4/G4) is the ONE
+ * CUSTODIAL tool: its description says so explicitly (G4 = documentation-
+ * signalled, no gate).
  */
 export const WALLET_TOOL_NAMES = [
   "wallet_status",
@@ -76,6 +80,8 @@ export const WALLET_TOOL_NAMES = [
   "wallet_buy_giftcard",
   "wallet_list_giftcard_orders",
   "wallet_shift_usdt",
+  "wallet_recover",
+  "wallet_pending",
 ] as const;
 
 const INSTRUCTIONS = [
@@ -132,6 +138,8 @@ export interface CreateWalletMcpServerOptions {
   apiKeyConfigured?: boolean;
   /** Crash-resume summary captured at boot (§3.2.9) — surfaced by wallet_status. */
   bootResume?: ResumeSummary;
+  /** Conversion crash-resume summary captured at boot (§5) — surfaced by wallet_status. */
+  bootConversions?: ConversionResumeSummary;
   /** Hard ceiling for the wait tools' timeout_seconds (§6.2d). Default 900. */
   maxWaitSeconds?: number;
   version?: string;
@@ -145,6 +153,12 @@ const EMPTY_RESUME: ResumeSummary = {
   failed: 0,
 };
 
+const EMPTY_CONVERSIONS: ConversionResumeSummary = {
+  boltz: null,
+  pegin: { pending: 0, cleared: 0, failed: 0 },
+  sideshift: { checked: 0, refreshed: 0, failed: 0 },
+};
+
 export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpServer {
   const wallet = opts.wallet;
   const maxWaitSeconds = clampCeiling(opts.maxWaitSeconds);
@@ -152,6 +166,7 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
     keyMode: opts.keyMode ?? "unknown",
     apiKeyConfigured: opts.apiKeyConfigured ?? false,
     bootResume: opts.bootResume ?? EMPTY_RESUME,
+    bootConversions: opts.bootConversions ?? EMPTY_CONVERSIONS,
   };
 
   // The tools that hit the DePix API (deposit/withdraw + their waits) short-circuit
@@ -204,7 +219,8 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
       description:
         "Read wallet operational status: key mode (live/test, derived locally from the sk_ prefix — no API call), " +
         "whether an API key is configured, whether the seed backup is confirmed, the current guardrail budget " +
-        "(rolling-24h + per-tx caps and usage), and the crash-resume summary from boot. Moves no money.",
+        "(rolling-24h + per-tx caps and usage), and the crash-resume summaries from boot (pending withdrawals + " +
+        "pending conversions). Moves no money.",
       inputSchema: s.statusInput,
       outputSchema: s.statusOutput,
       annotations: read,
@@ -532,6 +548,42 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
           args as { network: string; amount_sats: string; settle_address: string; refund_address?: string },
         ),
       ),
+  );
+
+  // ── recovery wiring (fund-safety): re-drive every rail + unified pending view ──
+
+  server.registerTool(
+    "wallet_recover",
+    {
+      title: "Recover everything pending",
+      description:
+        "Re-run crash recovery for EVERYTHING pending, across all rails: re-broadcast/re-POST pending Pix " +
+        "withdrawals (SAME signed bytes / SAME Idempotency-Key — never a double-pay), reconcile in-flight Boltz " +
+        "swaps (re-attach the watch, claim, or refund the L-BTC lockup), reconcile the tracked SideSwap peg-in, " +
+        "and refresh non-terminal SideShift shifts. Idempotent and safe to call repeatedly; it also runs " +
+        "automatically at boot. It only completes or refunds PREVIOUSLY authorized operations — it never starts " +
+        "a new payment. Returns per-rail counts; see wallet_pending for what is currently in flight.",
+      inputSchema: s.recoverInput,
+      outputSchema: s.recoverOutput,
+      annotations: write,
+    },
+    () => run(() => recoverTool(wallet)),
+  );
+
+  server.registerTool(
+    "wallet_pending",
+    {
+      title: "List everything in flight",
+      description:
+        "List everything currently IN FLIGHT across the wallet's four durable stores: pending Pix withdrawals, " +
+        "in-flight Boltz swaps (Lightning send/receive and stablecoin), the tracked SideSwap peg-in, and " +
+        "non-terminal SideShift shifts. Each item carries rail, id, state and rail-specific fields. Read-only " +
+        "and local (no network, no signing) — use wallet_recover to re-drive these items. Moves no money.",
+      inputSchema: s.pendingInput,
+      outputSchema: s.pendingOutput,
+      annotations: read,
+    },
+    () => run(() => pendingTool(wallet)),
   );
 
   return server;

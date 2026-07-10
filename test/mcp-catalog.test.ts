@@ -53,9 +53,12 @@ const FAST_FOLLOW = [
   "wallet_shift_usdt",
 ];
 
-const EXPECTED = [...MVP, ...FAST_FOLLOW].sort();
+// Recovery wiring (fund-safety): re-drive every rail + unified pending view.
+const RECOVERY = ["wallet_recover", "wallet_pending"];
 
-describe("wallet MCP catalog (§6.2 — 10 MVP + 8 fast-follow wallet_* tools)", () => {
+const EXPECTED = [...MVP, ...FAST_FOLLOW, ...RECOVERY].sort();
+
+describe("wallet MCP catalog (§6.2 — 10 MVP + 8 fast-follow + 2 recovery wallet_* tools)", () => {
   it("initialize handshake succeeds and lists the MVP catalog PLUS the fast-follows", async () => {
     const { client } = await connectWallet({ wallet: new FakeWallet() });
     // The connect above already ran initialize; capability read confirms the handshake.
@@ -63,9 +66,9 @@ describe("wallet MCP catalog (§6.2 — 10 MVP + 8 fast-follow wallet_* tools)",
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(EXPECTED);
-    expect(names.length).toBe(18);
-    // All 10 MVP tools survive; every fast-follow is present.
-    for (const n of [...MVP, ...FAST_FOLLOW]) expect(names).toContain(n);
+    expect(names.length).toBe(20);
+    // All 10 MVP tools survive; every fast-follow + recovery tool is present.
+    for (const n of [...MVP, ...FAST_FOLLOW, ...RECOVERY]) expect(names).toContain(n);
   });
 
   it("exposes wallet_shift_usdt and marks it CUSTODIAL in the description (§5.4/G4)", async () => {
