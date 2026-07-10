@@ -25,6 +25,19 @@ describe("logger redaction (spec §6.1)", () => {
     expect(out).toContain("[REDACTED]");
   });
 
+  it("redacts BIP39-shaped mnemonics BY PATTERN, with no registration (§2.3 fix)", () => {
+    // The decrypted mnemonic is never registerSecret()'d (that would keep the
+    // seed resident forever). It is scrubbed by pattern instead — proven here
+    // WITHOUT any registerSecret() call.
+    const mnemonic =
+      "legal winner thank year wave sausage worth useful legal winner thank yellow";
+    const out = redactSecrets(`unlock failed seed=${mnemonic}; retry`);
+    expect(out).not.toContain(mnemonic);
+    expect(out).not.toContain("sausage worth");
+    expect(out).toContain("[REDACTED_MNEMONIC]");
+    expect(out).toContain("retry"); // surrounding context is preserved
+  });
+
   it("redacts CT descriptors (blinding-key material)", () => {
     const descriptor =
       "ct(slip77(9c8e4f05c7711a98c838be228bcb84924d4570ca53f35fa1c793e58841d47023),elwpkh([73c5da0a/84'/1776'/0']xpub6CRFzUgHFDaiDAQFNX7VeV9JNPDRabq6NYSpzVZ8zW8ANUCiDdenkb1gBoEZuXNZb3wPc1SVcDXgD2ww5UBtTb8s8ArAbTkoRQ8qn34KgcY/<0;1>/*))#87kykuta";

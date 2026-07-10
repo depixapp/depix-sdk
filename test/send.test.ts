@@ -89,3 +89,26 @@ describe("funds", () => {
     ).rejects.toSatisfy((err: unknown) => isDepixSdkError(err, "INSUFFICIENT_FUNDS"));
   });
 });
+
+describe("concurrent send() is serialized through the choke point (§4.3 TOCTOU)", () => {
+  it("parallel sends each run enforce→sign and the mutex releases on every error path", async () => {
+    // Three concurrent R$50 sends (within both caps) on an empty wallet: each
+    // must pass the guardrail and then fail at build with INSUFFICIENT_FUNDS.
+    // If the per-instance opMutex failed to release on the throw path, the 2nd
+    // and 3rd would never acquire the lock and this test would hang (timeout) —
+    // so completing at all proves release-on-error, and INSUFFICIENT_FUNDS for
+    // every call proves each independently reached the signing leg in turn.
+    const amount = 5_000n * 1_000_000n;
+    const results = await Promise.allSettled([
+      wallet.send({ asset: "DEPIX", amountSats: amount, address: VALID_ADDRESS }),
+      wallet.send({ asset: "DEPIX", amountSats: amount, address: VALID_ADDRESS }),
+      wallet.send({ asset: "DEPIX", amountSats: amount, address: VALID_ADDRESS })
+    ]);
+    expect(results.map((r) => r.status)).toEqual(["rejected", "rejected", "rejected"]);
+    for (const r of results) {
+      expect(
+        isDepixSdkError((r as PromiseRejectedResult).reason, "INSUFFICIENT_FUNDS")
+      ).toBe(true);
+    }
+  });
+});

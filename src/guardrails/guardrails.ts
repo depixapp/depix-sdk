@@ -29,6 +29,7 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { GuardrailError } from "../errors.js";
 import { defaultLogger, type Logger } from "../logger.js";
+import { Mutex } from "../mutex.js";
 import { ensureDir, writeFileDurable } from "../store/fs-util.js";
 
 /** R$ 100,00 per transaction (roadmap decision 6). */
@@ -76,6 +77,12 @@ export class Guardrails {
   private readonly statePath: string;
   private readonly logger: Logger;
   private readonly now: () => number;
+  // Serializes the state read-modify-write so concurrent recordSpend() calls
+  // never lose entries (read→push→write is not atomic on its own — last writer
+  // would clobber the other's entry, under-counting the window). Defense in
+  // depth beyond the wallet-level opMutex, so the accumulator is correct for
+  // ANY caller (withdraw/swaps/gift cards join in PR2+).
+  private readonly writeMutex = new Mutex();
   // Immutable in runtime (G9) — no method mutates these; config plumbing is PR3.
   readonly perTxLimitBrlCents = DEFAULT_PER_TX_LIMIT_BRL_CENTS;
   readonly dailyLimitBrlCents = DEFAULT_DAILY_LIMIT_BRL_CENTS;
@@ -144,15 +151,17 @@ export class Guardrails {
         `recordSpend called with a non-positive-integer value: ${String(brlCents)}`
       );
     }
-    const now = this.now();
-    const entries = (await this.readState()).filter((e) => now - e.ts <= WINDOW_MS);
-    entries.push({ ts: now, brlCents, kind });
-    const state: StateFileV1 = { version: 1, entries };
-    await ensureDir(this.dataDir);
-    // TODO(PR3): authenticate this file with AES-256-GCM using the key
-    // derived from the passphrase (same as the seed store) + write the
-    // `guardrailsStateInitialized` marker into wallet.json (§4.5).
-    await writeFileDurable(this.statePath, `${JSON.stringify(state)}\n`);
+    await this.writeMutex.runExclusive(async () => {
+      const now = this.now();
+      const entries = (await this.readState()).filter((e) => now - e.ts <= WINDOW_MS);
+      entries.push({ ts: now, brlCents, kind });
+      const state: StateFileV1 = { version: 1, entries };
+      await ensureDir(this.dataDir);
+      // TODO(PR3): authenticate this file with AES-256-GCM using the key
+      // derived from the passphrase (same as the seed store) + write the
+      // `guardrailsStateInitialized` marker into wallet.json (§4.5).
+      await writeFileDurable(this.statePath, `${JSON.stringify(state)}\n`);
+    });
   }
 
   /** Current window usage (read-only — feeds wallet_status/wallet_get_guardrails). */

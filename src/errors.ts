@@ -31,10 +31,14 @@ export class DepixSdkError extends Error {
  *
  * Codes used in PR1 (see spec §7.1 for the full catalog):
  *   INVALID_MNEMONIC, DESCRIPTOR_MISMATCH, WRONG_PASSPHRASE, WEAK_PASSPHRASE,
- *   WALLET_NOT_FOUND, WALLET_ALREADY_EXISTS, WALLET_DIR_LOCKED,
- *   BACKUP_REQUIRED (§2.9), INVALID_ADDRESS, INVALID_AMOUNT,
+ *   WALLET_NOT_FOUND, WALLET_CORRUPTED, WALLET_ALREADY_EXISTS,
+ *   WALLET_DIR_LOCKED, BACKUP_REQUIRED (§2.9), INVALID_ADDRESS, INVALID_AMOUNT,
  *   UNSUPPORTED_ASSET, INSUFFICIENT_FUNDS, INSUFFICIENT_LBTC_FOR_FEE,
  *   ESPLORA_UNAVAILABLE, BROADCAST_FAILED
+ *
+ * WALLET_CORRUPTED (distinct from WALLET_NOT_FOUND): a wallet.json is present
+ * but unreadable (invalid JSON / unknown format-version). Callers branching on
+ * err.code must NOT react by creating a fresh wallet — the file is recoverable.
  */
 export class WalletError extends DepixSdkError {
   constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {

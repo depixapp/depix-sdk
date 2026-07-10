@@ -250,6 +250,24 @@ describe("fresh receive address per call (spec §3.1, decision 2026-07-10)", () 
     expect(await wallet.getReceiveAddress()).toBe(GOLDEN_ADDR_0);
     expect(await wallet.getReceiveAddress()).toBe(GOLDEN_ADDR_1);
   });
+
+  it("concurrent getReceiveAddress() calls never collide (per-instance mutex)", async () => {
+    const wallet = track(
+      await DepixWallet.restore({ dataDir, passphrase: PASSPHRASE, mnemonic: KNOWN_MNEMONIC })
+    );
+    // Without serialization these read the SAME counter and derive the SAME
+    // address (the counter advances by 1 instead of N) — the exact regression
+    // the fresh-address decision (§3.1) exists to prevent.
+    const N = 8;
+    const addrs = await Promise.all(
+      Array.from({ length: N }, () => wallet.getReceiveAddress())
+    );
+    expect(new Set(addrs).size).toBe(N); // all distinct — no shared index
+    // The counter advanced by exactly N: the next call is a brand-new address.
+    const next = await wallet.getReceiveAddress();
+    expect(addrs).not.toContain(next);
+    expect(new Set([...addrs, next]).size).toBe(N + 1);
+  });
 });
 
 describe("wipe() (spec §2.4 — selective)", () => {

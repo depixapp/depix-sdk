@@ -33,6 +33,7 @@ import {
 import { GuardrailError, WalletError } from "./errors.js";
 import { Guardrails } from "./guardrails/guardrails.js";
 import { createLogger, registerSecret, type Logger } from "./logger.js";
+import { Mutex } from "./mutex.js";
 import { assertStrongPassphrase } from "./store/crypto.js";
 import { acquireDirLock, type DirLock } from "./store/dir-lock.js";
 import { ensureDir } from "./store/fs-util.js";
@@ -166,6 +167,11 @@ export class DepixWallet {
   private lock: DirLock | null;
   private wollet: Wollet | null = null;
   private wolletReady = false;
+  private wolletPromise: Promise<Wollet> | null = null;
+  // Serializes the guardrail choke point (enforce→sign→record) and the
+  // nextReceiveIndex read-modify-write against concurrent in-process calls
+  // (§4.3 TOCTOU fix; the dataDir lock only guards across processes).
+  private readonly opMutex = new Mutex();
 
   private constructor(parts: WalletParts) {
     this.dataDir = parts.dataDir;
@@ -212,11 +218,11 @@ export class DepixWallet {
     const lock = await acquireDirLock(dataDir);
     try {
       if (file.encryptedSeed) {
-        // Validate the passphrase eagerly (fail fast with WRONG_PASSPHRASE);
-        // the plaintext is registered for log redaction and dropped here —
-        // signing re-materializes it per operation.
-        const mnemonic = await seedStore.decryptMnemonic(passphrase as string);
-        registerSecret(mnemonic);
+        // Validate the passphrase eagerly (fail fast with WRONG_PASSPHRASE).
+        // The decrypted plaintext is NOT retained: it goes out of scope here
+        // and signing re-materializes it per operation (§2.3). Log redaction is
+        // pattern-based (logger.ts), never by keeping the live seed resident.
+        await seedStore.decryptMnemonic(passphrase as string);
       }
       return new DepixWallet({ dataDir, passphrase, seedStore, file, lock, sync: options.sync });
     } catch (err) {
@@ -239,7 +245,9 @@ export class DepixWallet {
     registerSecret(passphrase);
     const mnemonic =
       options.mnemonic !== undefined ? validateMnemonic(options.mnemonic) : generateMnemonic();
-    registerSecret(mnemonic);
+    // The mnemonic is NOT registered for redaction (that would keep the seed
+    // resident for the whole process — §2.3 requires per-op ephemerality). It
+    // is returned to the caller in the foreground; logs redact it by pattern.
     const descriptor = descriptorFromMnemonic(mnemonic);
 
     await ensureDir(dataDir);
@@ -300,7 +308,9 @@ export class DepixWallet {
     assertStrongPassphrase(passphrase as string);
     registerSecret(passphrase);
     const mnemonic = validateMnemonic(options.mnemonic);
-    registerSecret(mnemonic);
+    // Not registered for redaction — see create(): retaining the plaintext for
+    // log redaction would defeat the per-op zeroing (§2.3). Redaction is by
+    // pattern (logger.ts).
     const descriptor = descriptorFromMnemonic(mnemonic);
 
     await ensureDir(dataDir);
@@ -404,12 +414,19 @@ export class DepixWallet {
     if (typeof options.index === "number") {
       return wollet.address(options.index).address().toString();
     }
-    const lastUnused = wollet.address(null).index();
-    const next = this.file.nextReceiveIndex ?? 0;
-    const idx = Math.max(lastUnused, next);
-    await this.seedStore.setNextReceiveIndex(idx + 1);
-    await this.refreshFile();
-    return wollet.address(idx).address().toString();
+    // Serialize the read-modify-write of nextReceiveIndex under the same
+    // per-instance mutex as send() (§3.1 fresh-address guarantee): concurrent
+    // getReceiveAddress() calls must not both read the same counter value and
+    // derive the SAME address, which would regress the on-chain-reuse property
+    // the fresh-address decision exists to protect.
+    return this.opMutex.runExclusive(async () => {
+      const lastUnused = wollet.address(null).index();
+      const next = this.file.nextReceiveIndex ?? 0;
+      const idx = Math.max(lastUnused, next);
+      await this.seedStore.setNextReceiveIndex(idx + 1);
+      await this.refreshFile();
+      return wollet.address(idx).address().toString();
+    });
   }
 
   async getBalances(): Promise<WalletBalances> {
@@ -481,61 +498,70 @@ export class DepixWallet {
       });
     }
 
-    // Choke point (§4.3) — BEFORE anything is built or signed.
-    const brlCents = this.valuateBrlCents(asset.key, params.amountSats);
-    await this.guardrails.enforce({ kind: "send", brlCents });
+    // Serialize the whole enforce→sign→record→broadcast section per wallet
+    // instance (§4.3 TOCTOU fix). Without this, two concurrent send() calls —
+    // Promise.all([send(a), send(b)]) or parallel injected wallet_send tool
+    // calls — both read used=0, both pass the daily cap, both sign, defeating
+    // the R$500/day ceiling (the ONLY layer for pure Liquid sends, §4.6).
+    // Serializing also prevents both from selecting the same UTXOs. The lock is
+    // released on the throw paths too (Mutex keeps the queue alive on error).
+    return this.opMutex.runExclusive(async () => {
+      // Choke point (§4.3) — BEFORE anything is built or signed.
+      const brlCents = this.valuateBrlCents(asset.key, params.amountSats);
+      await this.guardrails.enforce({ kind: "send", brlCents });
 
-    const wollet = await this.ensureWollet();
-    const network = mainnetNetwork();
-    let builder = new TxBuilder(network);
-    try {
-      if (asset.key === "LBTC") {
-        builder = builder.addLbtcRecipient(address, params.amountSats);
-      } else {
-        builder = builder.addRecipient(address, params.amountSats, new AssetId(asset.id));
-      }
-    } catch (err) {
-      throw new WalletError("INVALID_ADDRESS", "Recipient rejected by the transaction builder", {
-        cause: err
-      });
-    }
-
-    let pset;
-    try {
-      pset = builder.finish(wollet);
-    } catch (err) {
-      throw await this.classifyFinishError(err, asset.key, params.amountSats);
-    }
-
-    // Materialize the signer for this operation only and zero it in finally
-    // (per-op auth — wallet.js:2601-2607 parity). JS strings are immutable,
-    // so the best available "zeroing" for the decrypted mnemonic is freeing
-    // the wasm-side objects and dropping every reference on scope exit.
-    let signed;
-    {
-      let mnemonic: InstanceType<typeof Mnemonic> | null = null;
-      let signer: InstanceType<typeof Signer> | null = null;
+      const wollet = await this.ensureWollet();
+      const network = mainnetNetwork();
+      let builder = new TxBuilder(network);
       try {
-        mnemonic = new Mnemonic(await this.decryptMnemonic());
-        signer = new Signer(mnemonic, network);
-        signed = signer.sign(pset);
-      } finally {
+        if (asset.key === "LBTC") {
+          builder = builder.addLbtcRecipient(address, params.amountSats);
+        } else {
+          builder = builder.addRecipient(address, params.amountSats, new AssetId(asset.id));
+        }
+      } catch (err) {
+        throw new WalletError("INVALID_ADDRESS", "Recipient rejected by the transaction builder", {
+          cause: err
+        });
+      }
+
+      let pset;
+      try {
+        pset = builder.finish(wollet);
+      } catch (err) {
+        throw await this.classifyFinishError(err, asset.key, params.amountSats);
+      }
+
+      // Materialize the signer for this operation only and zero it in finally
+      // (per-op auth — wallet.js:2601-2607 parity). JS strings are immutable,
+      // so the best available "zeroing" for the decrypted mnemonic is freeing
+      // the wasm-side objects and dropping every reference on scope exit.
+      let signed;
+      {
+        let mnemonic: InstanceType<typeof Mnemonic> | null = null;
+        let signer: InstanceType<typeof Signer> | null = null;
         try {
-          signer?.free();
-          mnemonic?.free();
-        } catch {
-          // best effort
+          mnemonic = new Mnemonic(await this.decryptMnemonic());
+          signer = new Signer(mnemonic, network);
+          signed = signer.sign(pset);
+        } finally {
+          try {
+            signer?.free();
+            mnemonic?.free();
+          } catch {
+            // best effort
+          }
         }
       }
-    }
 
-    // Accounted at SIGNING time, not settlement (§4.5) — a failed broadcast
-    // still counts against the window (the tx may propagate later).
-    await this.guardrails.recordSpend(brlCents, "send");
+      // Accounted at SIGNING time, not settlement (§4.5) — a failed broadcast
+      // still counts against the window (the tx may propagate later).
+      await this.guardrails.recordSpend(brlCents, "send");
 
-    const finalized = wollet.finalize(signed);
-    const txid = await this.syncEngine.broadcast(finalized);
-    return { txid };
+      const finalized = wollet.finalize(signed);
+      const txid = await this.syncEngine.broadcast(finalized);
+      return { txid };
+    });
   }
 
   /** Selective wipe (§2.4): view-only survives, restore detects mismatch. */
@@ -607,9 +633,11 @@ export class DepixWallet {
         `No wallet seed in ${this.dataDir} (wiped or view-only). Use DepixWallet.restore().`
       );
     }
-    const mnemonic = await this.seedStore.decryptMnemonic(this.requirePassphrase());
-    registerSecret(mnemonic);
-    return mnemonic;
+    // Do NOT registerSecret() the plaintext: that Set is module-level and never
+    // cleared, so it would pin the seed on the heap for the whole process —
+    // exactly what §2.3's per-op zeroing forbids. Callers use the return value
+    // within a tight scope and drop it; logs redact mnemonics by pattern.
+    return this.seedStore.decryptMnemonic(this.requirePassphrase());
   }
 
   private requirePassphrase(): string {
@@ -643,11 +671,21 @@ export class DepixWallet {
 
   private async ensureWollet(): Promise<Wollet> {
     if (this.wollet && this.wolletReady) return this.wollet;
-    if (!this.wollet) {
-      this.wollet = buildWollet(this.requireDescriptor());
+    // Dedup concurrent initialization (concurrent getReceiveAddress()/send()/
+    // getBalances() must not each build a Wollet and replay the chain in
+    // parallel) — join the single in-flight build, like the sync engine does.
+    if (!this.wolletPromise) {
+      this.wolletPromise = (async () => {
+        if (!this.wollet) {
+          this.wollet = buildWollet(this.requireDescriptor());
+        }
+        await this.syncEngine.loadPersisted(this.wollet);
+        this.wolletReady = true;
+        return this.wollet;
+      })().finally(() => {
+        this.wolletPromise = null;
+      });
     }
-    await this.syncEngine.loadPersisted(this.wollet);
-    this.wolletReady = true;
-    return this.wollet;
+    return this.wolletPromise;
   }
 }

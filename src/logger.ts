@@ -14,9 +14,11 @@ const LEVEL_WEIGHT: Record<LogLevel, number> = {
   error: 40
 };
 
-// Exact-match secret registry. Wallet code registers the passphrase and the
-// decrypted mnemonic here as soon as it sees them, so even an accidental
-// interpolation cannot reach stderr in the clear.
+// Exact-match secret registry. The wallet registers the PASSPHRASE here (it
+// already lives in process memory for the whole session by design — §2.3 — so
+// this adds no residency). The decrypted MNEMONIC is deliberately NOT registered
+// (that would pin the seed on the heap forever and defeat the per-op zeroing);
+// it is redacted by pattern instead (MNEMONIC_RE below).
 const registeredSecrets = new Set<string>();
 
 /** Register a secret value for exact-match redaction in every log line. */
@@ -36,8 +38,17 @@ const SK_KEY_RE = /sk_(live|test)_[A-Za-z0-9]+/g;
 // wallet transaction. Redact the whole descriptor expression.
 const CT_DESCRIPTOR_RE = /ct\(slip77\([^)]*\)[^\s"')]*\)?(#[a-z0-9]+)?/g;
 const XPRV_RE = /\b[xt]prv[0-9A-Za-z]{20,}/g;
+// BIP39-shaped mnemonic: 12+ consecutive lowercase words of 3–8 letters (the
+// English wordlist bounds), whitespace-separated — as Mnemonic.toString()
+// renders. Redacting by PATTERN means the plaintext seed never has to be kept
+// resident in a registry to be scrubbed from logs (the §2.3 per-op-zeroing fix).
+const MNEMONIC_RE = /\b[a-z]{3,8}(?:\s+[a-z]{3,8}){11,}\b/g;
 
-/** Redact API keys, registered secrets, CT descriptors and xprv material. */
+/**
+ * Redact API keys, registered secrets, CT descriptors, xprv material and
+ * BIP39-shaped mnemonics. Defense-in-depth: SDK code never logs a secret on
+ * purpose (no-console is enforced in src/, §6.1).
+ */
 export function redactSecrets(text: string): string {
   let out = text;
   for (const secret of registeredSecrets) {
@@ -46,6 +57,7 @@ export function redactSecrets(text: string): string {
   out = out.replace(SK_KEY_RE, "sk_$1_[REDACTED]");
   out = out.replace(CT_DESCRIPTOR_RE, "[REDACTED_DESCRIPTOR]");
   out = out.replace(XPRV_RE, "[REDACTED_XPRV]");
+  out = out.replace(MNEMONIC_RE, "[REDACTED_MNEMONIC]");
   return out;
 }
 

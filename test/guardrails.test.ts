@@ -139,3 +139,17 @@ describe("state file handling (PR1 skeleton of §4.5)", () => {
     });
   });
 });
+
+describe("concurrent recordSpend is atomic (TOCTOU compounding fix — §4.5)", () => {
+  it("records EVERY concurrent spend — the read-modify-write does not lose entries", async () => {
+    const guardrails = makeGuardrails();
+    // Fire 10 recordSpend() in parallel. A lock-free read→push→write would let
+    // them read the same base state and clobber each other (last-writer-wins),
+    // under-counting the window. The internal write-mutex serializes the RMW.
+    await Promise.all(Array.from({ length: 10 }, () => guardrails.recordSpend(1_000, "send")));
+    const usage = await guardrails.usage();
+    expect(usage.usedCents).toBe(10_000); // 10 × R$10 — nothing lost
+    const raw = JSON.parse(await readFile(join(dataDir, "guardrails-state.json"), "utf8"));
+    expect(raw.entries).toHaveLength(10);
+  });
+});

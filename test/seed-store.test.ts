@@ -79,6 +79,32 @@ describe("SeedStore roundtrip", () => {
   });
 });
 
+describe("corrupt wallet.json is distinct from missing (WALLET_CORRUPTED)", () => {
+  it("present-but-invalid JSON → WALLET_CORRUPTED (not WALLET_NOT_FOUND)", async () => {
+    await writeFile(join(dataDir, "wallet.json"), "{ not valid json", { mode: 0o600 });
+    const store = new SeedStore(dataDir);
+    await expect(store.read()).rejects.toSatisfy((err: unknown) =>
+      isDepixSdkError(err, "WALLET_CORRUPTED")
+    );
+    // Crucially NOT WALLET_NOT_FOUND — a caller must not react by creating over it.
+    await expect(store.read()).rejects.not.toSatisfy((err: unknown) =>
+      isDepixSdkError(err, "WALLET_NOT_FOUND")
+    );
+  });
+
+  it("unknown format/version → WALLET_CORRUPTED", async () => {
+    await writeFile(
+      join(dataDir, "wallet.json"),
+      JSON.stringify({ format: "something-else", version: 99 }),
+      { mode: 0o600 }
+    );
+    const store = new SeedStore(dataDir);
+    await expect(store.read()).rejects.toSatisfy((err: unknown) =>
+      isDepixSdkError(err, "WALLET_CORRUPTED")
+    );
+  });
+});
+
 describe("durability and permissions (spec §2.4)", () => {
   it("dataDir is 0700 and wallet.json is 0600", async () => {
     await seededStore();
@@ -108,6 +134,26 @@ describe("durability and permissions (spec §2.4)", () => {
     expect(file!.descriptor).toBe(DESCRIPTOR);
     await store.setBackupConfirmed(true);
     expect((await store.read())!.backupConfirmed).toBe(true);
+  });
+
+  it("concurrent writes to wallet.json never tear the file (unique temp per write)", async () => {
+    const store = await seededStore();
+    // With a FIXED `.tmp` name, two in-flight writers open/truncate the same
+    // temp and their renames interleave — leaving a half-written file that
+    // reads back as WALLET_CORRUPTED. Unique temps keep every read well-formed.
+    await Promise.all(
+      Array.from({ length: 12 }, (_, i) =>
+        i % 2 === 0 ? store.setNextReceiveIndex(i) : store.setBackupConfirmed(true)
+      )
+    );
+    // Must still parse (never throws WALLET_CORRUPTED) and the seed must decrypt.
+    const file = await store.read();
+    expect(file).not.toBeNull();
+    expect(file!.descriptor).toBe(DESCRIPTOR);
+    expect(await store.decryptMnemonic(PASSPHRASE)).toBe(MNEMONIC);
+    // No orphan temp files accumulate from the unique names.
+    const entries = await readdir(dataDir);
+    expect(entries.filter((e) => e.endsWith(".tmp"))).toEqual([]);
   });
 });
 
@@ -162,5 +208,20 @@ describe("dataDir exclusive lock (spec §2.4 — WALLET_DIR_LOCKED)", () => {
     await expect(acquireDirLock(dataDir)).rejects.toSatisfy((err: unknown) =>
       isDepixSdkError(err, "WALLET_DIR_LOCKED")
     );
+  });
+
+  it("a live PID recorded under a DIFFERENT boot is stale (PID reuse hardening)", async () => {
+    // Our own (alive) PID, but the lock records a boot id that is not this boot:
+    // the original holder must be dead and the PID recycled — take the lock over
+    // instead of staying permanently WALLET_DIR_LOCKED on a false liveness match.
+    await writeFile(
+      join(dataDir, ".lock"),
+      `${process.pid}\n${Date.now()}\nlinux:00000000-0000-0000-0000-000000000000\n`,
+      { mode: 0o600 }
+    );
+    const lock = await acquireDirLock(dataDir);
+    const content = await readFile(join(dataDir, ".lock"), "utf8");
+    expect(content.split("\n")[0]).toBe(String(process.pid));
+    await lock.release();
   });
 });

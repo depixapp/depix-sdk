@@ -65,10 +65,12 @@ export class SeedStore {
       parsed = JSON.parse(raw);
     } catch (err) {
       // The seed file is the one artifact we never silently discard: a
-      // corrupted wallet.json is surfaced loudly instead of being treated as
-      // "no wallet" (which could lead to accidental re-creation over it).
+      // corrupted wallet.json is surfaced loudly with its OWN code — not
+      // WALLET_NOT_FOUND, whose natural "not found → create one" reaction is
+      // exactly wrong here (the data is present, just unreadable, and creating
+      // over it would clobber a recoverable file).
       throw new WalletError(
-        "WALLET_NOT_FOUND",
+        "WALLET_CORRUPTED",
         `wallet.json at ${this.filePath} is corrupted (invalid JSON). ` +
           "Restore from the mnemonic backup into a fresh dataDir.",
         { cause: err }
@@ -77,8 +79,9 @@ export class SeedStore {
     const file = parsed as WalletFileV1;
     if (file.format !== "depix-sdk-wallet" || file.version !== 1) {
       throw new WalletError(
-        "WALLET_NOT_FOUND",
-        `wallet.json at ${this.filePath} has an unknown format/version`
+        "WALLET_CORRUPTED",
+        `wallet.json at ${this.filePath} has an unknown format/version — ` +
+          "the file is damaged or written by an incompatible version."
       );
     }
     return file;

@@ -12,7 +12,9 @@
 // read-only fallback. Stale detection: if the recorded PID is dead (ESRCH),
 // the lock is broken and taken over.
 
+import { readFileSync } from "node:fs";
 import { open, readFile, unlink } from "node:fs/promises";
+import { hostname, uptime } from "node:os";
 import { join } from "node:path";
 import { WalletError } from "../errors.js";
 import { FILE_MODE } from "./fs-util.js";
@@ -32,11 +34,46 @@ function pidIsAlive(pid: number): boolean {
   }
 }
 
+/**
+ * A per-boot identifier. On PID reuse, `process.kill(pid, 0)` alone cannot tell
+ * a still-live original holder from an unrelated process that inherited the PID
+ * after a reboot — pairing liveness with the boot id closes that hole (the
+ * recorded holder is from a different boot ⇒ definitely stale). Linux exposes a
+ * stable UUID; elsewhere we approximate from the boot time.
+ */
+function bootId(): string {
+  try {
+    return `linux:${readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim()}`;
+  } catch {
+    // No /proc (macOS): derive the boot epoch (seconds). uptime()/Date.now()
+    // jitter is sub-second, far below any real reboot gap (compared with a
+    // tolerance in sameBoot()), so this is a stable per-boot value.
+    return `time:${hostname()}:${Math.round(Date.now() / 1000 - uptime())}`;
+  }
+}
+
+/**
+ * Whether two boot ids denote the same boot. Exact match for Linux UUIDs; for
+ * the time-based fallback, within a 60s tolerance (absorbs derivation jitter
+ * while staying far under any reboot gap). Unparseable/mismatched ⇒ treated as
+ * DIFFERENT boot only when both are decisively parseable — otherwise we stay
+ * conservative and never break a live lock.
+ */
+function sameBoot(a: string, b: string): boolean {
+  if (a === b) return true;
+  const sa = a.startsWith("time:") ? Number.parseInt(a.slice(a.lastIndexOf(":") + 1), 10) : null;
+  const sb = b.startsWith("time:") ? Number.parseInt(b.slice(b.lastIndexOf(":") + 1), 10) : null;
+  if (sa !== null && sb !== null && Number.isFinite(sa) && Number.isFinite(sb)) {
+    return Math.abs(sa - sb) <= 60;
+  }
+  return false;
+}
+
 async function tryCreate(lockPath: string): Promise<boolean> {
   try {
     const fh = await open(lockPath, "wx", FILE_MODE);
     try {
-      await fh.writeFile(`${process.pid}\n${Date.now()}\n`);
+      await fh.writeFile(`${process.pid}\n${Date.now()}\n${bootId()}\n`);
       await fh.sync();
     } finally {
       await fh.close();
@@ -74,17 +111,30 @@ export async function acquireDirLock(dataDir: string): Promise<DirLock> {
       };
     }
 
-    // Lock exists. Stale (dead PID / unparseable) → break it and retry once.
+    // Lock exists. Stale (dead PID / unparseable / different boot) → break it
+    // and retry once.
     let ownerPid: number | null;
+    let ownerBootId: string | null = null;
     try {
       const content = await readFile(lockPath, "utf8");
-      const parsed = Number.parseInt(content, 10);
+      const lines = content.split("\n");
+      const parsed = Number.parseInt(lines[0] ?? "", 10);
       ownerPid = Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+      // Line 3 (boot id) is absent in pre-existing 2-line lock files — null then.
+      ownerBootId = lines[2]?.trim() ? lines[2].trim() : null;
     } catch {
       ownerPid = null; // unreadable → treat as stale
     }
 
-    if (ownerPid !== null && pidIsAlive(ownerPid)) {
+    // Held only when the PID is alive AND (the recorded boot matches OR no boot
+    // id was recorded — stay conservative for legacy lock files). A live PID
+    // recorded under a DIFFERENT boot is a reused PID from a prior boot: stale.
+    const heldByLiveProcess =
+      ownerPid !== null &&
+      pidIsAlive(ownerPid) &&
+      (ownerBootId === null || sameBoot(ownerBootId, bootId()));
+
+    if (heldByLiveProcess) {
       throw new WalletError(
         "WALLET_DIR_LOCKED",
         `Data dir is locked by another process (pid ${ownerPid}). ` +

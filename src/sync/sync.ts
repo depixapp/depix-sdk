@@ -84,6 +84,14 @@ function providerConcurrency(provider: EsploraProvider): number {
   return provider.name.startsWith("depix-proxy") ? 4 : 1;
 }
 
+/**
+ * Reject after `ms`, but note: this CANNOT cancel `promise` — a wasm fullScan
+ * keeps running in the background. Callers must not apply a late result. The
+ * worker path terminates the worker on timeout; the inline path (scanInline)
+ * relies on the timeout rejection short-circuiting before applyUpdate and pins
+ * a no-op handler on the underlying scan so a late settle is neither applied
+ * nor surfaced as an unhandledRejection.
+ */
 async function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
@@ -221,7 +229,13 @@ export class SyncEngine {
   ): Promise<SyncResult> {
     const client = this.buildClient(provider);
     try {
-      const update = await withTimeout(client.fullScan(wollet), timeoutMs, "fullScan");
+      // withTimeout cannot cancel the wasm scan. On timeout the await below
+      // rejects and we bail BEFORE applyUpdate, so a late-resolving scan is
+      // never applied to a Wollet the caller now believes idle; pin a no-op
+      // handler so its late settle is not an unhandledRejection either.
+      const scan = client.fullScan(wollet);
+      void scan.catch(() => {});
+      const update = await withTimeout(scan, timeoutMs, "fullScan");
       if (!update) {
         await this.updateStore.writeMeta({ lastScanAt: Date.now(), lastSuccessAt: Date.now() });
         return { updated: false };

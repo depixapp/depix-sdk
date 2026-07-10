@@ -122,6 +122,48 @@ describe("provider chain (spec §2.6)", () => {
   });
 });
 
+describe("inline scan timeout (spec §2.7 — withTimeout cannot cancel the wasm scan)", () => {
+  it("a late-resolving inline scan is NOT applied — the timeout wins and its result is ignored", async () => {
+    let lateResolved = 0;
+    const factory = (): EsploraClientLike => ({
+      // Resolves AFTER the sync timeout: withTimeout rejects first, so this
+      // late result must never be applied to the Wollet the caller left idle.
+      fullScan: () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            lateResolved++;
+            resolve(undefined);
+          }, 80);
+        }),
+      broadcast: async () => {
+        throw new Error("not used");
+      },
+      free: () => {}
+    });
+    const engine = new SyncEngine({
+      descriptor: descriptorFromMnemonic(KNOWN_MNEMONIC),
+      dataDir,
+      updateStore: new UpdateStore(dataDir),
+      providers: [
+        { name: "p0", url: "http://localhost:1", waterfalls: true },
+        { name: "p1", url: "http://localhost:1", waterfalls: false }
+      ],
+      worker: false,
+      clientFactory: factory,
+      // A fresh wollet is neverScanned() → cold timeout applies; pin both small.
+      syncTimeoutMs: 10,
+      coldStartTimeoutMs: 10
+    });
+    await expect(engine.sync(wollet)).rejects.toSatisfy((err: unknown) =>
+      isDepixSdkError(err, "ESPLORA_UNAVAILABLE")
+    );
+    // Let the abandoned scans settle late; nothing must have been applied.
+    await new Promise((r) => setTimeout(r, 130));
+    expect(lateResolved).toBeGreaterThanOrEqual(1); // the scan really did resolve late
+    expect(wollet.neverScanned()).toBe(true); // no late update reached the Wollet
+  });
+});
+
 describe("broadcast chain (spec §3.2.6 parity)", () => {
   it("rotates providers and fails with BROADCAST_FAILED only when all refuse", async () => {
     const attempts: string[] = [];

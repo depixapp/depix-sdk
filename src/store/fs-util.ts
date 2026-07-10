@@ -10,11 +10,23 @@
 //   - writeFileAtomic: tmp + rename only. For updates/*.bin (recoverable by
 //     re-scan; tolerant reads cover corruption — §2.5).
 
-import { open, mkdir, rename, stat, chmod } from "node:fs/promises";
+import { randomBytes } from "node:crypto";
+import { open, mkdir, rename, stat, chmod, unlink } from "node:fs/promises";
 import { dirname } from "node:path";
 
 export const DIR_MODE = 0o700;
 export const FILE_MODE = 0o600;
+
+// Monotonic per-process counter for temp-file names. Combined with pid + random
+// it makes every temp path unique so concurrent writers to the SAME target
+// (e.g. SeedStore.patch() read-modify-writes of wallet.json) never open/truncate
+// a shared `.tmp` and rename a half-written file into place (§2.4 corruption).
+let tmpSeq = 0;
+
+function uniqueTmpPath(filePath: string): string {
+  const suffix = `${process.pid}.${(tmpSeq++).toString(36)}.${randomBytes(6).toString("hex")}`;
+  return `${filePath}.${suffix}.tmp`;
+}
 
 /** Create (or tighten) a directory with 0700 permissions. */
 export async function ensureDir(dirPath: string): Promise<void> {
@@ -31,17 +43,26 @@ async function writeTmpAndRename(
   data: string | Uint8Array,
   { durable }: { durable: boolean }
 ): Promise<void> {
-  const tmpPath = `${filePath}.tmp`;
-  const fh = await open(tmpPath, "w", FILE_MODE);
+  // Unique temp name per write (+ O_EXCL via "wx") so two in-flight writers to
+  // the same target cannot clobber each other's temp file.
+  const tmpPath = uniqueTmpPath(filePath);
   try {
-    await fh.writeFile(data);
-    if (durable) {
-      await fh.sync();
+    const fh = await open(tmpPath, "wx", FILE_MODE);
+    try {
+      await fh.writeFile(data);
+      if (durable) {
+        await fh.sync();
+      }
+    } finally {
+      await fh.close();
     }
-  } finally {
-    await fh.close();
+    await rename(tmpPath, filePath);
+  } catch (err) {
+    // Never leave an orphan temp behind on a failed write (unique names would
+    // otherwise accumulate). Best effort — the temp may already be gone.
+    await unlink(tmpPath).catch(() => {});
+    throw err;
   }
-  await rename(tmpPath, filePath);
   if (durable) {
     // fsync the containing directory so the rename itself survives power loss.
     const dirHandle = await open(dirname(filePath), "r");
