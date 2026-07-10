@@ -227,6 +227,21 @@ export class WithdrawContractError extends DepixSdkError {
  *                              custodial nature is signalled in docs + custodial:true.)
  *   SIDESHIFT_AMOUNT_MISMATCH — the fixed shift's depositAmount does not match (or
  *                              exceeds) the quoted amount — fail-closed before signing.
+ *
+ * The intent-layer subset (PR-B, wallet.quote()/wallet.convert() — every one of
+ * these carries an actionable `details.nextStep`, G3):
+ *   MULTIPLE_ROUTES_AVAILABLE  — the intent trio does not resolve to exactly one
+ *                              single-hop routing-table row (two entry rails, an
+ *                              inbound intent with an unknown source network, or
+ *                              only multi-hop candidates). The SDK never chooses:
+ *                              `details.routes` lists every candidate; quote()
+ *                              compares them and convert({route}) executes one.
+ *   MULTI_HOP_NOT_YET_AUTOMATED — an explicitly chosen route needs >1 hop;
+ *                              automated multi-hop (plan + recovery) ships in a
+ *                              later release (PR-C). The nextStep teaches the
+ *                              working fallback: one convert() per leg.
+ *   ROUTE_NOT_FOUND            — a `route` id that is not among the intent's
+ *                              candidates (details.availableRouteIds lists them).
  */
 export class ConversionError extends DepixSdkError {
   constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {

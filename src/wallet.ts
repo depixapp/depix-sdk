@@ -75,6 +75,15 @@ import { UpdateStore } from "./store/update-store.js";
 import { SyncEngine, type EsploraClientLike, type EsploraProvider } from "./sync/sync.js";
 import { ConvertNamespace, type ConvertNamespaceOptions } from "./convert/namespace.js";
 import type { ConvertWalletHooks } from "./convert/hooks.js";
+import {
+  intentDepsFromNamespace,
+  makeConvertFacade,
+  quoteRoutes,
+  type ConvertFacade,
+  type ConvertIntent,
+  type IntentDeps,
+  type RouteQuote
+} from "./convert/intent.js";
 import type { GuardrailDestination } from "./guardrails/allowlist.js";
 import { BoltzConvert, type BoltzConvertDeps, type BoltzResumeSummary } from "./convert/boltz/convert.js";
 import { BoltzSwapStore } from "./convert/boltz/store.js";
@@ -432,8 +441,15 @@ export class DepixWallet {
   /** Resolved, immutable guardrail config (§4.2/G9) — read by getGuardrails(). */
   private readonly guardrailConfig: ResolvedGuardrailConfig;
   private readonly valuator: BrlValuator;
-  /** Conversions (§5): wallet.convert.sideswap.* (PR4); PR5 adds .boltz. */
-  readonly convert: ConvertNamespace;
+  /**
+   * Conversions (§5). CALLABLE — `wallet.convert({ from, to, network, amount })`
+   * executes a single-hop intent (routing table PR-B; wallet.quote() enumerates
+   * the candidates) — AND still carries the advanced provider namespaces:
+   * wallet.convert.sideswap.* / .boltz.* / .sideshift.*.
+   */
+  readonly convert: ConvertFacade;
+  /** Intent-layer deps (PR-B) — shared by wallet.quote() and the convert facade. */
+  private readonly intentDeps: IntentDeps;
   /** Gift cards (§5.5): wallet.giftcards.list()/buy()/listOrders(). */
   readonly giftcards: GiftcardsNamespace;
   /** Merchant light-profile (§5.6): wallet.merchant.get()/update(). */
@@ -582,11 +598,19 @@ export class DepixWallet {
       assertOpen: () => this.assertOpen(),
       now: () => Date.now()
     };
-    this.convert = new ConvertNamespace(
+    const convertNs = new ConvertNamespace(
       convertHooks,
       parts.convert,
       this.convertNamespace?.boltz ?? null
     );
+    // The intent layer (PR-B) reuses the sub-namespaces — it adds NO signing
+    // path of its own; every money-moving leg still crosses the §4.3 choke
+    // point inside the provider methods. wallet.convert stays the home of the
+    // advanced namespaces AND becomes callable with a high-level intent.
+    this.intentDeps = intentDepsFromNamespace(convertNs, parts.convert?.intent);
+    // Pass assertOpen so the callable facade fails fast on a closed wallet — parity
+    // with wallet.quote() (§ money methods all assertOpen() first).
+    this.convert = makeConvertFacade(convertNs, this.intentDeps, () => this.assertOpen());
     // Gift cards (§5.5): browse + buy via CryptoRefills, paid over Lightning by
     // REUSING the same BoltzConvert instance as wallet.convert.boltz (so the
     // guardrail choke point + refund/watch machinery is shared, not duplicated).
@@ -1002,6 +1026,18 @@ export class DepixWallet {
   }
 
   // ─── money ─────────────────────────────────────────────────────────────
+
+  /**
+   * Enumerate EVERY candidate conversion route for an intent trio — single-hop
+   * AND multi-hop — with per-leg estimates (PR-B). Read-only: moves no money,
+   * signs nothing; an unestimatable leg yields nulls plus a note, never a
+   * throw. No policy: the agent compares and passes its chosen route id to
+   * wallet.convert({ ..., route }).
+   */
+  async quote(params: ConvertIntent): Promise<RouteQuote[]> {
+    this.assertOpen();
+    return quoteRoutes(params, this.intentDeps);
+  }
 
   /**
    * Send an asset to a Liquid address, signed locally (§2.3).
