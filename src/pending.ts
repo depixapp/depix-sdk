@@ -27,7 +27,7 @@ import { ensureDir, writeFileDurable } from "./store/fs-util.js";
 
 export const PENDING_WITHDRAWALS_FILE = "pending-withdrawals.json";
 
-export type PendingWithdrawalState = "requested" | "signed" | "broadcast";
+export type PendingWithdrawalState = "requested" | "signed";
 
 export interface PendingWithdrawalRecord {
   idempotencyKey: string;
@@ -197,13 +197,6 @@ export class PendingWithdrawals {
       record.signedTxHex = fields.signedTxHex;
       record.txid = fields.txid;
       record.state = "signed";
-    });
-  }
-
-  /** Transition to "broadcast" after the broadcast succeeds. */
-  async markBroadcast(idempotencyKey: string): Promise<void> {
-    await this.patch(idempotencyKey, (record) => {
-      record.state = "broadcast";
     });
   }
 

@@ -26,8 +26,12 @@ import { defaultSleep, Throttle, type SleepFn } from "./throttle.js";
 
 export const DEFAULT_API_BASE = "https://api.depixapp.com";
 
-// Server per-key buckets (router.js:74-80). Matched exactly so the client
-// never overshoots into a 429 it could have avoided.
+// Server per-key, PER-ROUTE buckets (router.js:74-75 creation, :79-80 reads).
+// The per-user limit is keyed by `scope + ":u"` (router.js perUser step), so
+// deposit and withdraw NEVER share a budget on the server — each route gets its
+// own perUser:2/min. The client mirrors this with separate `deposit:`/`withdraw:`
+// buckets (see createDeposit/createWithdraw) rather than one shared bucket, so
+// it never overshoots into a 429 it could have avoided.
 const CREATE_LIMIT_PER_MIN = 2;
 const READ_LIMIT_PER_MIN = 30;
 

@@ -214,7 +214,7 @@ export interface WithdrawResult {
 export interface ResumeSummary {
   /** rebroadcast + reposted. */
   resumed: number;
-  /** "signed"/"broadcast" records re-broadcast with the SAME bytes. */
+  /** "signed" records re-broadcast with the SAME bytes. */
   rebroadcast: number;
   /** "requested" records re-POSTed with the same Idempotency-Key + re-validated. */
   reposted: number;
@@ -889,9 +889,16 @@ export class DepixWallet {
     try {
       wire = await api.createWithdraw(request, { idempotencyKey });
     } catch (err) {
-      // The POST failed (or was rejected) — this is not a crash; drop the
-      // still-unsigned record so resume does not re-POST it forever.
-      await this.discardIfUnsigned(idempotencyKey);
+      // Only a DEFINITIVE rejection (4xx other than 409) means the server did
+      // NOT create the withdrawal — drop the still-unsigned record. A TRANSIENT
+      // failure (network / 5xx / 409 in-flight) may have created it server-side
+      // with the response lost, so KEEP the "requested" record: a later open()
+      // re-POSTs the SAME Idempotency-Key (authenticated replay, §3.2.9) instead
+      // of orphaning the provider-side withdrawal. Nothing is signed here, so
+      // keeping the record can never double-pay.
+      if (this.isPermanentApiRejection(err)) {
+        await this.discardIfUnsigned(idempotencyKey);
+      }
       throw err;
     }
     return this.processWithdrawResponse(wire, idempotencyKey);
@@ -911,9 +918,9 @@ export class DepixWallet {
 
   /**
    * Recover crashed withdrawals (§3.2.9). Auto-run by open() (opt-out). NEVER
-   * throws — per-record failures are logged. "signed"/"broadcast" records are
-   * re-broadcast with the SAME bytes (never re-signed — the anti-double-pay
-   * invariant); "requested" records re-POST with the same Idempotency-Key
+   * throws — per-record failures are logged. "signed" records are re-broadcast
+   * with the SAME bytes (never re-signed — the anti-double-pay invariant);
+   * "requested" records re-POST with the same Idempotency-Key
    * (authenticated replay) and re-run the full validation cadence. A record
    * failing GCM authentication is discarded and never signed from.
    */
@@ -948,7 +955,7 @@ export class DepixWallet {
 
     for (const record of readResult.records) {
       try {
-        if (record.state === "signed" || record.state === "broadcast") {
+        if (record.state === "signed") {
           if (!record.signedTxHex) {
             summary.failed++;
             continue;
@@ -978,12 +985,7 @@ export class DepixWallet {
         });
         // A permanent 4xx (not_found/expired/validation — not 409) means the
         // provider will never complete this withdrawal → drop the record.
-        if (
-          err instanceof DepixApiError &&
-          err.status >= 400 &&
-          err.status < 500 &&
-          err.status !== 409
-        ) {
+        if (this.isPermanentApiRejection(err)) {
           await this.pending.remove(record.idempotencyKey).catch(() => {});
         }
       }
@@ -1065,6 +1067,24 @@ export class DepixWallet {
       await this.discardIfUnsigned(idempotencyKey);
       throw err;
     }
+  }
+
+  /**
+   * A withdraw POST failure is DEFINITIVE only when it is a 4xx other than 409:
+   * the server rejected the request and created nothing, so the still-unsigned
+   * record can be dropped. Network errors (DepixApiError status 0), any 5xx and
+   * a 409 (idempotency in-flight) are TRANSIENT — the withdrawal may exist
+   * server-side with the response lost, so the record is KEPT for an idempotent
+   * resume re-POST (§3.2.9). Single source of truth for both withdraw() and
+   * resumePendingWithdrawals().
+   */
+  private isPermanentApiRejection(err: unknown): boolean {
+    return (
+      err instanceof DepixApiError &&
+      err.status >= 400 &&
+      err.status < 500 &&
+      err.status !== 409
+    );
   }
 
   /** Remove a pending record only while it is still "requested" (unsigned). */

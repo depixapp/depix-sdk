@@ -393,9 +393,13 @@ export class SyncEngine {
         if (!client.broadcastTx) {
           throw new WalletError("BROADCAST_FAILED", "Esplora client has no broadcastTx");
         }
-        const returned = await client.broadcastTx(Transaction.fromString(txHex));
+        await client.broadcastTx(Transaction.fromString(txHex));
         this.lastGoodProviderIndex = idx;
-        return typeof returned === "string" ? returned : String(returned);
+        // The provider's returned Txid is telemetry-only (§3.2.7); return the
+        // locally-derived txid (same value, already a string) so the result
+        // never depends on the wasm Txid.toString() shape — identical to the
+        // already-known branch below.
+        return localTxid;
       } catch (err) {
         const message = String((err as Error)?.message ?? err);
         if (ALREADY_KNOWN_RE.test(message)) {

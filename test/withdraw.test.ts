@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ASSETS } from "../src/assets.js";
 import { Address } from "../src/engine/lwk.js";
 import { DepixWallet } from "../src/wallet.js";
+import { PendingWithdrawals } from "../src/pending.js";
 import { isDepixSdkError } from "../src/errors.js";
 import {
   assertFeeAddressExplicit,
@@ -30,6 +31,11 @@ const EX1 = new Address(EULEN_LQ1).toUnconfidential().toString();
 const FEE_EX1 = "ex1qfu0zk2g5tgrzfr33qqlgsykec6dwj6g9234jr7";
 const SATS_PER_CENT = 10n ** 6n;
 const DEPIX_ID = ASSETS.DEPIX.id;
+// A real, small Liquid mainnet tx hex (public) — parseable by Transaction.fromString,
+// used ONLY as opaque signed bytes (same fixture as the resume suite).
+const FIXTURE_TXID = "21cb9e1fd71f5d9e9d9f5843f14f912ffd2f023b089fd0b78f2718fcdde52f33";
+const FIXTURE_HEX =
+  "0200000001010000000000000000000000000000000000000000000000000000000000000000ffffffff060365843c0101ffffffff03016d521c38ec1ea15734ae22b7c46064412829c0d0579f0a713d1c04ede979026f01000000000000000000266a240a8ce26f7f113667dccb98522fb9c292911d81ec200d31adc94501000000000000000000016d521c38ec1ea15734ae22b7c46064412829c0d0579f0a713d1c04ede979026f01000000000000010d001976a914fc26751a5025129a2fd006c6fbfa598ddd67f7e188ac016d521c38ec1ea15734ae22b7c46064412829c0d0579f0a713d1c04ede979026f01000000000000000000266a24aa21a9ed8fbc0adfe56fb749b2640b7b9131e42c6043588725c997c70c3658eea333f1510000000000000120000000000000000000000000000000000000000000000000000000000000000000000000000000";
 
 // ─── pure helpers ───────────────────────────────────────────────────────────
 
@@ -210,6 +216,10 @@ async function pendingCount(): Promise<number> {
   }
 }
 
+async function saltOf(dir: string): Promise<string> {
+  return JSON.parse(await readFile(join(dir, "wallet.json"), "utf8")).salt as string;
+}
+
 const BASE_PARAMS = { pixKey: "user@example.com", recipientTaxNumber: "12345678909", mode: "send" as const };
 
 beforeEach(async () => {
@@ -337,5 +347,112 @@ describe("withdraw() flow", () => {
     expect(res.netCents).toBe(500);
     expect(res.grossCents).toBe(500);
     expect(await pendingCount()).toBe(0);
+  });
+
+  it("LIVE path persists 'signed' to disk BEFORE it broadcasts, then removes it (anti-double-pay ordering §3.2.9)", async () => {
+    // The one safety-critical ordering the resume suite cannot cover: in the LIVE
+    // withdraw path the signed bytes must be persisted (markSigned → state
+    // "signed") BEFORE processWithdrawResponse calls broadcastRawTx. Reaching the
+    // real LWK build+sign needs on-chain funds, so we seam buildSignPersistWithdraw
+    // to run the SAME persist the production code does (store.markSigned) and hand
+    // back a known signed hex; the broadcast seam then reads pending-withdrawals.json
+    // and asserts the record is already "signed" with those exact bytes at the
+    // moment of broadcast.
+    // Holder so the broadcast seam (captured by restore() below) can read the
+    // store that is only constructible AFTER restore() writes wallet.json's salt.
+    const seam: { store?: PendingWithdrawals } = {};
+    const broadcasts: string[] = [];
+    let atBroadcast: Array<{ state: string; signedTxHex?: string }> | null = null;
+    const { fetch } = mockFetch([
+      {
+        json: {
+          response: {
+            withdrawalId: "w-live",
+            depositAddress: EULEN_LQ1,
+            depositAmountInCents: 5000, // R$50 — within both caps, single-output (no split)
+            payoutAmountInCents: 4900
+          }
+        }
+      }
+    ]);
+    wallet = await DepixWallet.restore({
+      dataDir,
+      passphrase: PASSPHRASE,
+      mnemonic: KNOWN_MNEMONIC,
+      apiKey: "sk_live_flowtest",
+      fetch,
+      sync: {
+        worker: false,
+        clientFactory: () => ({
+          fullScan: async () => undefined,
+          broadcast: async () => {
+            throw new Error("live withdraw must broadcast via broadcastTx, not the PSET path");
+          },
+          broadcastTx: async (tx) => {
+            broadcasts.push(tx.toString());
+            // Snapshot the on-disk record AT the moment of broadcast.
+            const { records } = await seam.store!.readAll();
+            atBroadcast = records.map((r) => ({ state: r.state, signedTxHex: r.signedTxHex }));
+            return FIXTURE_TXID;
+          },
+          free: () => {}
+        })
+      }
+    });
+    seam.store = new PendingWithdrawals({
+      dataDir,
+      passphrase: PASSPHRASE,
+      saltB64: await saltOf(dataDir)
+    });
+    // Seam the funds-dependent build+sign: persist "signed" exactly as the real
+    // buildSignPersistWithdraw does (store.markSigned), then return the bytes.
+    (
+      wallet as unknown as {
+        buildSignPersistWithdraw: (norm: unknown, idempotencyKey: string) => Promise<string>;
+      }
+    ).buildSignPersistWithdraw = async (_norm, idempotencyKey) => {
+      await seam.store!.markSigned(idempotencyKey, {
+        withdrawalId: "w-live",
+        signedTxHex: FIXTURE_HEX,
+        txid: FIXTURE_TXID
+      });
+      return FIXTURE_HEX;
+    };
+
+    const res = await wallet.withdraw({ ...BASE_PARAMS, amountCents: 5000 });
+
+    // The persisted bytes were broadcast...
+    expect(broadcasts).toEqual([FIXTURE_HEX]);
+    // ...and at that instant the on-disk record was ALREADY "signed" with them
+    // (persist-before-broadcast proven on the live path, not only on resume).
+    expect(atBroadcast).toEqual([{ state: "signed", signedTxHex: FIXTURE_HEX }]);
+    // ...then the record is removed after the broadcast returns (persist→broadcast→remove).
+    expect(await pendingCount()).toBe(0);
+    expect(res.txid).toBe(FIXTURE_TXID);
+  });
+
+  it("keeps the 'requested' record when the POST fails transiently (409) — for an idempotent resume re-POST (§3.2.9)", async () => {
+    // A non-in-flight 409 is NOT retried by the client and is classified
+    // TRANSIENT: the withdrawal may exist server-side, so the record is KEPT so a
+    // later open() can replay the SAME Idempotency-Key. Nothing is signed → safe.
+    wallet = await makeWallet({
+      status: 409,
+      json: { error: { code: "withdrawal_conflict", message: "conflict" } }
+    });
+    await expect(wallet.withdraw({ ...BASE_PARAMS, amountCents: 500 })).rejects.toSatisfy(
+      (err: unknown) => isDepixSdkError(err, "withdrawal_conflict")
+    );
+    expect(await pendingCount()).toBe(1); // KEPT for resume replay
+  });
+
+  it("discards the 'requested' record on a DEFINITIVE 4xx POST rejection (nothing was created)", async () => {
+    wallet = await makeWallet({
+      status: 400,
+      json: { error: { code: "validation_error", message: "bad pixKey", details: { field: "pixKey" } } }
+    });
+    await expect(wallet.withdraw({ ...BASE_PARAMS, amountCents: 500 })).rejects.toSatisfy(
+      (err: unknown) => isDepixSdkError(err, "validation_error")
+    );
+    expect(await pendingCount()).toBe(0); // definitively rejected → dropped
   });
 });
