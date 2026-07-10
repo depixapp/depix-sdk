@@ -455,19 +455,7 @@ export class SideShiftNamespace {
       throw new WalletError("INVALID_AMOUNT", "amountSats must be a positive bigint (USDt base units)");
     }
     const affiliateId = this.requireAffiliateId();
-    const raw = await requestQuote(
-      {
-        depositNetwork: "liquid",
-        settleNetwork: params.network,
-        depositAmount: usdtSatsToDecimal(params.amountSats),
-        affiliateId
-      },
-      this.fetchImpl
-    );
-    const quoteId = str(raw.id);
-    if (!quoteId) {
-      throw new SideShiftApiError("SideShift quote response is missing the quote id.", { status: 200, body: raw });
-    }
+    const { raw, quoteId } = await this.requestQuoteWithId(params.network, params.amountSats, affiliateId);
     return {
       quoteId,
       depositNetwork: "liquid",
@@ -599,8 +587,18 @@ export class SideShiftNamespace {
     });
   }
 
-  /** A fresh quote id for the fixed shift (a fixed shift consumes a quote). */
-  private async freshQuoteId(network: string, amountSats: bigint, affiliateId: string): Promise<string> {
+  /**
+   * Request a fresh SideShift quote and extract its id, failing CLOSED if the id is
+   * missing. Single source of truth for the quote request shape + id-extraction +
+   * missing-id throw: quote() reuses `raw` to build its preview, send()/freshQuoteId
+   * consume only the `quoteId` (a fixed shift burns one quote), so the two can never
+   * drift.
+   */
+  private async requestQuoteWithId(
+    network: string,
+    amountSats: bigint,
+    affiliateId: string
+  ): Promise<{ raw: Record<string, unknown>; quoteId: string }> {
     const raw = await requestQuote(
       { depositNetwork: "liquid", settleNetwork: network, depositAmount: usdtSatsToDecimal(amountSats), affiliateId },
       this.fetchImpl
@@ -609,6 +607,12 @@ export class SideShiftNamespace {
     if (!quoteId) {
       throw new SideShiftApiError("SideShift quote response is missing the quote id.", { status: 200, body: raw });
     }
+    return { raw, quoteId };
+  }
+
+  /** A fresh quote id for the fixed shift (a fixed shift consumes a quote). */
+  private async freshQuoteId(network: string, amountSats: bigint, affiliateId: string): Promise<string> {
+    const { quoteId } = await this.requestQuoteWithId(network, amountSats, affiliateId);
     return quoteId;
   }
 
@@ -624,6 +628,11 @@ export class SideShiftNamespace {
     this.assertShiftable(params.network);
     const affiliateId = this.requireAffiliateId();
     const settleAddress = await this.hooks.getReceiveAddress(); // backup-gated (§2.9)
+    // A receive (variable) shift signs nothing and moves no wallet funds: settleAddress is OUR
+    // backup-gated receive address, and refundAddress refunds the EXTERNAL depositor's inbound
+    // coin (on the source network), not ours. So — unlike send() — it is deliberately NOT
+    // allowlist-gated. Keep this asymmetry intentional. receive() is also not an MCP tool, so
+    // this refundAddress is not agent/injection-reachable.
     const refundAddress = params.refundAddress ? params.refundAddress.trim() : undefined;
     const raw = await createVariableShift(
       { depositNetwork: params.network, settleAddress, ...(refundAddress ? { refundAddress } : {}), affiliateId },
