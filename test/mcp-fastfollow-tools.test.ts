@@ -155,6 +155,33 @@ describe("wallet_receive_lightning (Boltz reverse — inflow)", () => {
       amount_sats: "50000",
     });
   });
+
+  it("rejects amount_sats above 2^53-1 instead of silently rounding it (Number cast guard)", async () => {
+    const wallet = new FakeWallet();
+    const { client } = await connectWallet({ wallet });
+    // 2^53 + 1 = the first positive integer a JS Number cannot represent exactly;
+    // Number("9007199254740993") === 9007199254740992 (rounded down). The schema's
+    // /^\d+$/ has no upper bound, so without the guard this would reach the wallet
+    // lossily. Expect a typed rejection at the boundary, before any wallet call.
+    const res = await client.callTool({
+      name: "wallet_receive_lightning",
+      arguments: { amount_sats: "9007199254740993" },
+    });
+    expect(errorPayload(res as never).error.code).toBe("amount_sats_too_large");
+    expect(wallet.convert.boltzCalls).toHaveLength(0);
+  });
+
+  it("accepts exactly 2^53-1 (Number.MAX_SAFE_INTEGER) at the ceiling", async () => {
+    const wallet = new FakeWallet();
+    const { client } = await connectWallet({ wallet });
+    await client.callTool({
+      name: "wallet_receive_lightning",
+      arguments: { amount_sats: String(Number.MAX_SAFE_INTEGER) },
+    });
+    expect(wallet.convert.boltzCalls).toEqual([
+      { method: "receiveLightning", args: { amountSats: Number.MAX_SAFE_INTEGER } },
+    ]);
+  });
 });
 
 describe("wallet_to_stablecoin (Boltz chain swap)", () => {
@@ -192,6 +219,22 @@ describe("wallet_to_stablecoin (Boltz chain swap)", () => {
     });
     expect(isError(res)).toBe(true);
     expect(wallet.convert.boltzCalls).toHaveLength(0); // schema rejected it
+  });
+
+  it("rejects amount_sats above 2^53-1 instead of silently rounding it (Number cast guard)", async () => {
+    const wallet = new FakeWallet();
+    const { client } = await connectWallet({ wallet });
+    const res = await client.callTool({
+      name: "wallet_to_stablecoin",
+      arguments: {
+        asset: "USDC",
+        network_id: "polygon",
+        amount_sats: "9007199254740993", // 2^53 + 1 — not exactly Number-representable
+        claim_address: "0xrecipient",
+      },
+    });
+    expect(errorPayload(res as never).error.code).toBe("amount_sats_too_large");
+    expect(wallet.convert.boltzCalls).toHaveLength(0); // guarded before the wallet call
   });
 });
 

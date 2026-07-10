@@ -308,6 +308,17 @@ export async function swapQuoteTool(
 }
 
 export async function swapExecuteTool(registry: SwapStreamRegistry, args: { swap_quote_id: string }) {
+  // take() removes the entry (and clears its abandon timer) BEFORE we await
+  // execute(), so a concurrent server.close() → disposeAll() can never double-close
+  // a socket that is mid-broadcast. The deliberate consequence: a stream that is
+  // in execute() is no longer registry-tracked, so disposeAll() cannot reach it —
+  // only the `finally { entry.stream.close() }` below does. The "clean shutdown
+  // leaves no live socket" guarantee therefore holds strictly for QUOTED-but-not-
+  // executed streams; an execute() that hangs is an in-flight money broadcast (the
+  // guardrail has already signed in the wallet layer) and is reclaimed by the stdio
+  // bin's process.exit(0) — or, if close() itself wedged, the runtime hard-exit
+  // watchdog. That is acceptable and unavoidable for an in-flight broadcast; there
+  // is no true socket leak in the packaged bin.
   const entry = registry.take(args.swap_quote_id);
   if (!entry) {
     throw new ToolError(
@@ -343,8 +354,30 @@ export async function payLightningInvoiceTool(wallet: McpWalletFacade, args: { i
   };
 }
 
+/**
+ * Down-cast a validated (`/^\d+$/`, unbounded) `amount_sats` string to the JS
+ * `number` the two Boltz inflows (`receiveLightning` / `toStablecoin`) take —
+ * their wallet API signature is `amountSats: number`, unlike the swap tools which
+ * carry `amount_sats` as bigint end-to-end via `BigInt()`. `Number()` would
+ * SILENTLY round a value above 2^53-1, so we guard the trust boundary here: reject
+ * with a typed error rather than let a lossily-rounded amount reach the wallet.
+ * (Comparison is done in BigInt to avoid the very lossiness we are guarding.)
+ */
+function amountSatsToNumber(amountSats: string): number {
+  // amountSatsField is /^\d+$/, so BigInt() never throws and the value is >= 0.
+  if (BigInt(amountSats) > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new ToolError(
+      `amount_sats ${amountSats} exceeds the maximum safely-representable integer ` +
+        `(${Number.MAX_SAFE_INTEGER}). This flow hands amountSats to the wallet as a JS number, ` +
+        "and a larger value would silently lose precision — request an amount at or below that ceiling.",
+      "amount_sats_too_large",
+    );
+  }
+  return Number(amountSats);
+}
+
 export async function receiveLightningTool(wallet: McpWalletFacade, args: { amount_sats: string }) {
-  const r = await wallet.convert.boltz.receiveLightning({ amountSats: Number(args.amount_sats) });
+  const r = await wallet.convert.boltz.receiveLightning({ amountSats: amountSatsToNumber(args.amount_sats) });
   return {
     swap_id: r.swapId,
     invoice: r.invoice,
@@ -360,7 +393,7 @@ export async function toStablecoinTool(
   const r = await wallet.convert.boltz.toStablecoin({
     asset: args.asset,
     networkId: args.network_id,
-    amountSats: Number(args.amount_sats),
+    amountSats: amountSatsToNumber(args.amount_sats),
     claimAddress: args.claim_address,
   });
   return {

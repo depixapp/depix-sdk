@@ -42,8 +42,15 @@ describe("shutdown with a socket-bound swap stream in flight", () => {
     const { client, server } = await connectWallet({ wallet });
     await openSwapQuote(client);
 
-    // Model a Boltz Lightning watch in flight: the stdio bin cancels it via
-    // wallet.close() (BoltzConvert.dispose) right after server.close().
+    // The Boltz half is a MODELED boolean seam, not a real pending watch: it
+    // asserts the shutdown WIRING/ORDERING only — that the stdio bin runs
+    // wallet.close() (→ BoltzConvert.dispose) right AFTER server.close(), in one
+    // sequence that exits 0 without hanging. The real proof that dispose() actually
+    // tears down an in-flight Boltz watch (status socket + reconnect timer) lives at
+    // the unit level in boltz-convert.test.ts ("close() cancels in-flight Boltz
+    // watches"). We keep it modeled here because the McpWalletFacade the server
+    // drives has no close()/live BoltzConvert to arm — reproducing a genuine watch
+    // would duplicate that unit test rather than exercise new server-side behavior.
     let boltzWatchCancelled = false;
 
     const exited = new Promise<number>((resolve) => {

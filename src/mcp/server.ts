@@ -175,6 +175,16 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
   // disposeAll() FIRST, so a shutdown with a quote in flight leaves no live socket
   // (the deferral-critical guarantee, §6.1). disposeAll() is synchronous, so it
   // never makes shutdown hang; the runtime hard-exit watchdog is the backstop.
+  //
+  // Why wrap close() rather than a cleaner hook: McpServer exposes no shutdown
+  // callback for registry teardown, and the transport `onclose` (which the stdio
+  // bin already consumes to TRIGGER shutdown) fires only on a host disconnect — a
+  // programmatic server.close() (the bin's own shutdown path) would bypass it and
+  // leak the sockets. Wrapping close() is the single choke point that covers BOTH
+  // entry points. It is safe: disposeAll() is synchronous + idempotent + per-stream
+  // try/caught, so it cannot throw, cannot hang the close, and double-close is a
+  // no-op — if the SDK ever reaches shutdown through a path other than close(),
+  // teardown regresses to the runtime hard-exit watchdog backstop, never a hang.
   const swapStreams = new SwapStreamRegistry();
   const baseClose = server.close.bind(server);
   server.close = async (): Promise<void> => {
