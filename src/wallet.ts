@@ -15,8 +15,9 @@
 
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { base64 } from "@scure/base";
 import type { Wollet } from "lwk_node";
-import { ASSETS, DEPIX_SATS_PER_BRL_CENT, MAINNET_ASSET_ID_TO_KEY, type AssetKey } from "./assets.js";
+import { ASSETS, MAINNET_ASSET_ID_TO_KEY, type AssetKey } from "./assets.js";
 import { runBackupRitual, type RitualIo } from "./backup-ritual.js";
 import {
   Address,
@@ -30,11 +31,19 @@ import {
   mainnetNetwork,
   validateMnemonic
 } from "./engine/lwk.js";
-import { GuardrailError, WalletError } from "./errors.js";
-import { Guardrails } from "./guardrails/guardrails.js";
+import { WalletError } from "./errors.js";
+import {
+  Guardrails,
+  resolveGuardrailConfig,
+  type GuardrailConfig,
+  type GuardrailMarkerStore,
+  type ResolvedGuardrailConfig
+} from "./guardrails/guardrails.js";
+import { QuotesClient, resolveApiBase, type QuotesSource } from "./guardrails/quotes.js";
+import { BrlValuator } from "./guardrails/valuation.js";
 import { createLogger, registerSecret, type Logger } from "./logger.js";
 import { Mutex } from "./mutex.js";
-import { assertStrongPassphrase } from "./store/crypto.js";
+import { assertStrongPassphrase, deriveKey } from "./store/crypto.js";
 import { acquireDirLock, type DirLock } from "./store/dir-lock.js";
 import { ensureDir } from "./store/fs-util.js";
 import { SeedStore, type WalletFileV1 } from "./store/seed-store.js";
@@ -54,9 +63,19 @@ export interface OpenOptions {
   /** Default: $DEPIX_WALLET_PASSPHRASE (required when a seed exists) */
   passphrase?: string;
   sync?: WalletSyncOptions;
+  /**
+   * Guardrail config (§4.2). Option > env (DEPIX_GUARDRAIL_*) > default
+   * (R$100/tx + R$500/day). IMMUTABLE at runtime (G9): set only here (or via
+   * env) + restart — there is no update method an injected LLM could reach.
+   */
+  guardrails?: GuardrailConfig;
+  /**
+   * Advanced/testing: inject the /api/quotes source used for L-BTC/USDt BRL
+   * valuation (§4.4). Default: a QuotesClient against apiBase (env DEPIX_API_BASE
+   * ?? https://api.depixapp.com), fresh 30s / stale 5min.
+   */
+  quotes?: QuotesSource;
   // TODO(PR2): apiKey/apiBase (api/client.ts — Bearer sk_, Idempotency-Key).
-  // TODO(PR3): guardrails?: GuardrailConfig (§4.2 — option > env > default;
-  // PR1 runs the hardcoded R$100/tx + R$500/day defaults, not configurable).
 }
 
 export interface CreateOptions extends OpenOptions {
@@ -98,7 +117,7 @@ export interface MnemonicBackup {
 
 export interface WalletBalances {
   balances: Record<AssetKey, bigint>;
-  /** BRL estimate arrives with /api/quotes valuation in PR3 (§4.4). */
+  /** Total BRL estimate in integer cents (§4.4); null if any needed quote is unavailable. */
   brlEstimate: number | null;
 }
 
@@ -153,6 +172,10 @@ interface WalletParts {
   file: WalletFileV1;
   lock: DirLock;
   sync?: WalletSyncOptions;
+  /** Resolved guardrail config (§4.2) — immutable, plumbed from open()/env. */
+  guardrailConfig: ResolvedGuardrailConfig;
+  /** Injected quotes source, or undefined for the default QuotesClient (§4.4). */
+  quotes?: QuotesSource;
 }
 
 export class DepixWallet {
@@ -161,6 +184,7 @@ export class DepixWallet {
   private readonly updateStore: UpdateStore;
   private readonly syncEngine: SyncEngine;
   private readonly guardrails: Guardrails;
+  private readonly valuator: BrlValuator;
   private readonly logger: Logger;
   private readonly passphrase: string | undefined;
   private file: WalletFileV1;
@@ -168,6 +192,10 @@ export class DepixWallet {
   private wollet: Wollet | null = null;
   private wolletReady = false;
   private wolletPromise: Promise<Wollet> | null = null;
+  // Memoized AES key for the guardrails-state authentication (§4.5): the SAME
+  // key as the seed store (Argon2id over passphrase+salt). Derived at most once
+  // per process — Argon2id is deliberately expensive, so never per enforce().
+  private guardrailKeyPromise: Promise<CryptoKey> | null = null;
   // Serializes the guardrail choke point (enforce→sign→record) and the
   // nextReceiveIndex read-modify-write against concurrent in-process calls
   // (§4.3 TOCTOU fix; the dataDir lock only guards across processes).
@@ -181,7 +209,20 @@ export class DepixWallet {
     this.passphrase = parts.passphrase;
     this.logger = createLogger();
     this.updateStore = new UpdateStore(parts.dataDir);
-    this.guardrails = new Guardrails({ dataDir: parts.dataDir, logger: this.logger });
+    this.valuator = new BrlValuator(parts.quotes ?? new QuotesClient({ apiBase: resolveApiBase() }));
+    // Marker backed by wallet.json (§4.5) — deleting it to erase the marker
+    // destroys seed access itself, so it is self-defeating to attack.
+    const marker: GuardrailMarkerStore = {
+      isInitialized: () => this.seedStore.isGuardrailsStateInitialized(),
+      markInitialized: () => this.seedStore.setGuardrailsStateInitialized()
+    };
+    this.guardrails = new Guardrails({
+      dataDir: parts.dataDir,
+      config: parts.guardrailConfig,
+      stateKey: () => this.guardrailStateKey(),
+      marker,
+      logger: this.logger
+    });
     this.syncEngine = new SyncEngine({
       descriptor: this.requireDescriptor(),
       dataDir: parts.dataDir,
@@ -201,6 +242,9 @@ export class DepixWallet {
   static async open(options: OpenOptions = {}): Promise<DepixWallet> {
     const dataDir = resolveDataDir(options.dataDir);
     const passphrase = resolvePassphrase(options.passphrase);
+    // Resolve the (immutable) guardrail config up front so a bad option/env
+    // fails fast with GUARDRAIL_CONFIG_INVALID before any lock is taken (§4.2).
+    const guardrailConfig = resolveGuardrailConfig(options.guardrails);
     const seedStore = new SeedStore(dataDir);
     const file = await seedStore.read();
     if (!file) {
@@ -224,7 +268,16 @@ export class DepixWallet {
         // pattern-based (logger.ts), never by keeping the live seed resident.
         await seedStore.decryptMnemonic(passphrase as string);
       }
-      return new DepixWallet({ dataDir, passphrase, seedStore, file, lock, sync: options.sync });
+      return new DepixWallet({
+        dataDir,
+        passphrase,
+        seedStore,
+        file,
+        lock,
+        sync: options.sync,
+        guardrailConfig,
+        quotes: options.quotes
+      });
     } catch (err) {
       await lock.release();
       throw err;
@@ -241,6 +294,7 @@ export class DepixWallet {
   static async create(options: CreateOptions = {}): Promise<CreateResult> {
     const dataDir = resolveDataDir(options.dataDir);
     const passphrase = resolvePassphrase(options.passphrase);
+    const guardrailConfig = resolveGuardrailConfig(options.guardrails);
     assertStrongPassphrase(passphrase as string);
     registerSecret(passphrase);
     const mnemonic =
@@ -288,7 +342,9 @@ export class DepixWallet {
         seedStore,
         file,
         lock,
-        sync: options.sync
+        sync: options.sync,
+        guardrailConfig,
+        quotes: options.quotes
       });
       return { mnemonic, descriptor, backupConfirmed, wallet };
     } catch (err) {
@@ -305,6 +361,7 @@ export class DepixWallet {
   static async restore(options: RestoreOptions): Promise<DepixWallet> {
     const dataDir = resolveDataDir(options.dataDir);
     const passphrase = resolvePassphrase(options.passphrase);
+    const guardrailConfig = resolveGuardrailConfig(options.guardrails);
     assertStrongPassphrase(passphrase as string);
     registerSecret(passphrase);
     const mnemonic = validateMnemonic(options.mnemonic);
@@ -331,7 +388,16 @@ export class DepixWallet {
         backupConfirmed: true
       });
       const file = (await seedStore.read())!;
-      return new DepixWallet({ dataDir, passphrase, seedStore, file, lock, sync: options.sync });
+      return new DepixWallet({
+        dataDir,
+        passphrase,
+        seedStore,
+        file,
+        lock,
+        sync: options.sync,
+        guardrailConfig,
+        quotes: options.quotes
+      });
     } catch (err) {
       await lock.release();
       throw err;
@@ -438,8 +504,23 @@ export class DepixWallet {
       const key = MAINNET_ASSET_ID_TO_KEY[String(assetId)];
       if (key) balances[key] = BigInt(amount as bigint);
     }
-    // TODO(PR3): brlEstimate via GET /api/quotes (§4.4 — fresh 30s/stale 5min).
-    return { balances, brlEstimate: null };
+    // brlEstimate (§2.3/§4.4): DePix is 1:1; L-BTC/USDt need /api/quotes. A read
+    // surface fails soft — a single unavailable quote makes the whole estimate
+    // null (never a misleading partial). Zero-balance assets need no quote, so
+    // an all-DePix (or empty) wallet estimates without any network call.
+    const brlEstimate = await this.estimateBalancesBrlCents(balances);
+    return { balances, brlEstimate };
+  }
+
+  /** Sum the BRL-cent estimate of all balances, or null if any needed quote is unavailable. */
+  private async estimateBalancesBrlCents(balances: Record<AssetKey, bigint>): Promise<number | null> {
+    let total = 0;
+    for (const key of Object.keys(balances) as AssetKey[]) {
+      const cents = await this.valuator.estimateBrlCents(key, balances[key]);
+      if (cents === null) return null; // a needed quote is unavailable
+      total += cents;
+    }
+    return total;
   }
 
   async listTransactions(): Promise<WalletTransaction[]> {
@@ -475,10 +556,11 @@ export class DepixWallet {
   /**
    * Send an asset to a Liquid address, signed locally (§2.3).
    * EVERY send goes through the guardrail choke point BEFORE signing (§4.3):
-   * per-tx and rolling-24h daily BRL caps with hardcoded defaults — main
-   * never has a signing path without a ceiling. DePix values 1:1 to BRL;
-   * L-BTC/USDt valuation needs /api/quotes (PR3) and fails CLOSED with
-   * QUOTES_UNAVAILABLE until then (§4.4/G6).
+   * per-tx and rolling-24h daily BRL caps (config §4.2). DePix values 1:1 to
+   * BRL; L-BTC/USDt are valued via GET /api/quotes and fail CLOSED with
+   * QUOTES_UNAVAILABLE when no fresh/stale quote is available (§4.4/G6). When
+   * the allowlist is ON, the destination address is checked against
+   * `allowlist.liquidAddresses` (matched by scriptPubkey — §4.3).
    */
   async send(params: SendParams): Promise<SendResult> {
     this.assertOpen();
@@ -506,9 +588,14 @@ export class DepixWallet {
     // Serializing also prevents both from selecting the same UTXOs. The lock is
     // released on the throw paths too (Mutex keeps the queue alive on error).
     return this.opMutex.runExclusive(async () => {
-      // Choke point (§4.3) — BEFORE anything is built or signed.
-      const brlCents = this.valuateBrlCents(asset.key, params.amountSats);
-      await this.guardrails.enforce({ kind: "send", brlCents });
+      // Choke point (§4.3) — BEFORE anything is built or signed. Valuation may
+      // hit /api/quotes for non-DePix assets and fail CLOSED (§4.4/G6).
+      const brlCents = await this.valuator.valuate(asset.key, params.amountSats);
+      await this.guardrails.enforce({
+        kind: "send",
+        brlCents,
+        destinations: [{ kind: "liquidAddress", address: params.address }]
+      });
 
       const wollet = await this.ensureWollet();
       const network = mainnetNetwork();
@@ -574,23 +661,27 @@ export class DepixWallet {
   // ─── internals ─────────────────────────────────────────────────────────
 
   /**
-   * BRL valuation (§4.4). DePix: 1:1 peg — ceil(amountSats / 10^6) cents
-   * (rounding UP so limits cannot be shaved). L-BTC/USDt: needs /api/quotes
-   * (PR3) → fail CLOSED with QUOTES_UNAVAILABLE (G6): failing open would make
-   * the cap bypassable by taking down a public endpoint.
+   * Derive (once) the AES-256-GCM key that authenticates the guardrails-state
+   * file (§4.5) — the SAME key as the seed store: Argon2id over the passphrase
+   * and the wallet's salt. Memoized because Argon2id is deliberately expensive;
+   * it must never run per enforce()/recordSpend().
    */
-  private valuateBrlCents(asset: AssetKey, amountSats: bigint): number {
-    if (asset === "DEPIX") {
-      const cents = (amountSats + DEPIX_SATS_PER_BRL_CENT - 1n) / DEPIX_SATS_PER_BRL_CENT;
-      return Number(cents);
+  private guardrailStateKey(): Promise<CryptoKey> {
+    if (!this.guardrailKeyPromise) {
+      this.guardrailKeyPromise = (async () => {
+        const salt = this.file.salt;
+        if (!salt) {
+          // No seed → no key. A view-only/wiped wallet cannot have written any
+          // authenticated state, so this path is only reached on misuse.
+          throw new WalletError(
+            "WALLET_NOT_FOUND",
+            "Cannot derive the guardrail state key: this wallet has no seed (wiped or view-only)."
+          );
+        }
+        return deriveKey(this.requirePassphrase(), base64.decode(salt));
+      })();
     }
-    // TODO(PR3): usdBrl / btcUsd×usdBrl valuation via GET /api/quotes with
-    // fresh-30s/stale-5min cache (§4.4) — until then, fail closed.
-    throw new GuardrailError(
-      "QUOTES_UNAVAILABLE",
-      `BRL valuation for ${asset} requires quotes (not available in this build) — ` +
-        "signing is blocked for non-DePix assets (fail-closed, spec §4.4)."
-    );
+    return this.guardrailKeyPromise;
   }
 
   private async classifyFinishError(

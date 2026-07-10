@@ -36,9 +36,22 @@ export {
 export {
   DEFAULT_DAILY_LIMIT_BRL_CENTS,
   DEFAULT_PER_TX_LIMIT_BRL_CENTS,
+  resolveGuardrailConfig,
+  type GuardrailAllowlist,
+  type GuardrailConfig,
+  type GuardrailDestination,
   type GuardrailIntent,
-  type GuardrailUsage
+  type GuardrailUsage,
+  type ResolvedGuardrailConfig
 } from "./guardrails/guardrails.js";
+
+export {
+  DEFAULT_API_BASE,
+  QuotesClient,
+  type Quotes,
+  type QuotesClientOptions,
+  type QuotesSource
+} from "./guardrails/quotes.js";
 
 export { createLogger, registerSecret, type Logger, type LogLevel } from "./logger.js";
 

@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DepixWallet } from "../src/wallet.js";
 import { GUARDRAILS_STATE_FILE } from "../src/guardrails/guardrails.js";
+import type { QuotesSource } from "../src/guardrails/quotes.js";
 import { isDepixSdkError } from "../src/errors.js";
 
 const PASSPHRASE = "correct-horse-battery-staple";
@@ -15,13 +16,25 @@ const KNOWN_MNEMONIC =
 // A valid mainnet confidential address (golden addr[1] of the known mnemonic).
 const VALID_ADDRESS =
   "lq1qqfk0uw9vlmqlggzs7cxmw49x8ks37l87udspmpt3ssgxjrkqqlww63xvus3c5gaz89r2kd393c4fvurwxf06qj87y2kd3vsln";
+// A second valid mainnet address (golden addr[0]) — a different destination.
+const OTHER_ADDRESS =
+  "lq1qqvxk052kf3qtkxmrakx50a9gc3smqad2ync54hzntjt980kfej9kkfe0247rp5h4yzmdftsahhw64uy8pzfe7cpg4fgykm7cv";
+
+// Quotes are unavailable by default → non-DePix valuation fails CLOSED without
+// any network call (deterministic offline test).
+const NO_QUOTES: QuotesSource = { get: async () => null };
 
 let dataDir: string;
 let wallet: DepixWallet;
 
 beforeEach(async () => {
   dataDir = await mkdtemp(join(tmpdir(), "depix-sdk-send-"));
-  wallet = await DepixWallet.restore({ dataDir, passphrase: PASSPHRASE, mnemonic: KNOWN_MNEMONIC });
+  wallet = await DepixWallet.restore({
+    dataDir,
+    passphrase: PASSPHRASE,
+    mnemonic: KNOWN_MNEMONIC,
+    quotes: NO_QUOTES
+  });
 });
 
 afterEach(async () => {
@@ -72,11 +85,59 @@ describe("guardrail choke point runs BEFORE signing (§4.3)", () => {
     ).rejects.toSatisfy((err: unknown) => isDepixSdkError(err, "GUARDRAIL_PER_TX_LIMIT"));
   });
 
-  it("fails CLOSED with QUOTES_UNAVAILABLE for L-BTC and USDt (valuation is PR3 — G6)", async () => {
+  it("fails CLOSED with QUOTES_UNAVAILABLE for L-BTC and USDt when no quote is available (G6)", async () => {
     for (const asset of ["LBTC", "USDT"] as const) {
       await expect(
         wallet.send({ asset, amountSats: 1_000n, address: VALID_ADDRESS })
       ).rejects.toSatisfy((err: unknown) => isDepixSdkError(err, "QUOTES_UNAVAILABLE"));
+    }
+  });
+
+  it("values L-BTC via /api/quotes and clears the choke point when a quote exists (§4.4)", async () => {
+    // With a quote, a tiny L-BTC send is valued in BRL, passes both ceilings,
+    // and only then fails at build with INSUFFICIENT_FUNDS — proving valuation
+    // ran (not QUOTES_UNAVAILABLE) and the guardrail let it through.
+    const dir = await mkdtemp(join(tmpdir(), "depix-sdk-send-q-"));
+    const quoted = await DepixWallet.restore({
+      dataDir: dir,
+      passphrase: PASSPHRASE,
+      mnemonic: KNOWN_MNEMONIC,
+      quotes: { get: async () => ({ btcUsd: 100_000, usdBrl: 5 }) }
+    });
+    try {
+      // 10_000 sats L-BTC × 100_000 × 5 = R$50,00 — within both caps.
+      await expect(
+        quoted.send({ asset: "LBTC", amountSats: 10_000n, address: VALID_ADDRESS })
+      ).rejects.toSatisfy((err: unknown) => isDepixSdkError(err, "INSUFFICIENT_FUNDS"));
+    } finally {
+      await quoted.close().catch(() => {});
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("allowlist wiring — send() checks the destination class (§4.3)", () => {
+  it("blocks a send to a non-allowlisted Liquid address, passes one that is listed", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "depix-sdk-send-al-"));
+    const w = await DepixWallet.restore({
+      dataDir: dir,
+      passphrase: PASSPHRASE,
+      mnemonic: KNOWN_MNEMONIC,
+      quotes: NO_QUOTES,
+      guardrails: { allowlist: { enabled: true, liquidAddresses: [VALID_ADDRESS] } }
+    });
+    try {
+      // Not in the allowlist → blocked before signing, nothing accounted.
+      await expect(
+        w.send({ asset: "DEPIX", amountSats: 5_000n * 1_000_000n, address: OTHER_ADDRESS })
+      ).rejects.toSatisfy((err: unknown) => isDepixSdkError(err, "GUARDRAIL_ALLOWLIST_BLOCKED"));
+      // Listed address → passes the allowlist, then fails at build (empty wallet).
+      await expect(
+        w.send({ asset: "DEPIX", amountSats: 5_000n * 1_000_000n, address: VALID_ADDRESS })
+      ).rejects.toSatisfy((err: unknown) => isDepixSdkError(err, "INSUFFICIENT_FUNDS"));
+    } finally {
+      await w.close().catch(() => {});
+      await rm(dir, { recursive: true, force: true });
     }
   });
 });

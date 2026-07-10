@@ -40,6 +40,11 @@ export interface WalletFileV1 {
   createdAt: number; // epoch ms
   backupConfirmed: boolean; // §2.9 backup gate
   nextReceiveIndex: number; // §3.1 fresh-address monotonic counter
+  // §4.5 guardrails-state marker: set true on the FIRST guardrail state write.
+  // Its presence turns a later missing/corrupt state file into fail-closed (an
+  // injected agent deleting the state cannot zero the 24h accumulator). Absent
+  // on wallets that predate this field / never signed — treated as false.
+  guardrailsStateInitialized?: boolean;
 }
 
 export class SeedStore {
@@ -168,6 +173,19 @@ export class SeedStore {
     await this.patch((file) => {
       // Monotonic: never move the counter backwards.
       file.nextReceiveIndex = Math.max(file.nextReceiveIndex ?? 0, next);
+    });
+  }
+
+  /** Read the guardrails-state marker (§4.5). Absent field → false. */
+  async isGuardrailsStateInitialized(): Promise<boolean> {
+    const file = await this.read();
+    return file?.guardrailsStateInitialized === true;
+  }
+
+  /** Set the guardrails-state marker (§4.5), durably (§2.4). Idempotent. */
+  async setGuardrailsStateInitialized(): Promise<void> {
+    await this.patch((file) => {
+      file.guardrailsStateInitialized = true;
     });
   }
 

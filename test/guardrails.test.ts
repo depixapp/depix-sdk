@@ -1,16 +1,21 @@
-// Guardrail choke point skeleton (spec §4, PR1 scope):
-// hardcoded defaults R$100/tx + R$500/day rolling 24h, arithmetic fail-closed,
-// quote fail-closed for non-DePix, persisted daily accumulator.
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+// Guardrail choke point core behavior (spec §4): per-tx + daily rolling-24h,
+// arithmetic fail-closed, atomic accounting. State is now AES-256-GCM
+// authenticated (§4.5), so these tests inject a test key + marker and assert
+// window behavior through the public API rather than by reading the raw file.
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   DEFAULT_DAILY_LIMIT_BRL_CENTS,
   DEFAULT_PER_TX_LIMIT_BRL_CENTS,
-  Guardrails
+  GUARDRAILS_STATE_FILE,
+  Guardrails,
+  resolveGuardrailConfig,
+  type GuardrailConfig
 } from "../src/guardrails/guardrails.js";
 import { GuardrailError, isDepixSdkError } from "../src/errors.js";
+import { InMemoryMarker, keyProvider } from "./guardrail-utils.js";
 
 let dataDir: string;
 
@@ -22,14 +27,25 @@ afterEach(async () => {
   await rm(dataDir, { recursive: true, force: true });
 });
 
-function makeGuardrails(now?: () => number): Guardrails {
-  return new Guardrails({ dataDir, now });
+function makeGuardrails(
+  opts: { now?: () => number; config?: GuardrailConfig; marker?: InMemoryMarker } = {}
+): Guardrails {
+  return new Guardrails({
+    dataDir,
+    config: resolveGuardrailConfig(opts.config, {}),
+    stateKey: keyProvider(),
+    marker: opts.marker ?? new InMemoryMarker(),
+    now: opts.now
+  });
 }
 
 describe("hardcoded defaults (spec §9 PR1 — main NEVER signs without a ceiling)", () => {
   it("defaults are R$100/tx and R$500/day", () => {
     expect(DEFAULT_PER_TX_LIMIT_BRL_CENTS).toBe(10_000);
     expect(DEFAULT_DAILY_LIMIT_BRL_CENTS).toBe(50_000);
+    const config = resolveGuardrailConfig(undefined, {});
+    expect(config.perTxLimitBrlCents).toBe(10_000);
+    expect(config.dailyLimitBrlCents).toBe(50_000);
   });
 });
 
@@ -75,7 +91,7 @@ describe("daily limit — rolling 24h window (G7)", () => {
 
   it("entries older than 24h leave the window (and are pruned on write)", async () => {
     let clock = Date.now();
-    const guardrails = makeGuardrails(() => clock);
+    const guardrails = makeGuardrails({ now: () => clock });
     await guardrails.recordSpend(50_000, "send"); // fill the day
     await expect(guardrails.enforce({ kind: "send", brlCents: 1 })).rejects.toSatisfy(
       (err: unknown) => isDepixSdkError(err, "GUARDRAIL_DAILY_LIMIT")
@@ -83,13 +99,11 @@ describe("daily limit — rolling 24h window (G7)", () => {
     clock += 24 * 60 * 60 * 1000 + 1; // 24h + 1ms later
     await expect(guardrails.enforce({ kind: "send", brlCents: 10_000 })).resolves.toBeUndefined();
     await guardrails.recordSpend(1_000, "send");
-    // The stale entry was pruned from the persisted state on write.
-    const raw = JSON.parse(await readFile(join(dataDir, "guardrails-state.json"), "utf8"));
-    expect(raw.entries).toHaveLength(1);
-    expect(raw.entries[0].brlCents).toBe(1_000);
+    // The stale entry was pruned on write — only the fresh R$10 remains.
+    expect((await guardrails.usage()).usedCents).toBe(1_000);
   });
 
-  it("persists across restarts (new instance, same dataDir)", async () => {
+  it("persists across restarts (new instance, same encrypted state + dataDir)", async () => {
     const first = makeGuardrails();
     await first.recordSpend(45_000, "send");
     const second = makeGuardrails();
@@ -97,6 +111,7 @@ describe("daily limit — rolling 24h window (G7)", () => {
       (err: unknown) => isDepixSdkError(err, "GUARDRAIL_DAILY_LIMIT")
     );
     await expect(second.enforce({ kind: "send", brlCents: 5_000 })).resolves.toBeUndefined();
+    expect((await second.usage()).usedCents).toBe(45_000);
   });
 });
 
@@ -115,15 +130,15 @@ describe("arithmetic fail-closed (§4.4 — GUARDRAIL_INVALID_AMOUNT)", () => {
   });
 });
 
-describe("state file handling (PR1 skeleton of §4.5)", () => {
+describe("state file handling (§4.5 — fresh-wallet semantics without a marker)", () => {
   it("missing state (fresh wallet, no marker yet) counts as an empty window", async () => {
     const guardrails = makeGuardrails();
     await expect(guardrails.enforce({ kind: "send", brlCents: 10_000 })).resolves.toBeUndefined();
   });
 
-  it("corrupted state file is surfaced as an empty window with a loud log (auth arrives in PR3)", async () => {
-    await writeFile(join(dataDir, "guardrails-state.json"), "{corrupt", "utf8");
-    const guardrails = makeGuardrails();
+  it("corrupted state WITHOUT a marker is surfaced as an empty window", async () => {
+    await writeFile(join(dataDir, GUARDRAILS_STATE_FILE), "{corrupt", "utf8");
+    const guardrails = makeGuardrails({ marker: new InMemoryMarker(false) });
     await expect(guardrails.enforce({ kind: "send", brlCents: 10_000 })).resolves.toBeUndefined();
   });
 
@@ -147,9 +162,6 @@ describe("concurrent recordSpend is atomic (TOCTOU compounding fix — §4.5)", 
     // them read the same base state and clobber each other (last-writer-wins),
     // under-counting the window. The internal write-mutex serializes the RMW.
     await Promise.all(Array.from({ length: 10 }, () => guardrails.recordSpend(1_000, "send")));
-    const usage = await guardrails.usage();
-    expect(usage.usedCents).toBe(10_000); // 10 × R$10 — nothing lost
-    const raw = JSON.parse(await readFile(join(dataDir, "guardrails-state.json"), "utf8"));
-    expect(raw.entries).toHaveLength(10);
+    expect((await guardrails.usage()).usedCents).toBe(10_000); // 10 × R$10 — nothing lost
   });
 });

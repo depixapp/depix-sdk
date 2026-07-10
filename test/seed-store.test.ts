@@ -77,6 +77,15 @@ describe("SeedStore roundtrip", () => {
       isDepixSdkError(err, "WALLET_NOT_FOUND")
     );
   });
+
+  it("guardrailsStateInitialized marker defaults false and persists once set (§4.5)", async () => {
+    const store = await seededStore();
+    expect(await store.isGuardrailsStateInitialized()).toBe(false);
+    await store.setGuardrailsStateInitialized();
+    expect(await store.isGuardrailsStateInitialized()).toBe(true);
+    // Persisted durably in wallet.json; a fresh handle still sees it.
+    expect((await new SeedStore(dataDir).read())!.guardrailsStateInitialized).toBe(true);
+  });
 });
 
 describe("corrupt wallet.json is distinct from missing (WALLET_CORRUPTED)", () => {

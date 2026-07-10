@@ -318,7 +318,7 @@ describe("backup gate persistence", () => {
 });
 
 describe("read surface", () => {
-  it("getBalances returns the three assets as bigints with brlEstimate null (quotes are PR3)", async () => {
+  it("getBalances returns the three assets as bigints; an empty wallet estimates R$0 with no quote (§4.4)", async () => {
     const wallet = track(
       await DepixWallet.restore({ dataDir, passphrase: PASSPHRASE, mnemonic: KNOWN_MNEMONIC })
     );
@@ -326,7 +326,9 @@ describe("read surface", () => {
     expect(balances.DEPIX).toBe(0n);
     expect(balances.USDT).toBe(0n);
     expect(balances.LBTC).toBe(0n);
-    expect(brlEstimate).toBeNull();
+    // All balances zero → no quote is needed → an honest R$0 (null is reserved
+    // for a genuinely unavailable quote on a non-zero non-DePix balance).
+    expect(brlEstimate).toBe(0);
   });
 
   it("listTransactions returns a typed empty list for a fresh wallet", async () => {
