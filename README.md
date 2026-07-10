@@ -237,51 +237,6 @@ One private key covers N wallets; the secret doesn't disappear, it changes shape
 
 ---
 
-## Publishing
-
-The package is published by a human (the npm account uses passkey 2FA, so the
-publish is interactive). The **`SIDESHIFT_AFFILIATE_ID`** value is provided by
-the **publisher's environment** and baked into the build at publish time (spec
-§5.4) — it is never committed to this public repo, never read at runtime, and
-never served by the backend.
-
-`prepublishOnly` runs the affiliate-id guard, then the build, then the offline
-test suite. The guard fails the publish loudly if the env is missing:
-
-```bash
-SIDESHIFT_AFFILIATE_ID=<your-affiliate-id> npm publish
-```
-
-Tests and CI use `SIDESHIFT_AFFILIATE_ID=test-affiliate`. (The build-time
-substitution/codegen that consumes this value ships with the SideShift delivery;
-the guard here only asserts the env is present and does not duplicate it.)
-
-Validate the tarball without publishing:
-
-```bash
-SIDESHIFT_AFFILIATE_ID=test-affiliate npm publish --dry-run
-```
-
-The published package contains `dist/` (compiled JS + types), `README.md` and
-`LICENSE`, and exposes the `depix-wallet-mcp` bin.
-
----
-
-## Testing
-
-- `npm test` — offline unit / sandbox / contract suite. Set `DEPIX_SDK_OFFLINE=1`
-  to skip the read-only live-network integration checks.
-- `npm run smoke` — smokes the built `dist/` (lwk_node init, descriptor + addr[0]
-  goldens, seed-store roundtrip) after `npm run build`.
-- `npm run openapi:diff` — advisory drift check of the vendored OpenAPI fixture
-  against the live document.
-- **Mainnet e2e** (`test/e2e/mainnet.test.ts`) — opt-in, real funds, human in the
-  loop. Skipped unless `RUN_MAINNET_E2E=1` and a `sk_live_` `DEPIX_API_KEY` are
-  set; see the file header for the full prerequisites.
-
-CI runs the matrix Node **22.4 / 24 / current** × **ubuntu / macos** (Windows is
-out for 1.0).
-
 ## Conversions
 
 `wallet.convert.*` moves between the three Liquid assets and out to other rails.
@@ -322,24 +277,58 @@ to its network class — `evmAddresses` / `tronAddresses`) **and** the
 `refundAddress` (`sideshiftRefundAddresses`) to be opted in. A Solana settle has
 no representable allowlist class, so it is fail-closed when the allowlist is on.
 
+---
+
+## Testing
+
+- `npm test` — offline unit / sandbox / contract suite. Set `DEPIX_SDK_OFFLINE=1`
+  to skip the read-only live-network integration checks.
+- `npm run smoke` — smokes the built `dist/` (lwk_node init, descriptor + addr[0]
+  goldens, seed-store roundtrip) after `npm run build`.
+- `npm run openapi:diff` — advisory drift check of the vendored OpenAPI fixture
+  against the live document.
+- **Mainnet e2e** (`test/e2e/mainnet.test.ts`) — opt-in, real funds, human in the
+  loop. Skipped unless `RUN_MAINNET_E2E=1` and a `sk_live_` `DEPIX_API_KEY` are
+  set; see the file header for the full prerequisites.
+
+CI runs the matrix Node **22.4 / 24 / current** × **ubuntu / macos** (Windows is
+out for 1.0).
+
+---
+
 ## Publishing
 
-The SideShift affiliate id (the DePix affiliate id — public, but not committed to
-this repo) is **baked into the package at build time**, mirroring the frontend's
-build-time substitution. The publisher **must** set `SIDESHIFT_AFFILIATE_ID` in
-the publish environment:
+The package (`version` **1.0.0**) is published **by a human** — the npm account
+uses passkey 2FA, so the publish is interactive. The **`SIDESHIFT_AFFILIATE_ID`**
+value (the DePix affiliate id — public, but never committed to this repo) is
+supplied by the **publisher's environment** and baked into the build at publish
+time (spec §5.4), mirroring the frontend's build-time substitution. It is never
+read at runtime and never served by the backend.
+
+`prepublishOnly` runs `scripts/check-affiliate-env.mjs` → `npm run build` → the
+offline test suite (`DEPIX_SDK_OFFLINE=1 npm run test`). The guard **fails the
+publish loudly** if `SIDESHIFT_AFFILIATE_ID` is unset, so a release can never ship
+without it; the build then bakes the value into
+`dist/convert/sideshift-affiliate.js`, and the published package performs **no
+runtime env read**. A dev build without the env var still succeeds but bakes an
+empty id, so SideShift calls throw `AFFILIATE_ID_MISSING` until a real build is
+published.
 
 ```bash
 SIDESHIFT_AFFILIATE_ID=<depix-affiliate-id> npm publish
 ```
 
-`prepublishOnly` runs `scripts/check-affiliate-env.mjs`, which **fails the publish**
-if the env var is unset, so a release can never ship without it. `npm run build`
-then bakes the value into `dist/convert/sideshift-affiliate.js` — the published
-package performs **no runtime env read**. A dev build without the env var succeeds
-but bakes an empty id, so SideShift calls throw `AFFILIATE_ID_MISSING` until a real
-build is published. Tests run with `SIDESHIFT_AFFILIATE_ID=test-affiliate` (wired
-in `package.json`).
+Tests and CI use `SIDESHIFT_AFFILIATE_ID=test-affiliate` (wired in `package.json`).
+Validate the tarball without publishing anything:
+
+```bash
+SIDESHIFT_AFFILIATE_ID=test-affiliate npm publish --dry-run
+```
+
+The published package contains `dist/` (compiled JS + types), `README.md` and
+`LICENSE`, and exposes the `depix-wallet-mcp` bin.
+
+---
 
 ## License
 

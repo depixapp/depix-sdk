@@ -96,7 +96,22 @@ async function main() {
     if (fm !== lm) problems.push(`methods for ${p}: fixture [${fm}] → live [${lm}]`);
   }
 
-  const pointers = diffPointers(fixture, live);
+  // Body-level drift, scoped to the request/response bodies of endpoints present
+  // in BOTH documents. The structured checks above already flag info.version,
+  // added/removed paths, and per-path method changes; walking the whole document
+  // here re-listed all of that. Scoping to shared path→method bodies keeps the
+  // advisory output to genuine schema drift the checks above cannot see.
+  const pointers = [];
+  for (const p of fPaths.filter((fp) => lPaths.includes(fp))) {
+    if (pointers.length >= 40) break;
+    const fMethods = methodsOf(fixture.paths[p]);
+    const lMethods = methodsOf(live.paths[p]);
+    const ptrPath = p.replace(/~/g, "~0").replace(/\//g, "~1");
+    for (const m of fMethods.filter((v) => lMethods.includes(v))) {
+      if (pointers.length >= 40) break;
+      diffPointers(fixture.paths[p][m], live.paths[p][m], `/paths/${ptrPath}/${m}`, pointers, 40);
+    }
+  }
 
   if (problems.length === 0 && pointers.length === 0) {
     out(`✓ openapi-diff: no drift (info.version ${fVer}, ${fPaths.length} paths).`);
@@ -111,7 +126,7 @@ async function main() {
   }
   out("");
   out("  Re-vendor the snapshot when this is an intended API change:");
-  out(`    curl -s ${LIVE_URL} | node -e 'process.stdout.write(JSON.stringify(JSON.parse(require(\"fs\").readFileSync(0,\"utf8\")),null,2)+\"\\n\")' > test/fixtures/openapi.json`);
+  out(`    curl -s ${LIVE_URL} | node -e 'process.stdout.write(JSON.stringify(JSON.parse(require("fs").readFileSync(0,"utf8")),null,2)+"\\n")' > test/fixtures/openapi.json`);
   return 1;
 }
 
