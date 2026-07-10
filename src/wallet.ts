@@ -1576,7 +1576,7 @@ export class DepixWallet {
         rail: "pegin",
         id: pegin.orderId,
         state: "pending",
-        createdAt: null,
+        createdAt: pegin.createdAt ?? null,
         pegAddr: pegin.pegAddr,
         recvAddr: pegin.recvAddr
       });

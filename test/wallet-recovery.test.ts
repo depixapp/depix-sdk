@@ -10,7 +10,12 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DepixWallet } from "../src/wallet.js";
 import { BoltzConvert, type BoltzResumeSummary } from "../src/convert/boltz/convert.js";
-import { BoltzSwapStore, type StoredSubmarineSwap } from "../src/convert/boltz/store.js";
+import {
+  BoltzSwapStore,
+  type StoredReverseSwap,
+  type StoredStablecoinSwap,
+  type StoredSubmarineSwap
+} from "../src/convert/boltz/store.js";
 import { PendingPegIn, PENDING_PEGIN_FILE } from "../src/convert/pending-pegin.js";
 import { SideShiftStore, type StoredSideShift } from "../src/convert/sideshift-store.js";
 import { PendingWithdrawals } from "../src/pending.js";
@@ -108,6 +113,58 @@ function storedSubmarine(swapId: string): StoredSubmarineSwap {
     timeoutBlockHeight: 3_100_000,
     refundPrivateKeyHex: "c".repeat(64),
     refundPublicKeyHex: "02" + "d".repeat(64),
+    state: "locked_up",
+    createdAt: 1_720_000_000_000
+  };
+}
+
+// Sentinel secrets (distinct 64-hex values) so the no-leak assertions can prove
+// each rail's key material stays out of the read-only view.
+const REVERSE_PREIMAGE_HEX = "b1".repeat(32);
+const REVERSE_CLAIM_PRIV_HEX = "b2".repeat(32);
+const STABLECOIN_REFUND_PRIV_HEX = "e1".repeat(32);
+const STABLECOIN_EVM_PRIV_HEX = "e2".repeat(32);
+const STABLECOIN_PREIMAGE_HEX = "e3".repeat(32);
+
+/** A stored reverse (LN RECEIVE) swap — carries a claim key + preimage. */
+function storedReverse(swapId: string): StoredReverseSwap {
+  return {
+    type: "reverse",
+    swapId,
+    invoice: "lnbc1...",
+    lockupAddress: "lq1qrevlockup",
+    onchainAmount: 200_000,
+    swapTree: {},
+    refundPublicKey: "03" + "cc".repeat(32),
+    timeoutBlockHeight: 3_100_000,
+    claimAddress: "lq1qclaim",
+    preimageHex: REVERSE_PREIMAGE_HEX,
+    claimPublicKeyHex: "02" + "ab".repeat(32),
+    claimPrivateKeyHex: REVERSE_CLAIM_PRIV_HEX,
+    state: "awaiting_payment",
+    createdAt: 1_720_000_000_000
+  };
+}
+
+/** A stored stablecoin (L-BTC -> USDT) swap — carries a refund key, EVM key + preimage. */
+function storedStablecoin(swapId: string): StoredStablecoinSwap {
+  return {
+    type: "stablecoin",
+    swapId,
+    asset: "USDT",
+    networkId: "tron",
+    claimAddress: "T" + "x".repeat(33),
+    lockupAddress: "lq1qstlockup",
+    lockAmountSats: 500_000,
+    serverPublicKey: "02" + "cd".repeat(32),
+    swapTree: {},
+    timeoutBlockHeight: 3_100_000,
+    refundPrivateKeyHex: STABLECOIN_REFUND_PRIV_HEX,
+    refundPublicKeyHex: "02" + "ef".repeat(32),
+    preimageHex: STABLECOIN_PREIMAGE_HEX,
+    evmPrivateKeyHex: STABLECOIN_EVM_PRIV_HEX,
+    createdSwap: {},
+    plan: {},
     state: "locked_up",
     createdAt: 1_720_000_000_000
   };
@@ -255,27 +312,51 @@ describe("wallet.getPending() unifies the four pending stores", () => {
       request: { pixKey: "k", taxNumber: "t", depositAmountInCents: 500 }
     });
     const boltzStore = new BoltzSwapStore({ dataDir, passphrase: PASSPHRASE, saltB64: salt });
+    // Seed one of EACH boltz rail — each stores different key material.
     await boltzStore.put(storedSubmarine("sub_1"));
+    await boltzStore.put(storedReverse("rev_1"));
+    await boltzStore.put(storedStablecoin("stbl_1"));
     await new PendingPegIn(dataDir).put({ orderId: "peg_1", pegAddr: "bc1qpeg", recvAddr: "lq1qrecv" });
     const shifts = new SideShiftStore({ dataDir });
     await shifts.save(storedShift("sh_pending", "waiting"));
     await shifts.save(storedShift("sh_done", "settled")); // terminal → excluded
 
     const items = await wallet.getPending();
-    expect(items).toHaveLength(4);
+    expect(items).toHaveLength(6);
 
     const byRail = Object.fromEntries(items.map((i) => [i.rail, i]));
     expect(byRail.withdrawal).toMatchObject({ id: "idem-1", state: "requested", withdrawalId: null, txid: null });
-    expect(byRail.boltz).toMatchObject({ id: "sub_1", state: "locked_up", swapType: "submarine" });
     expect(byRail.pegin).toMatchObject({ id: "peg_1", state: "pending", pegAddr: "bc1qpeg", recvAddr: "lq1qrecv" });
+    // The unified view surfaces the peg-in's REAL createdAt (was hardcoded null).
+    expect(byRail.pegin?.createdAt).toEqual(expect.any(Number));
     expect(byRail.sideshift).toMatchObject({ id: "sh_pending", state: "waiting", shiftType: "send", network: "tron" });
 
-    // NO key material leaks through the read-only view (boltz records carry
-    // swap-scoped refund keys — those must stay inside the encrypted store).
+    // All three boltz rails surface rail/id/state/swapType metadata only.
+    const boltzById = Object.fromEntries(items.filter((i) => i.rail === "boltz").map((i) => [i.id, i]));
+    expect(Object.keys(boltzById)).toHaveLength(3);
+    expect(boltzById.sub_1).toMatchObject({ state: "locked_up", swapType: "submarine" });
+    expect(boltzById.rev_1).toMatchObject({ state: "awaiting_payment", swapType: "reverse" });
+    expect(boltzById.stbl_1).toMatchObject({ state: "locked_up", swapType: "stablecoin" });
+
+    // NO key material leaks through the read-only view — this is the fund-safety
+    // invariant the PR leans on, so it is checked for EVERY rail's secrets:
+    // submarine refund key, reverse claim key + preimage, stablecoin refund/EVM
+    // key + preimage. All must stay inside the encrypted store.
     const flat = JSON.stringify(items);
+    // submarine
     expect(flat).not.toContain("refundPrivateKeyHex");
     expect(flat).not.toContain("c".repeat(64));
     expect(flat).not.toContain("signedTxHex");
+    // reverse — claim key + preimage
+    expect(flat).not.toContain("claimPrivateKeyHex");
+    expect(flat).not.toContain("preimageHex");
+    expect(flat).not.toContain(REVERSE_PREIMAGE_HEX);
+    expect(flat).not.toContain(REVERSE_CLAIM_PRIV_HEX);
+    // stablecoin — refund key, ephemeral EVM key + preimage
+    expect(flat).not.toContain("evmPrivateKeyHex");
+    expect(flat).not.toContain(STABLECOIN_REFUND_PRIV_HEX);
+    expect(flat).not.toContain(STABLECOIN_EVM_PRIV_HEX);
+    expect(flat).not.toContain(STABLECOIN_PREIMAGE_HEX);
   });
 
   it("returns an empty list when nothing is in flight", async () => {
