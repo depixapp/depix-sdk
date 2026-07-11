@@ -184,6 +184,23 @@ describe("execute() — fail-closed validation aborts before recording/broadcast
     stream.close();
   });
 
+  it("a signer that completes WITHOUT running validate() is refused (SWAP_VALIDATION_FAILED): no record, no taker_sign", async () => {
+    const client = new FakeSideSwapClient();
+    // A future/custom signer that validated out-of-band and never invoked the
+    // callback — actualRecvSats stays null. The executor must refuse to report
+    // an unverified receipt rather than fall back to the pre-fee quote figure.
+    const noValidateSigner = async (): Promise<string> => "SIGNED_BUT_UNVALIDATED";
+    const { hooks, spies } = makeHooks();
+    const market = makeMarket(hooks, client, noValidateSigner);
+    const { stream, quote } = await openStreamWithQuote(market, client);
+
+    await expect(stream.execute(quote)).rejects.toSatisfy((e) => isDepixSdkError(e, "SWAP_VALIDATION_FAILED"));
+    expect(client.getQuoteCalls).toEqual(["Q1"]);
+    expect(spies.record).toHaveLength(0);
+    expect(client.takerSignCalls).toHaveLength(0);
+    stream.close();
+  });
+
   it("a SHRUNK/OMITTED change (from-net beyond sendAmount + slack) aborts: no record, no taker_sign", async () => {
     const client = new FakeSideSwapClient();
     // Dealer pays us the exact recv (LBTC +5) but consumes a whole 1,000,000-unit

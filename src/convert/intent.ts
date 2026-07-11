@@ -392,10 +392,15 @@ async function estimateLeg(leg: RouteLeg, amountIn: bigint, deps: IntentDeps): P
           };
         }
         // fee_asset comes from the start_quotes RESPONSE and the server may
-        // omit it; the fees are netted from the RECV side (observed), so
-        // default to the recv asset rather than reporting an unusable null.
-        const feeAssetKey = quote.feeAsset
-          ? (MAINNET_ASSET_ID_TO_KEY[quote.feeAsset] ?? (leg.to as AssetKey))
+        // OMIT it; the fees are netted from the RECV side (observed), so an
+        // omitted fee asset defaults to the recv asset rather than reporting an
+        // unusable null. A PRESENT-but-unmapped id, however, stays null — an
+        // honest "unknown" (which suppresses estimatedFeeTotalSats downstream)
+        // rather than coercing it to `leg.to`, which would mislabel the fee
+        // asset and could sum fees denominated in different assets into a
+        // spurious same-asset total.
+        const feeAssetKey: AssetKey | null = quote.feeAsset
+          ? (MAINNET_ASSET_ID_TO_KEY[quote.feeAsset] ?? null)
           : (leg.to as AssetKey);
         return {
           receivedSats: netRecv,

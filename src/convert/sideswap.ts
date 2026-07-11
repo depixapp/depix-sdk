@@ -695,6 +695,24 @@ export class SwapQuoteStream {
         });
       });
 
+      // The ForeignPsetSigner contract REQUIRES validate() to run before it
+      // signs (fail-closed, §5.1). The production signer honors it, but a
+      // future/custom signer that validated out-of-band could complete without
+      // invoking the callback — leaving actualRecvSats null. Refuse to broadcast
+      // or report an UNVERIFIED receipt rather than silently falling back to the
+      // dealer's PRE-fee quote figure (the multi-hop executor chains on this
+      // amount and would over-size the next leg's input).
+      if (actualRecvSats === null) {
+        throw new ConversionError(
+          "SWAP_VALIDATION_FAILED",
+          "the swap signer completed without running PSET validation — refusing to report an unverified receive amount"
+        );
+      }
+      // Post-fee net the validated PSET actually credits us — narrowed to a
+      // non-null bigint by the guard above (captured before the awaits below,
+      // which would otherwise reset the closure-assigned variable's narrowing).
+      const netRecvSats: bigint = actualRecvSats;
+
       // Account the SENT side at signing time (§4.5) — BEFORE taker_sign asks
       // SideSwap to broadcast (parity with send() recording before broadcast).
       await hooks.recordSpend(brlCents, "sideswap-swap");
@@ -706,7 +724,7 @@ export class SwapQuoteStream {
         sendAmountSats: quote.sendAmountSats,
         // What the validated PSET actually credits us (post-fee), not the
         // dealer's pre-fee quote figure.
-        recvAmountSats: actualRecvSats ?? quote.recvAmountSats,
+        recvAmountSats: netRecvSats,
         brlCents
       };
     });
