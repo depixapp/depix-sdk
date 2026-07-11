@@ -17,6 +17,7 @@ import { DepixWallet, planSendMany, selectCoinsGreedy, type WalletUtxo } from ".
 import { GUARDRAILS_STATE_FILE } from "../src/guardrails/guardrails.js";
 import type { QuotesSource } from "../src/guardrails/quotes.js";
 import type { EsploraClientLike } from "../src/sync/sync.js";
+import type { Logger } from "../src/logger.js";
 import { isDepixSdkError, type GuardrailError } from "../src/errors.js";
 
 const PASSPHRASE = "correct-horse-battery-staple";
@@ -129,6 +130,50 @@ describe("advanced.listUtxos() — read-only", () => {
     await expect(wallet.advanced.listUtxos()).rejects.toSatisfy((err: unknown) =>
       isDepixSdkError(err, "WALLET_NOT_FOUND")
     );
+  });
+
+  it("drops an unblindable UTXO but logs its outpoint (breadcrumb for a false selectCoins shortfall)", async () => {
+    wallet = await restore();
+    // Observe the wallet's own debug channel without touching the log level.
+    const debugCalls: unknown[][] = [];
+    (wallet as unknown as { logger: Logger }).logger = {
+      debug: (...args: unknown[]) => {
+        debugCalls.push(args);
+      },
+      info: () => {},
+      warn: () => {},
+      error: () => {}
+    };
+    // Inject a fake wollet (parity with sideswap-market.test.ts): one readable
+    // coin and one whose unblind() throws (an unspendable/malformed output).
+    const readable = {
+      outpoint: () => ({ txid: () => ({ toString: () => "aa".repeat(32) }), vout: () => 0 }),
+      unblinded: () => ({ asset: () => ({ toString: () => "11".repeat(32) }), value: () => 1_000_000 }),
+      height: () => 100,
+      address: () => ({ toString: () => VALID_ADDRESS })
+    };
+    const unblindable = {
+      outpoint: () => ({ txid: () => ({ toString: () => "bb".repeat(32) }), vout: () => 1 }),
+      unblinded: () => {
+        throw new Error("cannot unblind");
+      },
+      height: () => 100,
+      address: () => ({ toString: () => VALID_ADDRESS })
+    };
+    Object.assign(wallet as unknown as { wollet: unknown; wolletReady: boolean }, {
+      wollet: { tip: () => ({ height: () => 200 }), utxos: () => [readable, unblindable] },
+      wolletReady: true
+    });
+
+    const utxos = await wallet.advanced.listUtxos();
+    // The readable coin is listed; the unblindable one is dropped (unspendable).
+    expect(utxos).toHaveLength(1);
+    expect(utxos[0]?.outpoint).toEqual({ txid: "aa".repeat(32), vout: 0 });
+    // ...but the drop is no longer silent — the skipped outpoint is logged.
+    expect(debugCalls).toHaveLength(1);
+    const [message, meta] = debugCalls[0] as [string, { outpoint: string }];
+    expect(message).toContain("skipped");
+    expect(meta.outpoint).toBe(`${"bb".repeat(32)}:1`);
   });
 });
 

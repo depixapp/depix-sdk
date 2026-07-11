@@ -1530,8 +1530,24 @@ export class DepixWallet {
           height,
           confirmations
         });
-      } catch {
-        // skip a malformed/unblindable entry (parity with collectSwapUtxos)
+      } catch (err) {
+        // A malformed/unblindable entry is unspendable anyway, so dropping it
+        // is correct (parity with collectSwapUtxos). But selectCoins() consumes
+        // this list, so a silent drop could surface a false INSUFFICIENT_FUNDS
+        // from that informational helper — leave a debug breadcrumb naming the
+        // skipped outpoint (best-effort read; the throw may be the outpoint
+        // itself, in which case it stays "unknown").
+        let outpointRef = "unknown";
+        try {
+          const op = utxo.outpoint();
+          outpointRef = `${op.txid().toString()}:${op.vout()}`;
+        } catch {
+          // outpoint unreadable too — keep "unknown"
+        }
+        this.logger.debug("advanced.listUtxos: skipped unreadable UTXO", {
+          outpoint: outpointRef,
+          error: err instanceof Error ? err.message : String(err)
+        });
       }
     }
     return result;
