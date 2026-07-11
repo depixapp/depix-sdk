@@ -134,7 +134,10 @@ export async function buildRefundTx(params: BuildRefundTxParams): Promise<string
   const tweaked = utxo.tweakMusig(LBTC, keyAgg, tree.tree);
 
   const lockupTx = utxo.getTransaction(LBTC).fromHex(lockupTxHex);
-  const swapOutput = utxo.detectSwap(tweaked.aggPubkey, lockupTx);
+  // detectSwap is a boltz-core export, NOT boltz-swaps/utxo — same port bug as
+  // reverse.ts; on `utxo` it threw "detectSwap is not a function", which would
+  // have broken every on-failure lockup refund (submarine + chain).
+  const swapOutput = boltzCore.detectSwap(tweaked.aggPubkey, lockupTx);
   if (swapOutput === undefined) {
     throw new ConversionError(
       "SWAP_VALIDATION_FAILED",

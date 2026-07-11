@@ -171,7 +171,12 @@ export async function buildReverseClaimTx(args: {
   const tweaked = utxo.tweakMusig(LBTC, keyAgg, tree.tree);
 
   const lockupTx = utxo.getTransaction(LBTC).fromHex(lockupTxHex);
-  const swapOutput = utxo.detectSwap(tweaked.aggPubkey, lockupTx);
+  // detectSwap lives on boltz-core, NOT boltz-swaps/utxo (which has no such
+  // export) — matching the frontend port (wallet/boltz/reverse.js). Calling it
+  // on `utxo` threw "utxo.detectSwap is not a function" and stranded every paid
+  // reverse (Lightning receive) claim until the Boltz timeout (mainnet e2e,
+  // 2026-07-11).
+  const swapOutput = boltzCore.detectSwap(tweaked.aggPubkey, lockupTx);
   if (swapOutput === undefined) {
     throw new ConversionError("SWAP_VALIDATION_FAILED", "reverse claim: could not find the swap output in the lockup tx");
   }

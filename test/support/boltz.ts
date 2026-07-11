@@ -22,6 +22,21 @@ export interface HonestSubmarineLockup {
   refundPrivateKey: string;
   paymentHash: string;
   timeoutBlockHeight: number;
+  /**
+   * A minimal, parseable Liquid tx with one explicit L-BTC output paying the
+   * lockup script — enough to drive buildReverseClaimTx/buildRefundTx through
+   * the real boltz-core detectSwap (the `utxo.detectSwap` port bug was invisible
+   * to every test because none supplied a lockup tx to parse).
+   */
+  lockupTxHex: string;
+}
+
+/** Explicit (unblinded) Liquid confidential-value buffer: 0x01 + 8-byte BE amount. */
+function explicitValue(sats: number): Buffer {
+  const b = Buffer.alloc(9);
+  b[0] = 0x01;
+  b.writeBigUInt64BE(BigInt(sats), 1);
+  return b;
 }
 
 /**
@@ -59,6 +74,15 @@ export async function buildHonestSubmarineLockup(
   const addrmod = liquid.address ?? liquid.default?.address;
   const lockupAddress = addrmod.fromOutputScript(Buffer.from(script), net);
 
+  // One explicit L-BTC output paying the lockup script — a real, parseable
+  // Liquid tx so buildReverseClaimTx/buildRefundTx reach boltz-core.detectSwap.
+  const Tx = liquid.Transaction ?? liquid.default?.Transaction;
+  const assetExplicit = Buffer.concat([Buffer.from([0x01]), Buffer.alloc(32, 0x11)]);
+  const lockupTx = new Tx();
+  lockupTx.addInput(Buffer.alloc(32), 0);
+  lockupTx.addOutput(Buffer.from(script), explicitValue(100_000), assetExplicit, Buffer.from([0x00]));
+  const lockupTxHex = lockupTx.toHex();
+
   return {
     lockupAddress,
     swapTree: serialized,
@@ -66,7 +90,8 @@ export async function buildHonestSubmarineLockup(
     refundPublicKey: hex.encode(refundPub),
     refundPrivateKey: hex.encode(refundPriv),
     paymentHash: paymentHashHex,
-    timeoutBlockHeight: timeout
+    timeoutBlockHeight: timeout,
+    lockupTxHex
   };
 }
 
