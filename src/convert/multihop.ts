@@ -248,15 +248,20 @@ async function drivePlan(args: DriveArgs): Promise<ConvertResult> {
     // Atomically CLAIM the leg BEFORE executing it (§4.1 concurrency guard) —
     // stamp it `in_flight` iff it is still unstarted, deciding on the store's
     // FRESH state, never this driver's readAll() snapshot. Two concurrent
-    // recovery passes (Promise.all([recover(), recover()]), or parallel
-    // wallet_recover calls) both drive from their OWN stale snapshot; the claim
-    // re-reads the encrypted record under the store mutex so only ONE wins. The
-    // loser sees the leg already claimed (or the plan already terminal) and
-    // BAILS instead of re-broadcasting the provider leg — the double-spend the
-    // unmutexed re-drive allowed. This restores the idempotent-by-construction
-    // invariant the withdrawal rail already has (§3.2.9). Marking `in_flight`
-    // before the leg runs also keeps a crash mid-leg visible to recovery
-    // (in_flight + no result = probe, never blindly re-execute).
+    // recovery passes WITHIN ONE PROCESS (Promise.all([recover(), recover()]),
+    // or parallel wallet_recover calls on the single MCP wallet) both drive from
+    // their OWN stale snapshot; the claim re-reads the encrypted record under the
+    // store mutex so only ONE wins. The loser sees the leg already claimed (or
+    // the plan already terminal) and BAILS instead of re-broadcasting the
+    // provider leg. Marking `in_flight` before the leg runs also keeps a crash
+    // mid-leg visible to recovery (in_flight + no result = probe, never blindly
+    // re-execute).
+    //
+    // NOTE — this is INTRA-PROCESS only (the store mutex is in-memory). It does
+    // NOT stop two DepixWallet instances on the same dataDir from both claiming
+    // and double-broadcasting (test/adversarial-double-spend.test.ts #4b). What
+    // prevents that is the exclusive dir-lock every constructor holds
+    // (WALLET_DIR_LOCKED blocks a 2nd open) — not this claim.
     const claim = await store.claimLeg(plan.planId, i);
     if (claim !== "claimed") {
       logger.warn("multi-hop leg already being driven by a concurrent recovery pass — not re-executing", {

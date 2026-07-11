@@ -223,11 +223,11 @@ export class ConversionPlanStore {
   }
 
   /**
-   * Atomically CLAIM leg `legIndex` for execution — the concurrency guard that
-   * makes the plan rail idempotent-by-construction like the withdrawal rail
-   * (§3.2.9). The check-and-set runs under the SAME store mutex `patch`/`put`
-   * take, so it re-reads the ENCRYPTED record fresh and decides on live state,
-   * never a caller's stale readAll() snapshot:
+   * Atomically CLAIM leg `legIndex` for execution — the INTRA-PROCESS concurrency
+   * guard against a double provider broadcast. The check-and-set runs under the
+   * SAME in-memory store mutex `patch`/`put` take, so it re-reads the ENCRYPTED
+   * record fresh and decides on live state, never a caller's stale readAll()
+   * snapshot:
    *   - leg UNSET (null/absent — never started) → stamp it `in_flight` (and
    *     advance currentLegIndex/state), return `"claimed"` — the caller executes;
    *   - leg already carries a result (another recover()/resume pass claimed it,
@@ -235,9 +235,20 @@ export class ConversionPlanStore {
    *     the caller must NOT execute (a second provider broadcast = double-spend);
    *   - plan gone (a concurrent driver reached a terminal outcome and removed it)
    *     → return `"not_found"`.
-   * Two concurrent recovery passes (`Promise.all([recover(), recover()])`, or
-   * parallel `wallet_recover` calls — §4.1) therefore can never BOTH drive the
-   * same leg: exactly one gets `"claimed"`.
+   * Two concurrent recovery passes WITHIN ONE PROCESS (`Promise.all([recover(),
+   * recover()])`, or parallel `wallet_recover` calls on the one MCP wallet — §4.1)
+   * therefore can never BOTH drive the same leg: exactly one gets `"claimed"`.
+   *
+   * SCOPE — this guard is IN-MEMORY and thus INTRA-PROCESS ONLY. The mutex is
+   * per-ConversionPlanStore-instance, so two DepixWallet instances over the SAME
+   * dataDir (two processes, or two open()s in one) do NOT share it and CAN both
+   * claim the same leg (verified: test/adversarial-double-spend.test.ts #4b). The
+   * barrier that actually prevents that cross-process double-spend is the
+   * exclusive **dir-lock** every constructor acquires (WALLET_DIR_LOCKED on a 2nd
+   * open — see acquireDirLock / dir-lock.ts), which stops two wallets from
+   * coexisting on one dataDir in the first place. Do NOT relax the dir-lock (e.g.
+   * a lock-skipping "observer" resume mode) on the assumption that claimLeg covers
+   * cross-process — it does not.
    */
   async claimLeg(planId: string, legIndex: number): Promise<"claimed" | "already_active" | "not_found"> {
     return this.mutex.runExclusive(async () => {
