@@ -263,15 +263,18 @@ describe("quoteRoutes — enumerates ALL candidates with chained estimates", () 
     expect(routes.map((r) => r.id)).toEqual([ROUTE_DEPIX_BOLTZ, ROUTE_DEPIX_SIDESHIFT]);
     const [viaBoltz, viaSideshift] = routes;
 
-    // Non-custodial boltz path: swap est feeds the stablecoin estimator.
+    // Non-custodial boltz path: swap est feeds the stablecoin estimator with
+    // the NET recv (20_000 quoted − 110 declared fees = 19_890) — SideSwap's
+    // recv_amount is pre-fee and the dealer nets the fees out of the recv
+    // output (mainnet e2e P0/P2, 2026-07-11).
     expect(viaBoltz).toMatchObject({ hops: 2, custodial: false });
     expect(estimateStablecoin).toHaveBeenCalledWith(
-      expect.objectContaining({ asset: "USDT", networkId: "ethereum", amountSats: 20_000 })
+      expect.objectContaining({ asset: "USDT", networkId: "ethereum", amountSats: 19_890 })
     );
     // Received is normalized to 8-decimal base units of the destination asset.
     expect(viaBoltz!.estimatedReceivedSats).toBe(95_000_000n);
     expect(viaBoltz!.estimateComplete).toBe(true);
-    expect(viaBoltz!.legs[0]!.estimatedReceivedSats).toBe(20_000n);
+    expect(viaBoltz!.legs[0]!.estimatedReceivedSats).toBe(19_890n);
     expect(viaBoltz!.legs[0]!.estimatedFeeSats).toBe(110n);
     expect(viaBoltz!.legs[0]!.feeAsset).toBe("LBTC");
     // 300 miner sats + ceil(0.1% of 20_000) = 320 L-BTC sats.
@@ -288,8 +291,13 @@ describe("quoteRoutes — enumerates ALL candidates with chained estimates", () 
     // Implicit sideshift fee = deposited − settled = 50_000_000 (USDT sats).
     expect(viaSideshift!.legs[1]!.estimatedFeeSats).toBe(50_000_000n);
     expect(viaSideshift!.legs[1]!.feeAsset).toBe("USDT");
-    // Mixed fee assets across legs (USDT swap leg had no fee asset) → no total.
-    expect(viaSideshift!.estimatedFeeTotalSats).toBe(null);
+    // The swap leg's server omitted fee_asset → the SDK defaults it to the
+    // recv asset (fees are netted from the recv side — e2e P2, 2026-07-11).
+    // Both legs are then USDT-denominated, so the total IS computable:
+    // 0 (zero-fee swap leg) + 50_000_000 (sideshift implicit fee).
+    expect(viaSideshift!.legs[0]!.feeAsset).toBe("USDT");
+    expect(viaSideshift!.estimatedFeeTotalSats).toBe(50_000_000n);
+    expect(viaSideshift!.feeAsset).toBe("USDT");
   });
 
   it("an unestimatable leg yields null estimates, flags the route and SKIPS downstream estimators", async () => {

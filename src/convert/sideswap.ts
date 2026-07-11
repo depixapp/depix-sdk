@@ -102,6 +102,17 @@ export interface SwapValidationExpectation {
   fromAssetId: string;
   /** Quoted send amount in base units — the MOST of the from-asset we agreed to part with. */
   sendAmountSats: bigint;
+  /**
+   * Fees the dealer DECLARED in the quote (server_fee + fixed_fee, base units).
+   * SideSwap's quoted recv_amount is PRE-fee: the dealer nets these out of the
+   * recv output in the PSET it builds (observed live: quote 5945, PSET 5853,
+   * fixed network fee ≈ 92 — mainnet e2e P0, 2026-07-11). The recv check
+   * therefore accepts [recvAmountSats − declaredFeesSats − 1%, recvAmountSats
+   * + 1%] — the widening is bounded by fees the dealer COMMITTED to in the
+   * quote (visible to the caller pre-execute), never open-ended. Omitted/0n ⇒
+   * the strict pre-fee window (legacy behavior).
+   */
+  declaredFeesSats?: bigint;
 }
 
 /**
@@ -238,14 +249,21 @@ function netSpentOf(netBalances: ReadonlyMap<string, bigint>, assetId: string): 
  *
  * PRIMARY (hard): an output MUST pay `expectedScriptHex` (our receive address).
  * SECONDARY (FAIL-CLOSED): the recv-asset net balance must be present, positive
- * and within ±1% of `recvAmountSats`. A null inspection (read failed) or a
- * missing recv-asset key ABORTS here — the SDK has no human at a preview screen,
- * so the amount check is the only confirmation of value (§5.1/G3).
+ * and within [recvAmountSats − declaredFeesSats − 1%, recvAmountSats + 1%] —
+ * SideSwap's quoted recv is PRE-fee and the dealer nets the declared fees out
+ * of the recv output (see SwapValidationExpectation.declaredFeesSats). A null
+ * inspection (read failed) or a missing recv-asset key ABORTS here — the SDK
+ * has no human at a preview screen, so the amount check is the only
+ * confirmation of value (§5.1/G3).
+ *
+ * @returns the actual recv-asset net (base units) the PSET credits us — the
+ * post-fee amount the wallet will really receive; callers surface this instead
+ * of the pre-fee quote figure.
  */
 export function assertSwapPsetPaysAndBalances(
   inspection: SwapPsetInspection,
   expect: SwapValidationExpectation
-): void {
+): bigint {
   if (!expect.expectedScriptHex) {
     throw validationFailed("expectedScriptHex (our receive address) is required for swap validation");
   }
@@ -258,6 +276,19 @@ export function assertSwapPsetPaysAndBalances(
   }
   if (expect.sendAmountSats <= 0n) {
     throw validationFailed("quoted sendAmountSats must be positive");
+  }
+  const declaredFees = expect.declaredFeesSats ?? 0n;
+  if (declaredFees < 0n) {
+    throw validationFailed("declaredFeesSats must not be negative");
+  }
+  if (declaredFees >= expect.recvAmountSats) {
+    // The dealer's own declared fees consume the whole receive side — the swap
+    // amount is too small for this route. Refuse with a diagnosis instead of a
+    // divergence error the caller can't act on.
+    throw validationFailed(
+      `declared fees (${declaredFees}) meet or exceed the quoted receive amount ` +
+        `(${expect.recvAmountSats}) — the swap amount is too small for this route.`
+    );
   }
   // SECONDARY SANITY CHECK — FAIL-CLOSED in the SDK (G3, diverges from frontend).
   if (inspection.netBalances === null) {
@@ -279,10 +310,18 @@ export function assertSwapPsetPaysAndBalances(
       `PSET net balance for the recv asset is non-positive (got ${net}, expected ~${expect.recvAmountSats}).`
     );
   }
+  // Tolerance is 1% of the QUOTED recv (price jitter); the floor additionally
+  // allows the dealer-declared fees to be netted from the recv output. The
+  // ceiling stays at quote + 1% — receiving MORE than quoted is as anomalous
+  // as receiving less.
   const tolerance = expect.recvAmountSats / 100n; // 1%
-  if (net < expect.recvAmountSats - tolerance || net > expect.recvAmountSats + tolerance) {
+  const floor = expect.recvAmountSats - declaredFees - tolerance;
+  const ceiling = expect.recvAmountSats + tolerance;
+  if (net < floor || net > ceiling) {
     throw validationFailed(
-      `PSET amount diverges >1% from the quote (got ${net}, expected ${expect.recvAmountSats}).`
+      `PSET amount diverges from the quote beyond the declared fees + 1% window ` +
+        `(got ${net}, quoted ${expect.recvAmountSats}, declared fees ${declaredFees}, ` +
+        `accepted [${floor}, ${ceiling}]).`
     );
   }
   // SEND-SIDE FAIL-CLOSED BOUND (§5.1/G3 hardening) — the recv checks above are
@@ -297,6 +336,7 @@ export function assertSwapPsetPaysAndBalances(
         "failing closed (§5.1/G3 change-diversion guard, no human at the preview screen)."
     );
   }
+  return net;
 }
 
 // ─── taker UTXO collection (port of getUtxos, wallet.js:2687-2719) ───────────
@@ -641,15 +681,37 @@ export class SwapQuoteStream {
       });
 
       const { pset } = await client.getQuote(quote.quoteId);
-      const signedPset = await signForeignPset(pset, (inspection) =>
-        assertSwapPsetPaysAndBalances(inspection, {
+      // Captured by the validate callback: the actual post-fee recv the PSET
+      // credits us (SideSwap's quoted recv is pre-fee — see declaredFeesSats).
+      let actualRecvSats: bigint | null = null;
+      const signedPset = await signForeignPset(pset, (inspection) => {
+        actualRecvSats = assertSwapPsetPaysAndBalances(inspection, {
           expectedScriptHex,
           recvAssetId,
           recvAmountSats: quote.recvAmountSats,
           fromAssetId,
-          sendAmountSats: quote.sendAmountSats
-        })
-      );
+          sendAmountSats: quote.sendAmountSats,
+          declaredFeesSats: quote.serverFeeSats + quote.fixedFeeSats
+        });
+      });
+
+      // The ForeignPsetSigner contract REQUIRES validate() to run before it
+      // signs (fail-closed, §5.1). The production signer honors it, but a
+      // future/custom signer that validated out-of-band could complete without
+      // invoking the callback — leaving actualRecvSats null. Refuse to broadcast
+      // or report an UNVERIFIED receipt rather than silently falling back to the
+      // dealer's PRE-fee quote figure (the multi-hop executor chains on this
+      // amount and would over-size the next leg's input).
+      if (actualRecvSats === null) {
+        throw new ConversionError(
+          "SWAP_VALIDATION_FAILED",
+          "the swap signer completed without running PSET validation — refusing to report an unverified receive amount"
+        );
+      }
+      // Post-fee net the validated PSET actually credits us — narrowed to a
+      // non-null bigint by the guard above (captured before the awaits below,
+      // which would otherwise reset the closure-assigned variable's narrowing).
+      const netRecvSats: bigint = actualRecvSats;
 
       // Account the SENT side at signing time (§4.5) — BEFORE taker_sign asks
       // SideSwap to broadcast (parity with send() recording before broadcast).
@@ -660,7 +722,9 @@ export class SwapQuoteStream {
         from: quote.from,
         to: quote.to,
         sendAmountSats: quote.sendAmountSats,
-        recvAmountSats: quote.recvAmountSats,
+        // What the validated PSET actually credits us (post-fee), not the
+        // dealer's pre-fee quote figure.
+        recvAmountSats: netRecvSats,
         brlCents
       };
     });

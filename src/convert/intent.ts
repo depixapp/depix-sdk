@@ -376,10 +376,35 @@ async function estimateLeg(leg: RouteLeg, amountIn: bigint, deps: IntentDeps): P
       });
       try {
         const quote = await stream.next();
-        const feeAssetKey = quote.feeAsset ? (MAINNET_ASSET_ID_TO_KEY[quote.feeAsset] ?? null) : null;
+        // SideSwap's recv_amount is PRE-fee: the dealer nets server_fee +
+        // fixed_fee out of the recv output in the PSET (observed live —
+        // mainnet e2e P0/P2, 2026-07-11). Surface the NET amount the wallet
+        // will actually be credited; a pre-fee figure here overstated the
+        // outcome and made quote() disagree with the executed result.
+        const declaredFees = quote.serverFeeSats + quote.fixedFeeSats;
+        const netRecv = quote.recvAmountSats - declaredFees;
+        if (netRecv <= 0n) {
+          return {
+            receivedSats: null,
+            feeSats: declaredFees,
+            feeAsset: null,
+            note: "declared fees meet or exceed the quoted receive — amount too small for this route"
+          };
+        }
+        // fee_asset comes from the start_quotes RESPONSE and the server may
+        // OMIT it; the fees are netted from the RECV side (observed), so an
+        // omitted fee asset defaults to the recv asset rather than reporting an
+        // unusable null. A PRESENT-but-unmapped id, however, stays null — an
+        // honest "unknown" (which suppresses estimatedFeeTotalSats downstream)
+        // rather than coercing it to `leg.to`, which would mislabel the fee
+        // asset and could sum fees denominated in different assets into a
+        // spurious same-asset total.
+        const feeAssetKey: AssetKey | null = quote.feeAsset
+          ? (MAINNET_ASSET_ID_TO_KEY[quote.feeAsset] ?? null)
+          : (leg.to as AssetKey);
         return {
-          receivedSats: quote.recvAmountSats,
-          feeSats: quote.serverFeeSats + quote.fixedFeeSats,
+          receivedSats: netRecv,
+          feeSats: declaredFees,
           feeAsset: feeAssetKey
         };
       } finally {
