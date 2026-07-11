@@ -41,14 +41,30 @@ function pidIsAlive(pid: number): boolean {
  * recorded holder is from a different boot ⇒ definitely stale). Linux exposes a
  * stable UUID; elsewhere we approximate from the boot time.
  */
+/**
+ * Boot id when the runtime cannot determine the boot (sandboxes deny the
+ * uv_uptime / uv_os_gethostname syscalls with EPERM — e.g. macOS seatbelt,
+ * hardened containers; mainnet e2e P1, 2026-07-11). sameBoot() treats this
+ * value as SAME-boot against anything: we can never prove a different boot, so
+ * stale-lock detection degrades to PID-liveness only — conservative (a live
+ * holder's lock is never stolen), and create()/open() no longer crash.
+ */
+const BOOT_ID_UNKNOWN = "unknown";
+
 function bootId(): string {
   try {
     return `linux:${readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim()}`;
   } catch {
-    // No /proc (macOS): derive the boot epoch (seconds). uptime()/Date.now()
-    // jitter is sub-second, far below any real reboot gap (compared with a
-    // tolerance in sameBoot()), so this is a stable per-boot value.
+    /* no /proc (macOS) — fall through to the time-based derivation */
+  }
+  try {
+    // Derive the boot epoch (seconds). uptime()/Date.now() jitter is
+    // sub-second, far below any real reboot gap (compared with a tolerance in
+    // sameBoot()), so this is a stable per-boot value.
     return `time:${hostname()}:${Math.round(Date.now() / 1000 - uptime())}`;
+  } catch {
+    // Sandboxed runtime denied the syscall(s) — see BOOT_ID_UNKNOWN.
+    return BOOT_ID_UNKNOWN;
   }
 }
 
@@ -57,10 +73,13 @@ function bootId(): string {
  * the time-based fallback, within a 60s tolerance (absorbs derivation jitter
  * while staying far under any reboot gap). Unparseable/mismatched ⇒ treated as
  * DIFFERENT boot only when both are decisively parseable — otherwise we stay
- * conservative and never break a live lock.
+ * conservative and never break a live lock. An UNKNOWN id (sandboxed runtime)
+ * is never decisive, so it compares as SAME boot — the caller then relies on
+ * PID liveness alone rather than stealing a possibly-live lock.
  */
 function sameBoot(a: string, b: string): boolean {
   if (a === b) return true;
+  if (a === BOOT_ID_UNKNOWN || b === BOOT_ID_UNKNOWN) return true;
   const sa = a.startsWith("time:") ? Number.parseInt(a.slice(a.lastIndexOf(":") + 1), 10) : null;
   const sb = b.startsWith("time:") ? Number.parseInt(b.slice(b.lastIndexOf(":") + 1), 10) : null;
   if (sa !== null && sb !== null && Number.isFinite(sa) && Number.isFinite(sb)) {

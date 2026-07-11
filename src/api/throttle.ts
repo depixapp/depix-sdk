@@ -17,9 +17,14 @@ export type SleepFn = (ms: number) => Promise<void>;
 
 export const defaultSleep: SleepFn = (ms) =>
   new Promise((resolve) => {
-    // Never keep the event loop alive just to honor a throttle delay.
-    const timer = setTimeout(resolve, ms);
-    if (typeof timer === "object" && typeof timer.unref === "function") timer.unref();
+    // The timer MUST hold the event loop: every consumer of this sleep is an
+    // actively-awaiting caller (throttle acquire(), waitForDeposit/Withdrawal
+    // polls, retry backoff) — there is no fire-and-forget path. An earlier
+    // .unref() here let Node drain the loop mid-await when the sleep was the
+    // only live handle, killing `node -e` one-liners with exit 13
+    // ("unsettled top-level await") in the middle of waitForDeposit()
+    // (mainnet e2e P3, 2026-07-11).
+    setTimeout(resolve, ms);
   });
 
 export interface ThrottleOptions {

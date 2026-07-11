@@ -1869,6 +1869,11 @@ export class DepixWallet {
    * layer touches the immutable Eulen flow. deposit() does NOT pass through the
    * guardrail — it is an INFLOW (§4.3). The QR is paid by the human OWNER; the
    * DePix lands here and appears on the next sync().
+   *
+   * The DePix CREDITED is the paid amount MINUS the provider's fees (a fixed
+   * fee plus a percentage — e.g. a R$31.63 deposit lands ~R$30.01). Success is
+   * waitForDeposit() reaching `depix_sent`; do NOT assert the balance rose by
+   * exactly `amountCents`.
    */
   async deposit(params: DepositParams): Promise<DepositResult> {
     this.assertOpen();

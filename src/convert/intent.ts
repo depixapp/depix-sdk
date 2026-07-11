@@ -376,10 +376,30 @@ async function estimateLeg(leg: RouteLeg, amountIn: bigint, deps: IntentDeps): P
       });
       try {
         const quote = await stream.next();
-        const feeAssetKey = quote.feeAsset ? (MAINNET_ASSET_ID_TO_KEY[quote.feeAsset] ?? null) : null;
+        // SideSwap's recv_amount is PRE-fee: the dealer nets server_fee +
+        // fixed_fee out of the recv output in the PSET (observed live —
+        // mainnet e2e P0/P2, 2026-07-11). Surface the NET amount the wallet
+        // will actually be credited; a pre-fee figure here overstated the
+        // outcome and made quote() disagree with the executed result.
+        const declaredFees = quote.serverFeeSats + quote.fixedFeeSats;
+        const netRecv = quote.recvAmountSats - declaredFees;
+        if (netRecv <= 0n) {
+          return {
+            receivedSats: null,
+            feeSats: declaredFees,
+            feeAsset: null,
+            note: "declared fees meet or exceed the quoted receive — amount too small for this route"
+          };
+        }
+        // fee_asset comes from the start_quotes RESPONSE and the server may
+        // omit it; the fees are netted from the RECV side (observed), so
+        // default to the recv asset rather than reporting an unusable null.
+        const feeAssetKey = quote.feeAsset
+          ? (MAINNET_ASSET_ID_TO_KEY[quote.feeAsset] ?? (leg.to as AssetKey))
+          : (leg.to as AssetKey);
         return {
-          receivedSats: quote.recvAmountSats,
-          feeSats: quote.serverFeeSats + quote.fixedFeeSats,
+          receivedSats: netRecv,
+          feeSats: declaredFees,
           feeAsset: feeAssetKey
         };
       } finally {

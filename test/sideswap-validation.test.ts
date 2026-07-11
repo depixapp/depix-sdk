@@ -211,3 +211,73 @@ describe("assertPegOutRecipient — peg-out output pin (§5.2)", () => {
     ).toThrow();
   });
 });
+
+describe("assertSwapPsetPaysAndBalances — fee-aware recv window (mainnet e2e P0, 2026-07-11)", () => {
+  // SideSwap's quoted recv_amount is PRE-fee: the dealer nets server_fee +
+  // fixed_fee out of the recv output. Live repro: quote 5945, PSET 5853
+  // (fixed network fee ≈ 92 → 1.55% > the naive 1% window) — every small swap
+  // aborted on both convert() and the advanced stream until this window
+  // learned about the declared fees.
+  const QUOTED = 5945n;
+  const FEES = 92n;
+  const expectWithFees = {
+    ...expectValid,
+    recvAmountSats: QUOTED,
+    declaredFeesSats: FEES
+  };
+  const netOf = (n: bigint): SwapPsetInspection => inspection({ netBalances: new Map([[LBTC, n]]) });
+
+  it("REGRESSION: accepts the live-observed post-fee net (5853 for quote 5945, fees 92)", () => {
+    expect(() => assertSwapPsetPaysAndBalances(netOf(5853n), expectWithFees)).not.toThrow();
+  });
+
+  it("returns the ACTUAL post-fee net the PSET credits (callers must not report the pre-fee quote)", () => {
+    expect(assertSwapPsetPaysAndBalances(netOf(5853n), expectWithFees)).toBe(5853n);
+    expect(assertSwapPsetPaysAndBalances(inspection(), expectValid)).toBe(RECV);
+  });
+
+  it("accepts the exact window edges [quote − fees − 1%, quote + 1%]", () => {
+    const tol = QUOTED / 100n; // 59
+    expect(() => assertSwapPsetPaysAndBalances(netOf(QUOTED - FEES - tol), expectWithFees)).not.toThrow();
+    expect(() => assertSwapPsetPaysAndBalances(netOf(QUOTED + tol), expectWithFees)).not.toThrow();
+  });
+
+  it("FAIL-CLOSED: aborts one base unit beyond either edge — fees never widen the window open-endedly", () => {
+    const tol = QUOTED / 100n;
+    expect(() => assertSwapPsetPaysAndBalances(netOf(QUOTED - FEES - tol - 1n), expectWithFees)).toThrow();
+    expect(() => assertSwapPsetPaysAndBalances(netOf(QUOTED + tol + 1n), expectWithFees)).toThrow();
+    try {
+      assertSwapPsetPaysAndBalances(netOf(QUOTED - FEES - tol - 1n), expectWithFees);
+    } catch (e) {
+      expect(isSwapFail(e)).toBe(true);
+    }
+  });
+
+  it("omitted / zero declaredFeesSats keeps the strict legacy ±1% window", () => {
+    expect(() =>
+      assertSwapPsetPaysAndBalances(inspection({ netBalances: new Map([[LBTC, 989n]]) }), expectValid)
+    ).toThrow();
+    expect(() =>
+      assertSwapPsetPaysAndBalances(
+        inspection({ netBalances: new Map([[LBTC, 989n]]) }),
+        { ...expectValid, declaredFeesSats: 0n }
+      )
+    ).toThrow();
+  });
+
+  it("refuses with a 'too small' diagnosis when declared fees meet/exceed the quoted recv", () => {
+    const tiny = { ...expectValid, recvAmountSats: 90n, declaredFeesSats: 92n };
+    expect(() => assertSwapPsetPaysAndBalances(netOf(1n), tiny)).toThrow(/too small/);
+    try {
+      assertSwapPsetPaysAndBalances(netOf(1n), tiny);
+    } catch (e) {
+      expect(isSwapFail(e)).toBe(true);
+    }
+  });
+
+  it("rejects negative declaredFeesSats", () => {
+    expect(() =>
+      assertSwapPsetPaysAndBalances(inspection(), { ...expectValid, declaredFeesSats: -1n })
+    ).toThrow();
+  });
+});

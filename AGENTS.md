@@ -113,6 +113,9 @@ async waitForWithdrawal(id: string, options: WaitOptions = {}): Promise<StatusRe
 - `deposit()` creates a Pix QR (`qrCopyPaste`) that the **human owner** pays —
   you have no bank account. It fills the receive address with this wallet's own
   fresh address. Inflow → no guardrail. R$ 5–3000 server-side.
+- **The DePix credited is NET of provider fees** (fixed + percentage — e.g. a
+  R$31.63 deposit lands ~R$30.01). Success = `waitForDeposit()` reaching
+  `depix_sent`; never assert the balance rose by exactly `amountCents`.
 - `payerTaxNumber` = CPF/CNPJ of the QR **payer**; `recipientTaxNumber` = CPF/CNPJ
   of the destination Pix key **holder**. Two different people — never reuse one
   for the other.
@@ -206,6 +209,10 @@ try {
   Pass the multi-hop Boltz route id explicitly.
 - `RouteQuote` = `{ id, legs, hops, custodial, estimatedReceivedSats, estimatedFeeTotalSats, feeAsset, estimateComplete, notes }`
   — estimates are best-effort; an unestimatable leg yields nulls + a note, never a throw.
+- `estimatedReceivedSats` is **NET of the provider's declared fees** — it is
+  what the wallet will actually be credited. If the declared fees consume the
+  whole receive side (a very small conversion), the route quotes `null` with a
+  "too small for this route" note — convert a larger amount.
 - `ConvertResult` = `{ route, status, txids, receivedSats, custodial, trackingId?, funding?, nextStep? }`
   with `status: "settled" | "pending" | "awaiting_funding" | "refunded" | "refund_pending" | "failed"`.
   On timeout you get `"pending"` + an actionable `nextStep` — **funds in flight
