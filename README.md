@@ -334,4 +334,7 @@ The published package contains `dist/` (compiled JS + types), `README.md` and
 
 ## License
 
-MIT — see [LICENSE](./LICENSE).
+**AGPL-3.0-only** — see [LICENSE](./LICENSE). The network-copyleft applies: a
+modified version offered over a network must make its source available under the
+same terms. For use in a closed-source or commercial product without the AGPL
+obligations, a separate commercial license is available — contact DePix.
