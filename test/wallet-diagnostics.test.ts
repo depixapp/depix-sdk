@@ -5,14 +5,15 @@
 // getPending() applies verbatim: NEVER any key material — no seed, mnemonic,
 // passphrase or descriptor in the snapshot.
 import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DepixWallet } from "../src/wallet.js";
+import { DepixWallet, redactHomePath } from "../src/wallet.js";
 import { descriptorFromMnemonic } from "../src/engine/lwk.js";
 import type { EsploraClientLike } from "../src/sync/sync.js";
 import { PendingWithdrawals } from "../src/pending.js";
 import { SideShiftStore, type StoredSideShift } from "../src/convert/sideshift-store.js";
+import { ConversionPlanStore, type StoredConversionPlan } from "../src/convert/plan-store.js";
 import { isDepixSdkError } from "../src/errors.js";
 
 const PASSPHRASE = "correct-horse-battery-staple";
@@ -130,6 +131,37 @@ describe("wallet.diagnostics() — the support snapshot", () => {
     });
   });
 
+  // A pending conversion plan must land in `plans` via the EXPLICIT
+  // `else if (rail === "plan")` branch — not a catch-all that would silently
+  // absorb any (future) unrecognized rail into the plans counter.
+  it("counts a pending conversion plan into plans (explicit rail branch)", async () => {
+    wallet = await restore({
+      resumePendingWithdrawalsOnOpen: false,
+      resumePendingConversionsOnOpen: false
+    });
+    const salt = JSON.parse(await readFile(join(dataDir, "wallet.json"), "utf8")).salt as string;
+    const plan: StoredConversionPlan = {
+      planId: "plan_1",
+      intent: { from: "BTC", to: "USDT", network: "tron", amountSats: 100_000n },
+      route: { id: "route-x", legs: [], hops: 2, custodial: false },
+      params: {},
+      currentLegIndex: 0,
+      legResults: [null],
+      state: "pending",
+      createdAt: 1_720_000_000_000
+    };
+    await new ConversionPlanStore({ dataDir, passphrase: PASSPHRASE, saltB64: salt }).put(plan);
+
+    const diag = await wallet.diagnostics();
+    expect(diag.pending).toEqual({
+      withdrawals: 0,
+      boltzSwaps: 0,
+      pegins: 0,
+      sideshiftShifts: 0,
+      plans: 1
+    });
+  });
+
   it("NEVER leaks key material — no mnemonic word, passphrase or descriptor", async () => {
     wallet = await restore();
     const diag = await wallet.diagnostics();
@@ -165,5 +197,56 @@ describe("wallet.diagnostics() — the support snapshot", () => {
     await expect(wallet.diagnostics()).rejects.toSatisfy((err: unknown) =>
       isDepixSdkError(err, "WALLET_NOT_FOUND")
     );
+  });
+
+  // The dataDir surfaced by diagnostics() (and echoed by the wallet_diagnostics
+  // MCP tool) has its home-dir prefix redacted to `~` so the OS username the
+  // absolute path routinely embeds does not leak to an MCP host / support.
+  it("redacts the home-dir prefix of dataDir to ~ in the snapshot", async () => {
+    // A real dataDir UNDER the home dir (mkdtemp keeps it isolated + cleaned).
+    const homeDataDir = await mkdtemp(join(homedir(), ".depix-sdk-diag-home-"));
+    let homeWallet: DepixWallet | undefined;
+    try {
+      homeWallet = await DepixWallet.restore({
+        dataDir: homeDataDir,
+        passphrase: PASSPHRASE,
+        mnemonic: KNOWN_MNEMONIC,
+        sync: {
+          clientFactory: fakeClient,
+          providers: [{ name: "p0", url: "http://localhost:1", waterfalls: false }]
+        }
+      });
+      const diag = await homeWallet.diagnostics();
+      expect(diag.dataDir.startsWith("~")).toBe(true);
+      expect(diag.dataDir).toBe(redactHomePath(homeDataDir));
+      expect(diag.dataDir).not.toContain(homedir()); // no absolute home prefix / username leaked
+    } finally {
+      await homeWallet?.close().catch(() => {});
+      await rm(homeDataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("redactHomePath — home prefix down to ~", () => {
+  it("replaces an exact homedir with ~", () => {
+    expect(redactHomePath(homedir())).toBe("~");
+  });
+
+  it("replaces the homedir prefix with ~ on a nested path", () => {
+    const p = join(homedir(), ".depix-wallet", "sub");
+    const red = redactHomePath(p);
+    expect(red.startsWith("~")).toBe(true);
+    expect(red).not.toContain(homedir());
+    expect(red).toBe(join("~", ".depix-wallet", "sub"));
+  });
+
+  it("leaves a path outside the home dir untouched", () => {
+    const p = join(tmpdir(), "depix-outside-home");
+    expect(redactHomePath(p)).toBe(p);
+  });
+
+  it("is boundary-safe: a sibling sharing the home prefix is NOT redacted", () => {
+    const sibling = homedir() + "-sibling";
+    expect(redactHomePath(sibling)).toBe(sibling);
   });
 });

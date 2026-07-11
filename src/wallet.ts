@@ -14,7 +14,7 @@
 // `mnemonicSecured: true`.
 
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { base64 } from "@scure/base";
 import type { Wollet } from "lwk_node";
 import { ASSETS, MAINNET_ASSET_ID_TO_KEY, type AssetKey } from "./assets.js";
@@ -472,6 +472,25 @@ export type PendingItem =
 
 function resolveDataDir(explicit?: string): string {
   return explicit ?? process.env.DEPIX_WALLET_DIR ?? join(homedir(), ".depix-wallet");
+}
+
+/**
+ * Redact the OS home-directory prefix of an absolute path down to `~`. Used
+ * ONLY for the dataDir VALUE surfaced by diagnostics() / the wallet_diagnostics
+ * MCP tool: an absolute dataDir routinely embeds the OS username, which becomes
+ * privacy-sensitive once the snapshot reaches an MCP host or is pasted into a
+ * support thread. Not key material — the path is still support-useful, just
+ * without the username. The real dataDir is kept intact everywhere else (dir
+ * lock, stores, error messages). Boundary-safe: only a full leading path
+ * segment is redacted (never `/home/bob-2` when home is `/home/bob`).
+ */
+export function redactHomePath(p: string): string {
+  const home = homedir();
+  if (!home) return p;
+  if (p === home) return "~";
+  const prefix = home.endsWith(sep) ? home : home + sep;
+  if (p.startsWith(prefix)) return "~" + sep + p.slice(prefix.length);
+  return p;
 }
 
 function resolvePassphrase(explicit?: string): string | undefined {
@@ -1184,21 +1203,24 @@ export class DepixWallet {
    * Deep re-scan (PR-D). Serialized under the op mutex so no signing operation
    * can hold the stale Wollet across the swap. Ordering is fail-safe:
    *   1. join any in-flight Wollet build (never abandon a half-built instance);
-   *   2. drop the persisted scan cache — rescan means "trust nothing cached"
-   *      (the cache is rebuilt by this very scan; §2.5 calls it recoverable);
-   *   3. cold-scan a VIRGIN wollet via the engine's dedicated rescan pass
-   *      (never joined onto an in-flight incremental scan of the stale state);
+   *   2. hand the cache-drop to the engine's rescan pass as `beforeScan` — it
+   *      runs AFTER the in-flight incremental scan of the stale state is drained
+   *      and after the pass claims the sync slot, so a concurrent non-mutexed
+   *      sync() cannot persist an orphan chain-link across the clear (rescan
+   *      means "trust nothing cached"; the cache is rebuilt by this very scan,
+   *      §2.5 recoverable);
+   *   3. cold-scan a VIRGIN wollet via that same rescan pass (never joined onto
+   *      an in-flight incremental scan of the stale state);
    *   4. only on success, swap the fresh wollet in and free the stale one — a
    *      failed rescan leaves the current in-memory state fully usable.
    */
   private async rescanFromZero(): Promise<{ updated: boolean }> {
     return this.opMutex.runExclusive(async () => {
       await this.ensureWollet();
-      await this.updateStore.clearAll();
       const fresh = buildWollet(this.requireDescriptor());
       let result: { updated: boolean };
       try {
-        result = await this.syncEngine.rescan(fresh);
+        result = await this.syncEngine.rescan(fresh, () => this.updateStore.clearAll());
       } catch (err) {
         try {
           fresh.free();
@@ -1905,11 +1927,20 @@ export class DepixWallet {
       plans: 0
     };
     for (const item of await this.getPending()) {
-      if (item.rail === "withdrawal") pending.withdrawals++;
-      else if (item.rail === "boltz") pending.boltzSwaps++;
-      else if (item.rail === "pegin") pending.pegins++;
-      else if (item.rail === "sideshift") pending.sideshiftShifts++;
-      else pending.plans++;
+      const rail = item.rail;
+      if (rail === "withdrawal") pending.withdrawals++;
+      else if (rail === "boltz") pending.boltzSwaps++;
+      else if (rail === "pegin") pending.pegins++;
+      else if (rail === "sideshift") pending.sideshiftShifts++;
+      else if (rail === "plan") pending.plans++;
+      else {
+        // Compile-time exhaustiveness: a rail added to PendingItem without a
+        // branch here fails tsc (`rail` narrows to never). At runtime a support
+        // snapshot must not throw, so an unknown rail is logged and SKIPPED —
+        // never silently miscounted into plans.
+        const _unknownRail: never = rail;
+        this.logger.warn("diagnostics: skipping pending item with unknown rail", String(_unknownRail));
+      }
     }
 
     // Best effort: the readout needs the seed-derived state key, which a
@@ -1925,7 +1956,9 @@ export class DepixWallet {
     return {
       sdkVersion: SDK_VERSION,
       lwkVersion: LWK_VERSION,
-      dataDir: this.dataDir,
+      // Home-prefix redacted to `~` — the value leaves the process (MCP host /
+      // support). The real dataDir stays intact everywhere else in this class.
+      dataDir: redactHomePath(this.dataDir),
       backupConfirmed: this.isBackupConfirmed(),
       hasSeed: Boolean(this.file.encryptedSeed),
       apiKeyConfigured: this.api !== null,
