@@ -51,6 +51,7 @@ async function main(): Promise<void> {
       boltz: null,
       pegin: { pending: 0, cleared: 0, failed: 0 },
       sideshift: { checked: 0, refreshed: 0, failed: 0 },
+      plans: { checked: 0, advanced: 0, completed: 0, needsReview: 0, discarded: 0, failed: 0 },
     };
   }
 

@@ -230,16 +230,17 @@ export class WithdrawContractError extends DepixSdkError {
  *
  * The intent-layer subset (PR-B, wallet.quote()/wallet.convert() — every one of
  * these carries an actionable `details.nextStep`, G3):
- *   MULTIPLE_ROUTES_AVAILABLE  — the intent trio does not resolve to exactly one
- *                              single-hop routing-table row (two entry rails, an
- *                              inbound intent with an unknown source network, or
- *                              only multi-hop candidates). The SDK never chooses:
+ *   MULTIPLE_ROUTES_AVAILABLE  — the intent trio resolves to more than one
+ *                              candidate (two entry rails, an inbound intent
+ *                              with an unknown source network, several
+ *                              compositions). The SDK never chooses:
  *                              `details.routes` lists every candidate; quote()
- *                              compares them and convert({route}) executes one.
- *   MULTI_HOP_NOT_YET_AUTOMATED — an explicitly chosen route needs >1 hop;
- *                              automated multi-hop (plan + recovery) ships in a
- *                              later release (PR-C). The nextStep teaches the
- *                              working fallback: one convert() per leg.
+ *                              compares them and convert({route}) executes one
+ *                              (multi-hop routes run end to end behind a
+ *                              persisted plan — PR-C).
+ *   PLAN_VALIDATION_FAILED     — a stored multi-hop conversion plan failed
+ *                              AES-GCM authentication (tampered) — discarded,
+ *                              never acted upon (PR-C).
  *   ROUTE_NOT_FOUND            — a `route` id that is not among the intent's
  *                              candidates (details.availableRouteIds lists them).
  */

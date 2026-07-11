@@ -228,6 +228,19 @@ export class Guardrails {
   }
 
   /**
+   * Allowlist-only check (§4.3) for a multi-hop plan CONTINUATION leg whose
+   * VALUE was already counted at the plan's first outflow leg (count-once,
+   * PR-C). The per-tx/daily ceilings are deliberately skipped — re-counting
+   * would double-charge the same money — but the destination classes are NOT:
+   * every leg's final destinations still pass the allowlist when it is ON.
+   * Callers (the wallet's hooks) only route here after authenticating the plan
+   * against the encrypted plan store; everything else uses enforce().
+   */
+  checkAllowlist(destinations: readonly GuardrailDestination[]): void {
+    this.allowlist.check(destinations);
+  }
+
+  /**
    * Account a signed operation into the rolling window (§4.5 — at SIGNING time,
    * not settlement). Prunes entries older than 24h; authenticated + durable
    * write; sets the marker on first write.

@@ -199,6 +199,14 @@ function conversionsResumeToOutput(c: ConversionResumeSummary) {
       : null,
     pegin: { pending: c.pegin.pending, cleared: c.pegin.cleared, failed: c.pegin.failed },
     sideshift: { checked: c.sideshift.checked, refreshed: c.sideshift.refreshed, failed: c.sideshift.failed },
+    plans: {
+      checked: c.plans.checked,
+      advanced: c.plans.advanced,
+      completed: c.plans.completed,
+      needs_review: c.plans.needsReview,
+      discarded: c.plans.discarded,
+      failed: c.plans.failed,
+    },
   };
 }
 
@@ -556,6 +564,12 @@ function pendingItemToOutput(item: PendingItem) {
     case "sideshift":
       out.shift_type = item.shiftType;
       out.network = item.network;
+      break;
+    case "plan":
+      out.route_id = item.routeId;
+      out.hops = item.hops;
+      out.current_leg = item.currentLeg;
+      if (item.note !== undefined) out.note = item.note;
       break;
   }
   return out;
