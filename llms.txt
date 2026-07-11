@@ -1,0 +1,62 @@
+# @depixapp/sdk
+
+> Non-custodial Liquid wallet SDK for AI agents (Node ≥ 22.4). The agent holds
+> its own seed and signs locally to pay/receive over Pix (DePix), swap the three
+> Liquid assets (DePix, L-BTC, USDt), and bridge to Lightning, BTC and EVM/Tron —
+> behind an intent-first `convert()`/`quote()` surface with owner-set,
+> runtime-immutable guardrails. Ships a local stdio MCP server
+> (`depix-wallet-mcp`, 23 `wallet_*` tools).
+
+Key facts: all amounts are bigint 8-decimal base units ("sats"); DePix is
+pegged 1:1 to BRL (1 BRL cent = 1_000_000 sats); Pix flows use integer BRL
+cents. The agent states the RESULT (`{ from, to, network, amount }`) — the SDK
+routes, settles and recovers; it never picks among multiple candidate routes
+(`MULTIPLE_ROUTES_AVAILABLE` → compare via `quote()`, pass `route`). The only
+custodial path (SideShift USDt cross-network) is always flagged
+`custodial: true`. Errors carry a stable `code` and an actionable
+`details.nextStep`.
+
+## Docs
+
+- [AGENTS.md](./AGENTS.md): the agent manifest — mental model, exact API
+  signatures, routing table, error catalog with remediations, guardrails,
+  custody, env vars, MCP tool list, recipes. Start here.
+- [README.md](./README.md): human-oriented guide — quickstarts (create/backup,
+  Pix deposit/withdraw, MCP setup), fleet-operator backup envelope, publishing.
+
+## Core surface (details in AGENTS.md §3)
+
+- [Lifecycle + backup gate](./AGENTS.md#lifecycle--backup-gate):
+  `DepixWallet.create()/open()/restore()`; no receive address before the seed
+  backup is confirmed (`BACKUP_REQUIRED`).
+- [Pix on/off-ramp](./AGENTS.md#pix-onoff-ramp-needs-depix_api_key-else-api_key_required):
+  `deposit()` (owner pays the QR), `withdraw()`, `waitForDeposit()/waitForWithdrawal()`
+  — the waiters are UNBOUNDED unless you pass `timeoutMs`; always bound human waits.
+- [convert()/quote() — primary surface](./AGENTS.md#convert--quote--the-primary-conversion-surface):
+  intent trio, routing table (SideSwap/Boltz/SideShift legs), multi-hop
+  crash-safe plans, `custodial: true` disclosure.
+- [Recovery](./AGENTS.md#recovery): `recover()` + `getPending()` — idempotent,
+  auto-runs on `open()`, never starts a new payment.
+- [advanced.*](./AGENTS.md#advanced--the-power-user-escape-hatch):
+  `listUtxos`/`selectCoins`/`sendMany` + per-provider namespaces; no raw PSET
+  surface by design.
+- [Errors](./AGENTS.md#4-errors--always-branch-on-errcode): guardrail limits,
+  `QUOTES_UNAVAILABLE` (fail-closed), `MULTIPLE_ROUTES_AVAILABLE`,
+  `INSUFFICIENT_FUNDS`, `POLL_TIMEOUT`, `API_KEY_REQUIRED`…
+- [Guardrails](./AGENTS.md#5-guardrails--the-owners-not-yours): R$ 100/tx +
+  R$ 500 rolling-24h + allowlist; immutable at runtime; multi-hop counts once.
+- [Environment variables](./AGENTS.md#7-environment-variables): `DEPIX_API_KEY`
+  (`sk_test_`/`sk_live_`), `DEPIX_WALLET_PASSPHRASE`, `DEPIX_WALLET_DIR`,
+  `DEPIX_API_BASE`, `DEPIX_GUARDRAIL_*`; `SIDESHIFT_AFFILIATE_ID` is
+  baked at build time only.
+- [Local MCP](./AGENTS.md#8-local-mcp-server--depix-wallet-mcp):
+  `npx -p @depixapp/sdk depix-wallet-mcp` — 23 tools incl. `wallet_quote` /
+  `wallet_convert`; stdout = JSON-RPC, stderr = redacted logs; no seed-export
+  or guardrail-mutation tool exists.
+
+## Optional
+
+- [Prerequisites & limits](./AGENTS.md#9-prerequisites--platform-limits):
+  `sk_live_` needs admin-granted `merchant.api_access` (+ WhatsApp verification
+  when enforced); 2/min writes, 30/min status reads.
+- [License](./README.md#license): AGPL-3.0-only; commercial license available.

@@ -1,5 +1,9 @@
 # @depixapp/sdk
 
+> **Agents: start here → [AGENTS.md](./AGENTS.md)** — the machine-first manifest
+> (mental model, exact signatures, routing table, error catalog, guardrails,
+> env vars, MCP tools). A concise link index lives in [llms.txt](./llms.txt).
+
 Non-custodial Liquid wallet SDK for AI agents. An agent runs a full wallet in
 Node — its own seed, signing locally — to **pay and receive over Pix/DePix**,
 hold and convert the three Liquid assets (DePix, L-BTC, USDt), and buy gift
