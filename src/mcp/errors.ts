@@ -215,6 +215,48 @@ function hasSdkAuthoredMessage(err: DepixSdkError): boolean {
   return SDK_AUTHORED_MESSAGE_ERRORS.some((cls) => err instanceof cls);
 }
 
+/**
+ * ALLOWLIST-shaped reshape of MULTIPLE_ROUTES_AVAILABLE's candidate routes
+ * (intent.ts routeForDetails) so a stateless wallet_convert caller can choose
+ * without a second round trip. sanitizeDetails drops arrays/objects wholesale,
+ * so the candidates need this explicit, field-by-field allowlist: every value
+ * is SDK-constructed from closed enums (provider/method/asset/network), and
+ * only known keys with the expected primitive type pass — anything else is
+ * dropped, never forwarded (§6.2e).
+ */
+function sanitizeCandidateRoutes(value: unknown): Array<Record<string, unknown>> | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const routes: Array<Record<string, unknown>> = [];
+  for (const entry of value) {
+    if (typeof entry !== "object" || entry === null) continue;
+    const rec = entry as Record<string, unknown>;
+    const id = truncate(rec.id);
+    if (id === undefined) continue;
+    const legsRaw = Array.isArray(rec.legs) ? rec.legs : [];
+    const legs: Array<Record<string, unknown>> = [];
+    for (const legEntry of legsRaw) {
+      if (typeof legEntry !== "object" || legEntry === null) continue;
+      const leg = legEntry as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const key of ["provider", "method", "from", "to", "network"] as const) {
+        const v = truncate(leg[key]);
+        if (v !== undefined) out[key] = v;
+      }
+      const fromNetwork = truncate(leg.fromNetwork);
+      if (fromNetwork !== undefined) out.from_network = fromNetwork;
+      if (typeof leg.custodial === "boolean") out.custodial = leg.custodial;
+      legs.push(out);
+    }
+    routes.push({
+      id,
+      ...(asInt(rec.hops) !== undefined ? { hops: asInt(rec.hops) } : {}),
+      ...(typeof rec.custodial === "boolean" ? { custodial: rec.custodial } : {}),
+      legs,
+    });
+  }
+  return routes.length > 0 ? routes : undefined;
+}
+
 /** Canned host-facing message for a non-allowlisted (provider-transport) error —
  *  a function of `error.code` ONLY; the raw provider text goes to `data`. */
 function cannedTransportMessage(code: string): string {
@@ -272,6 +314,18 @@ export function mapToolError(err: unknown): ToolError {
       const data: Record<string, unknown> = { code: err.code, retryable: false };
       const details = sanitizeDetails(err.details);
       if (details) data.details = details;
+      // wallet_convert refuses to choose among several candidate routes (the
+      // locked no-policy rule). The tool is STATELESS, so the candidates must
+      // ride in the error itself: surface them (allowlist-shaped) plus an
+      // actionable next_step — the agent compares via wallet_quote and re-calls
+      // wallet_convert with `route` set.
+      if (err.code === "MULTIPLE_ROUTES_AVAILABLE") {
+        const routes = sanitizeCandidateRoutes(err.details?.routes);
+        if (routes) data.routes = routes;
+        data.next_step =
+          "Call wallet_quote with the same from/to/network/amount_sats to compare these candidate routes " +
+          "(fees, receipts, custodial flags), then call wallet_convert again with `route` set to your chosen route id.";
+      }
       return new ToolError(err.message, err.code, { data });
     }
 

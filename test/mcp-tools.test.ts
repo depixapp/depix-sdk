@@ -193,3 +193,143 @@ describe("wallet_get_guardrails", () => {
     });
   });
 });
+
+describe("wallet_quote", () => {
+  it("maps the trio + amount_sats → ConvertIntent and reshapes every bigint estimate to a string", async () => {
+    const wallet = new FakeWallet();
+    const { client } = await connectWallet({ wallet });
+    const out = sc(
+      await client.callTool({
+        name: "wallet_quote",
+        arguments: { from: "DEPIX", to: "USDT", network: "ethereum", amount_sats: "100000000" },
+      }),
+    );
+    expect(wallet.lastArgs("quote")).toEqual([
+      { from: "DEPIX", to: "USDT", network: "ethereum", amount: 100_000_000n },
+    ]);
+    expect(out.routes).toEqual([
+      {
+        id: "sideswap.swap:DEPIX@liquid>LBTC@liquid",
+        hops: 1,
+        custodial: false,
+        estimated_received_sats: "900",
+        estimated_fee_total_sats: "31",
+        fee_asset: "LBTC",
+        estimate_complete: true,
+        notes: [],
+        legs: [
+          {
+            provider: "sideswap",
+            method: "swap",
+            from: "DEPIX",
+            from_network: "liquid",
+            to: "LBTC",
+            network: "liquid",
+            custodial: false,
+            estimated_received_sats: "900",
+            estimated_fee_sats: "31",
+            fee_asset: "LBTC",
+          },
+        ],
+      },
+    ]);
+  });
+
+  it("forwards from_network as fromNetwork (origin-rail narrowing)", async () => {
+    const wallet = new FakeWallet();
+    const { client } = await connectWallet({ wallet });
+    await client.callTool({
+      name: "wallet_quote",
+      arguments: { from: "BTC", to: "LBTC", from_network: "lightning", amount_sats: "25000" },
+    });
+    expect(wallet.lastArgs("quote")).toEqual([
+      { from: "BTC", to: "LBTC", fromNetwork: "lightning", amount: 25_000n },
+    ]);
+  });
+});
+
+describe("wallet_convert", () => {
+  it("maps args → ConvertParams (route/address/wait/timeout_seconds→ms) and reshapes the result", async () => {
+    const wallet = new FakeWallet();
+    const { client } = await connectWallet({ wallet });
+    const out = sc(
+      await client.callTool({
+        name: "wallet_convert",
+        arguments: {
+          from: "DEPIX",
+          to: "USDT",
+          network: "ethereum",
+          amount_sats: "100000000",
+          route: "sideswap.swap:DEPIX@liquid>USDT@liquid+sideshift.send:USDT@liquid>USDT@ethereum",
+          address: "0x" + "a".repeat(40),
+          refund_address: "lq1refund",
+          wait: true,
+          timeout_seconds: 120,
+        },
+      }),
+    );
+    expect(wallet.lastArgs("convert")).toEqual([
+      {
+        from: "DEPIX",
+        to: "USDT",
+        network: "ethereum",
+        amount: 100_000_000n,
+        route: "sideswap.swap:DEPIX@liquid>USDT@liquid+sideshift.send:USDT@liquid>USDT@ethereum",
+        address: "0x" + "a".repeat(40),
+        refundAddress: "lq1refund",
+        wait: true,
+        timeoutMs: 120_000,
+      },
+    ]);
+    expect(out).toEqual({
+      route_id: "sideswap.swap:DEPIX@liquid>LBTC@liquid",
+      hops: 1,
+      custodial: false,
+      status: "settled",
+      txids: ["cv".repeat(32)],
+      received_sats: "900",
+    });
+  });
+
+  it("reshapes an awaiting_funding result: funding block, null receipt, next_step", async () => {
+    const wallet = new FakeWallet();
+    wallet.convertResult = {
+      route: wallet.convertResult.route,
+      status: "awaiting_funding",
+      txids: [],
+      receivedSats: null,
+      custodial: false,
+      trackingId: "REV_1",
+      funding: {
+        kind: "lightning-invoice",
+        invoice: "lnbc1invoice",
+        network: "lightning",
+        expiresAt: 1_720_000_000_000,
+      },
+      nextStep: "share the BOLT11 invoice with the payer",
+    };
+    const { client } = await connectWallet({ wallet });
+    const out = sc(
+      await client.callTool({
+        name: "wallet_convert",
+        arguments: { from: "BTC", to: "LBTC", from_network: "lightning", amount_sats: "25000" },
+      }),
+    );
+    expect(out).toEqual({
+      route_id: "sideswap.swap:DEPIX@liquid>LBTC@liquid",
+      hops: 1,
+      custodial: false,
+      status: "awaiting_funding",
+      txids: [],
+      received_sats: null,
+      tracking_id: "REV_1",
+      funding: {
+        kind: "lightning-invoice",
+        invoice: "lnbc1invoice",
+        network: "lightning",
+        expires_at: 1_720_000_000_000,
+      },
+      next_step: "share the BOLT11 invoice with the payer",
+    });
+  });
+});

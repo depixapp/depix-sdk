@@ -40,6 +40,10 @@ const MVP = [
   "wallet_get_guardrails",
 ];
 
+// PR-B/PR-C intent layer: the PRIMARY conversion surface (route enumeration +
+// one-call execution, single- and multi-hop).
+const INTENT = ["wallet_quote", "wallet_convert"];
+
 // PR8b/PR5c fast-follow (§6.2): SideSwap + Boltz Lightning/stablecoin +
 // CryptoRefills + SideShift (wallet_shift_usdt — the ONE custodial tool, §5.4/G4).
 const FAST_FOLLOW = [
@@ -59,19 +63,47 @@ const RECOVERY = ["wallet_recover", "wallet_pending"];
 // Maintenance/support (PR-D): read-only health snapshot, never key material.
 const MAINTENANCE = ["wallet_diagnostics"];
 
-const EXPECTED = [...MVP, ...FAST_FOLLOW, ...RECOVERY, ...MAINTENANCE].sort();
+const EXPECTED = [...MVP, ...INTENT, ...FAST_FOLLOW, ...RECOVERY, ...MAINTENANCE].sort();
 
-describe("wallet MCP catalog (§6.2 — 10 MVP + 8 fast-follow + 2 recovery + 1 maintenance wallet_* tools)", () => {
-  it("initialize handshake succeeds and lists the MVP catalog PLUS the fast-follows", async () => {
+describe("wallet MCP catalog (§6.2 — 10 MVP + 2 intent + 8 fast-follow + 2 recovery + 1 maintenance wallet_* tools)", () => {
+  it("initialize handshake succeeds and lists the MVP catalog PLUS intent + fast-follows", async () => {
     const { client } = await connectWallet({ wallet: new FakeWallet() });
     // The connect above already ran initialize; capability read confirms the handshake.
     expect(client.getServerVersion()?.name).toBe("com.depixapp/wallet");
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(EXPECTED);
-    expect(names.length).toBe(21);
-    // All 10 MVP tools survive; every fast-follow + recovery + maintenance tool is present.
-    for (const n of [...MVP, ...FAST_FOLLOW, ...RECOVERY, ...MAINTENANCE]) expect(names).toContain(n);
+    expect(names.length).toBe(23);
+    // All 10 MVP tools survive; every intent + fast-follow + recovery + maintenance tool is present.
+    for (const n of [...MVP, ...INTENT, ...FAST_FOLLOW, ...RECOVERY, ...MAINTENANCE]) expect(names).toContain(n);
+  });
+
+  it("wallet_convert is the described PRIMARY conversion surface; wallet_quote feeds it route ids (unit-explicit)", async () => {
+    const { client } = await connectWallet({ wallet: new FakeWallet() });
+    const { tools } = await client.listTools();
+    const convert = tools.find((t) => t.name === "wallet_convert");
+    const quote = tools.find((t) => t.name === "wallet_quote");
+    expect(convert).toBeDefined();
+    expect(quote).toBeDefined();
+    // The headline surface says so, points at wallet_quote for ambiguity, and
+    // discloses that it moves money through the guardrails.
+    expect(convert!.description).toMatch(/PRIMARY conversion surface/i);
+    expect(convert!.description).toMatch(/MULTIPLE_ROUTES_AVAILABLE/);
+    expect(convert!.description).toMatch(/wallet_quote/);
+    expect(convert!.description).toMatch(/MOVES MONEY/);
+    expect(quote!.description).toMatch(/wallet_convert/);
+    // Unit-explicit money fields on both.
+    for (const t of [convert!, quote!]) {
+      const props = (t.inputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+      expect(props).toHaveProperty("amount_sats");
+      expect(props).not.toHaveProperty("amount");
+      expect(props).not.toHaveProperty("amount_cents");
+    }
+    // The result signals custody per route (G4 — signalled, never gated).
+    const out = (convert!.outputSchema as { properties?: Record<string, unknown> }).properties ?? {};
+    expect(out).toHaveProperty("custodial");
+    expect(out).toHaveProperty("received_sats");
+    expect(out).toHaveProperty("next_step");
   });
 
   it("exposes wallet_shift_usdt and marks it CUSTODIAL in the description (§5.4/G4)", async () => {
@@ -183,5 +215,15 @@ describe("stablecoin schema enums mirror the source of truth (no drift)", () => 
     const { BOLTZ_STABLECOIN_NETWORKS } = await import("../src/convert/boltz/stablecoin.js");
     expect([...STABLECOIN_ASSETS].sort()).toEqual(["USDC", "USDT"]);
     expect([...STABLECOIN_NETWORK_IDS].sort()).toEqual(BOLTZ_STABLECOIN_NETWORKS.map((n) => n.id).sort());
+  });
+
+  it("INTENT_ASSETS / INTENT_NETWORK_IDS cover every provider-tool enum (no reachable intent left out)", async () => {
+    const { INTENT_ASSETS, INTENT_NETWORK_IDS, SEND_ASSETS, SHIFT_NETWORK_IDS, STABLECOIN_NETWORK_IDS } =
+      await import("../src/mcp/schemas.js");
+    expect([...INTENT_ASSETS].sort()).toEqual(["BTC", "DEPIX", "LBTC", "USDC", "USDT"]);
+    for (const asset of SEND_ASSETS) expect(INTENT_ASSETS).toContain(asset);
+    for (const network of SHIFT_NETWORK_IDS) expect(INTENT_NETWORK_IDS).toContain(network);
+    for (const network of STABLECOIN_NETWORK_IDS) expect(INTENT_NETWORK_IDS).toContain(network);
+    for (const network of ["liquid", "bitcoin", "lightning"]) expect(INTENT_NETWORK_IDS).toContain(network);
   });
 });

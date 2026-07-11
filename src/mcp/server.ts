@@ -23,6 +23,7 @@ import * as s from "./schemas.js";
 import { MAX_WAIT_SECONDS_CEILING } from "./schemas.js";
 import {
   buyGiftcardTool,
+  convertTool,
   createDepositTool,
   createWithdrawalTool,
   diagnosticsTool,
@@ -33,6 +34,7 @@ import {
   listTransactionsTool,
   payLightningInvoiceTool,
   pendingTool,
+  quoteTool,
   receiveLightningTool,
   recoverTool,
   sendTool,
@@ -43,6 +45,7 @@ import {
   toStablecoinTool,
   waitDepositTool,
   waitWithdrawalTool,
+  type McpIntentArgs,
   type McpWalletFacade,
   type ToolContext,
 } from "./tools.js";
@@ -56,12 +59,13 @@ export const DEFAULT_SERVER_VERSION = "1.0.0";
 
 /**
  * The full catalog (§6.2), prefixed `wallet_` (G10). Exported for tests/docs.
- * The MVP 10 (PR8) plus the fast-follow conversions + gift cards (PR8b) plus
- * SideShift (PR5c) plus the recovery pair (wallet_recover / wallet_pending —
- * fund-safety wiring) plus wallet_diagnostics (PR-D — read-only support
- * snapshot) — 21 tools. wallet_shift_usdt (§5.4/G4) is the ONE CUSTODIAL
- * tool: its description says so explicitly (G4 = documentation-signalled,
- * no gate).
+ * The MVP 10 (PR8) plus the intent layer (wallet_quote / wallet_convert —
+ * PR-B/PR-C, the PRIMARY conversion surface) plus the fast-follow conversions
+ * + gift cards (PR8b) plus SideShift (PR5c) plus the recovery pair
+ * (wallet_recover / wallet_pending — fund-safety wiring) plus
+ * wallet_diagnostics (PR-D — read-only support snapshot) — 23 tools.
+ * wallet_shift_usdt (§5.4/G4) is the ONE all-custodial tool; wallet_convert
+ * FLAGS custodial routes per call (G4 = documentation-signalled, no gate).
  */
 export const WALLET_TOOL_NAMES = [
   "wallet_status",
@@ -74,6 +78,8 @@ export const WALLET_TOOL_NAMES = [
   "wallet_create_withdrawal",
   "wallet_wait_withdrawal",
   "wallet_get_guardrails",
+  "wallet_quote",
+  "wallet_convert",
   "wallet_swap_quote",
   "wallet_swap_execute",
   "wallet_pay_lightning_invoice",
@@ -90,7 +96,8 @@ export const WALLET_TOOL_NAMES = [
 const INSTRUCTIONS = [
   "DePix Wallet MCP — a NON-CUSTODIAL Liquid wallet that signs locally, in the agent's own environment.",
   "The seed never leaves this machine: keys, passphrase and dataDir are configured via environment variables (DEPIX_API_KEY, DEPIX_WALLET_PASSPHRASE, DEPIX_WALLET_DIR, DEPIX_GUARDRAIL_*), never via tools.",
-  "Money-moving tools (wallet_send, wallet_create_withdrawal) pass through the owner's guardrails (per-tx + rolling-24h BRL caps, optional allowlist) BEFORE signing — the facade never bypasses them.",
+  "Money-moving tools (wallet_send, wallet_create_withdrawal, wallet_convert) pass through the owner's guardrails (per-tx + rolling-24h BRL caps, optional allowlist) BEFORE signing — the facade never bypasses them.",
+  "wallet_convert is the PRIMARY conversion surface (asset/network conversions end to end, single- and multi-hop); wallet_quote enumerates the candidate routes with estimates. The provider-level tools (wallet_swap_*, wallet_to_stablecoin, wallet_shift_usdt, …) are the low-level escape hatch.",
   "Amounts carry their unit in the field name: amount_cents is BRL cents; amount_sats is the asset's base units (1 DePix cent = 1,000,000 sats). Never mix them.",
   "There is no tool to export the seed, change guardrails, or pay a merchant checkout QR — by design.",
   "wallet_create_deposit returns a Pix copy-and-paste the human OWNER pays; the agent has no bank.",
@@ -386,6 +393,62 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
       annotations: read,
     },
     () => run(() => getGuardrailsTool(wallet)),
+  );
+
+  // ── intent layer (PR-B/PR-C): the PRIMARY conversion surface. Client-direct
+  // providers — NOT gated on DEPIX_API_KEY. ──
+
+  server.registerTool(
+    "wallet_quote",
+    {
+      title: "Quote conversion routes",
+      description:
+        "Enumerate EVERY candidate conversion route for an intent — from/to asset (DEPIX, USDT, LBTC, BTC, USDC) " +
+        "plus destination network — with per-leg fee/receipt estimates, single-hop AND multi-hop, custodial legs " +
+        "flagged. The SDK never ranks or picks: compare the candidates and pass your chosen route id to " +
+        "wallet_convert (the primary conversion surface). amount_sats is the FROM asset's BASE UNITS. Estimates " +
+        "are best-effort (null + a note when a leg cannot be pre-estimated). Opens short-lived provider quote " +
+        "streams but signs nothing — moves no money.",
+      inputSchema: s.walletQuoteInput,
+      outputSchema: s.walletQuoteOutput,
+      annotations: write,
+    },
+    (args) => run(() => quoteTool(wallet, args as unknown as McpIntentArgs)),
+  );
+
+  server.registerTool(
+    "wallet_convert",
+    {
+      title: "Convert (primary surface)",
+      description:
+        "THE PRIMARY conversion surface — converts between assets/networks end to end (e.g. DEPIX→LBTC, " +
+        "LBTC→BTC@lightning, DEPIX→USDT@ethereum) in ONE call; prefer it over the low-level provider tools " +
+        "(wallet_swap_*, wallet_to_stablecoin, wallet_shift_usdt). Executes exactly ONE route: single-hop " +
+        "directly, multi-hop legs sequentially behind a crash-safe persisted plan (wallet_recover resumes after " +
+        "any interruption). MOVES MONEY: every money-moving leg passes through the owner's guardrails BEFORE " +
+        "signing; routes transiting a custodial provider return custodial:true. If several candidate routes " +
+        "resolve the intent, the call fails with MULTIPLE_ROUTES_AVAILABLE and the candidates in " +
+        "error.data.routes — call wallet_quote and pass `route`. Outbound cross-network routes need `address` " +
+        "(or `invoice` for lightning). Waits for settlement by default; on timeout it returns status pending " +
+        "with a next_step — funds in flight are never lost. amount_sats is the FROM asset's BASE UNITS.",
+      inputSchema: s.walletConvertInput,
+      outputSchema: s.walletConvertOutput,
+      annotations: money,
+    },
+    (args) =>
+      run(() =>
+        convertTool(
+          wallet,
+          args as unknown as McpIntentArgs & {
+            route?: string;
+            address?: string;
+            invoice?: string;
+            refund_address?: string;
+            wait?: boolean;
+            timeout_seconds?: number;
+          },
+        ),
+      ),
   );
 
   // ── fast-follow: conversions + gift cards (§6.2 fast-follow, §5). Client-direct

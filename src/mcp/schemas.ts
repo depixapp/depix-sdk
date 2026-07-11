@@ -516,6 +516,180 @@ export const listGiftcardOrdersOutput = {
     .describe("Locally tracked gift-card orders, newest first."),
 } as const;
 
+// ── intent layer: wallet_quote + wallet_convert (PR-B/PR-C — the PRIMARY
+// conversion surface). Same disciplines: amount_sats = the FROM asset's BASE
+// UNITS; custody is per-route, SIGNALLED in the output (custodial flag), never
+// gated (G4). ──
+
+/** Assets the intent layer routes between (mirror of routes.ts IntentAsset). */
+export const INTENT_ASSETS = ["DEPIX", "USDT", "LBTC", "BTC", "USDC"] as const;
+/** Networks an intent can source from / deliver to (mirror of routes.ts IntentNetwork). */
+export const INTENT_NETWORK_IDS = [
+  "liquid",
+  "bitcoin",
+  "lightning",
+  "ethereum",
+  "polygon",
+  "arbitrum",
+  "optimism",
+  "base",
+  "tron",
+  "bsc",
+  "solana",
+] as const;
+
+const intentAssetField = (what: string) => z.enum(INTENT_ASSETS).describe(what);
+
+const intentTrioFields = () =>
+  ({
+    from: intentAssetField("Asset to convert FROM: DEPIX, USDT, LBTC (L-BTC), BTC or USDC."),
+    to: intentAssetField("Asset to convert TO: DEPIX, USDT, LBTC (L-BTC), BTC or USDC."),
+    network: z
+      .enum(INTENT_NETWORK_IDS)
+      .optional()
+      .describe(
+        "DESTINATION network of `to` (default liquid). e.g. lightning for a BOLT11 payout, " +
+          "ethereum/tron/… for an external stablecoin delivery.",
+      ),
+    from_network: z
+      .enum(INTENT_NETWORK_IDS)
+      .optional()
+      .describe(
+        "ORIGIN network of `from`. Liquid assets default to liquid (this wallet's holdings); " +
+          "set it for external inflows (BTC: bitcoin | lightning; inbound USDT: its source network).",
+      ),
+    amount_sats: amountSatsField(),
+  }) as const;
+
+export const walletQuoteInput = { ...intentTrioFields() } as const;
+
+export const walletConvertInput = {
+  ...intentTrioFields(),
+  route: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "A route id from wallet_quote. REQUIRED when more than one candidate route resolves the intent " +
+        "(the SDK never chooses for you — MULTIPLE_ROUTES_AVAILABLE lists the candidates).",
+    ),
+  address: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "FINAL destination address for outbound cross-network routes (peg-out BTC address, EVM/Tron " +
+        "stablecoin address, SideShift settle address). Checked against the allowlist when it is ON (§4.3).",
+    ),
+  invoice: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "BOLT11 invoice — the destination of an LBTC → BTC@lightning conversion (its embedded amount " +
+        "governs; amount_sats is used only for quoting).",
+    ),
+  refund_address: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      "Optional Liquid refund address for SideShift send routes. Checked against the allowlist when it is ON.",
+    ),
+  wait: z
+    .boolean()
+    .optional()
+    .describe(
+      "Wait for settlement (default true). Inflow routes return funding details immediately either way; " +
+        "with wait:false outbound routes return status pending right after the first broadcast.",
+    ),
+  timeout_seconds: z
+    .number()
+    .int()
+    .min(1)
+    .max(MAX_WAIT_SECONDS_CEILING)
+    .optional()
+    .describe(
+      `Settlement wait bound in seconds (hard ceiling ${MAX_WAIT_SECONDS_CEILING}). On timeout the result is ` +
+        "status pending with a next_step — funds in flight are never an error.",
+    ),
+} as const;
+
+const routeLegQuoteOutput = () =>
+  z.object({
+    provider: z.string().describe("Provider executing this leg: sideswap | boltz | sideshift."),
+    method: z.string().describe("Provider method (swap, pegIn, pegOut, payLightningInvoice, …)."),
+    from: z.string(),
+    from_network: z.string(),
+    to: z.string(),
+    network: z.string(),
+    custodial: z.boolean().describe("true only for SideShift legs — funds transit their custody (G4)."),
+    estimated_received_sats: z
+      .string()
+      .nullable()
+      .describe("Estimated leg output in 8-decimal base units of `to` (string), or null when unavailable."),
+    estimated_fee_sats: z.string().nullable().describe("Estimated leg fee in base units of fee_asset, or null."),
+    fee_asset: z.string().nullable().describe("Asset the fee is denominated in, or null when unknown."),
+    note: z.string().optional().describe("Why an estimate is missing / any caveat."),
+  });
+
+export const walletQuoteOutput = {
+  routes: z
+    .array(
+      z.object({
+        id: z.string().describe("Stable route id — pass it to wallet_convert as `route` to execute this candidate."),
+        hops: z.number().int().describe("Number of legs (multi-hop routes execute sequentially behind a crash-safe plan)."),
+        custodial: z
+          .boolean()
+          .describe("true iff ANY leg transits a custodial provider (SideShift) — signalled, never gated (G4)."),
+        estimated_received_sats: z
+          .string()
+          .nullable()
+          .describe("Final estimated receipt in 8-decimal base units of `to` (string), or null when incomplete."),
+        estimated_fee_total_sats: z
+          .string()
+          .nullable()
+          .describe("Sum of leg fees when every leg reported one in the SAME asset; otherwise null."),
+        fee_asset: z.string().nullable(),
+        estimate_complete: z.boolean().describe("true when every leg produced an estimate (the chain is complete)."),
+        notes: z.array(z.string()).describe("Per-leg caveats (missing estimators, mixed fee assets, …)."),
+        legs: z.array(routeLegQuoteOutput()),
+      }),
+    )
+    .describe("EVERY candidate route with chained estimates — the agent compares and chooses; the SDK never ranks."),
+} as const;
+
+export const walletConvertOutput = {
+  route_id: z.string().describe("The executed route's id."),
+  hops: z.number().int().describe("Legs in the executed route."),
+  custodial: z.boolean().describe("true when the executed route transits a custodial provider (G4, signalled)."),
+  status: z
+    .enum(["settled", "pending", "awaiting_funding", "refunded", "refund_pending", "failed"])
+    .describe(
+      "settled = delivered. pending/refund_pending = in flight (see next_step; wallet_recover resumes). " +
+        "awaiting_funding = an external party must fund first (see funding). refunded/failed = terminal, nothing delivered.",
+    ),
+  txids: z.array(z.string()).describe("Every txid the conversion produced so far (lockup/send first, payout/claim after)."),
+  received_sats: z
+    .string()
+    .nullable()
+    .describe("ACTUAL receipt in 8-decimal base units of `to` (string) — null until the provider reports delivery."),
+  tracking_id: z.string().optional().describe("Provider tracking id (swap id / shift id / peg order id)."),
+  funding: z
+    .object({
+      kind: z.enum(["bitcoin-address", "lightning-invoice", "external-deposit-address"]),
+      address: z.string().optional().describe("Address the EXTERNAL party funds (BTC or provider deposit address)."),
+      invoice: z.string().optional().describe("BOLT11 invoice for the payer to pay."),
+      network: z.string().optional().describe("The network the external funds must be sent on."),
+      min: z.string().nullable().optional(),
+      max: z.string().nullable().optional(),
+      expires_at: z.number().int().nullable().optional().describe("Epoch-ms funding deadline, when the provider sets one."),
+    })
+    .optional()
+    .describe("Funding instructions for INFLOW routes (only with status awaiting_funding)."),
+  next_step: z.string().optional().describe("What to do next when the result is not terminal — always actionable (G3)."),
+} as const;
+
 // ── recovery wiring: wallet_recover + wallet_pending (fund-safety) ────────────
 
 export const recoverInput = {} as const;

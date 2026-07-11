@@ -84,12 +84,15 @@ async function openReal(): Promise<void> {
 }
 
 describe("MCP facade e2e over a real wallet (sandbox, offline)", () => {
-  it("handshakes and lists the 10 MVP + 8 fast-follow + 2 recovery + 1 maintenance tools over a REAL wallet", async () => {
+  it("handshakes and lists the 10 MVP + 2 intent + 8 fast-follow + 2 recovery + 1 maintenance tools over a REAL wallet", async () => {
     await openReal();
     const names = (await client.listTools()).tools.map((t) => t.name);
-    expect(names).toHaveLength(21);
+    expect(names).toHaveLength(23);
     expect(names).toContain("wallet_create_deposit");
     expect(names).toContain("wallet_create_withdrawal");
+    // The intent layer (PR-B/PR-C): the PRIMARY conversion surface.
+    expect(names).toContain("wallet_quote");
+    expect(names).toContain("wallet_convert");
     // The real DepixWallet satisfies the extended facade → fast-follows registered.
     expect(names).toContain("wallet_swap_quote");
     expect(names).toContain("wallet_pay_lightning_invoice");
@@ -100,6 +103,47 @@ describe("MCP facade e2e over a real wallet (sandbox, offline)", () => {
     expect(names).toContain("wallet_pending");
     // Maintenance/support (PR-D): read-only health snapshot, never key material.
     expect(names).toContain("wallet_diagnostics");
+  });
+
+  it("wallet_quote over the REAL wallet enumerates both DEPIX→USDT@ethereum candidates offline (estimates fail soft)", async () => {
+    await openReal();
+    const res = await client.callTool({
+      name: "wallet_quote",
+      arguments: { from: "DEPIX", to: "USDT", network: "ethereum", amount_sats: "100000000" },
+    });
+    expect(res.isError).toBeFalsy();
+    const out = res.structuredContent as { routes: Array<Record<string, unknown>> };
+    expect(out.routes.map((r) => r.id)).toEqual([
+      "sideswap.swap:DEPIX@liquid>LBTC@liquid+boltz.toStablecoin:LBTC@liquid>USDT@ethereum",
+      "sideswap.swap:DEPIX@liquid>USDT@liquid+sideshift.send:USDT@liquid>USDT@ethereum",
+    ]);
+    // Custody is signalled per route (G4) and the empty offline wallet cannot
+    // estimate the market leg — null + notes, never a throw.
+    expect(out.routes.map((r) => r.custodial)).toEqual([false, true]);
+    for (const route of out.routes) {
+      expect(route.estimated_received_sats).toBe(null);
+      expect(route.estimate_complete).toBe(false);
+      expect((route.notes as string[]).length).toBeGreaterThan(0);
+    }
+  });
+
+  it("wallet_convert over the REAL wallet surfaces MULTIPLE_ROUTES_AVAILABLE with the candidates + next_step in data", async () => {
+    await openReal();
+    const res = await client.callTool({
+      name: "wallet_convert",
+      arguments: { from: "DEPIX", to: "USDT", network: "ethereum", amount_sats: "100000000" },
+    });
+    expect(res.isError).toBe(true);
+    const payload = JSON.parse(
+      (res.content as Array<{ type: string; text?: string }>).find((c) => c.text?.trim().startsWith("{"))!.text!,
+    ) as { error: { code: string; routes?: Array<{ id: string }>; next_step?: string } };
+    expect(payload.error.code).toBe("MULTIPLE_ROUTES_AVAILABLE");
+    expect(payload.error.routes?.map((r) => r.id)).toEqual([
+      "sideswap.swap:DEPIX@liquid>LBTC@liquid+boltz.toStablecoin:LBTC@liquid>USDT@ethereum",
+      "sideswap.swap:DEPIX@liquid>USDT@liquid+sideshift.send:USDT@liquid>USDT@ethereum",
+    ]);
+    expect(payload.error.next_step).toMatch(/wallet_quote/);
+    expect(payload.error.next_step).toMatch(/`route`|route id/);
   });
 
   it("wallet_create_deposit returns the sandbox QR", async () => {

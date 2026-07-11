@@ -34,6 +34,14 @@ import type {
   ToStablecoinResult,
 } from "../convert/boltz/convert.js";
 import type { StablecoinAsset, StablecoinParams } from "../convert/boltz/stablecoin.js";
+import type {
+  ConvertFunding,
+  ConvertParams,
+  ConvertResult,
+  RouteLegQuote,
+  RouteQuote,
+} from "../convert/intent.js";
+import type { ConvertIntent, IntentAsset, IntentNetwork } from "../convert/routes.js";
 import type { SwapQuoteParams } from "../convert/sideswap.js";
 import type { SideShiftSendResult } from "../convert/sideshift.js";
 import type { BuyGiftcardParams, BuyGiftcardResult } from "../giftcards/namespace.js";
@@ -106,7 +114,14 @@ export interface McpWalletFacade {
   recover(): Promise<RecoverySummary>;
   getPending(): Promise<PendingItem[]>;
   diagnostics(): Promise<WalletDiagnostics>;
-  readonly convert: McpConvertFacade;
+  /** wallet.quote() (PR-B) — enumerate + estimate every candidate route, read-only. */
+  quote(params: ConvertIntent): Promise<RouteQuote[]>;
+  /**
+   * wallet.convert (PR-B/PR-C) — CALLABLE (the intent executor wallet_convert
+   * wraps) AND the carrier of the advanced provider sub-namespaces the
+   * fast-follow tools consume. DepixWallet's ConvertFacade satisfies both.
+   */
+  readonly convert: McpConvertFacade & ((params: ConvertParams) => Promise<ConvertResult>);
   readonly giftcards: McpGiftcardsFacade;
 }
 
@@ -614,6 +629,132 @@ export async function diagnosticsTool(wallet: McpWalletFacade) {
     },
     guardrails: d.guardrails ? guardrailBudget(d.guardrails) : null,
   };
+}
+
+// ── intent layer: wallet_quote + wallet_convert (PR-B/PR-C) ──
+//
+// The PRIMARY conversion surface. Same rule as everything above — ZERO money
+// logic here: wallet_convert wraps the callable wallet.convert() (which routes
+// every money-moving leg through the §4.3 guardrail choke point inside the
+// provider methods) and wallet_quote wraps the read-only wallet.quote(). The
+// tools only translate snake_case args and reshape bigints to strings.
+
+/** Snake_case intent-trio args shared by wallet_quote and wallet_convert. */
+export interface McpIntentArgs {
+  from: IntentAsset;
+  to: IntentAsset;
+  network?: IntentNetwork;
+  from_network?: IntentNetwork;
+  amount_sats: string;
+}
+
+function intentFromArgs(args: McpIntentArgs): ConvertIntent {
+  return {
+    from: args.from,
+    to: args.to,
+    ...(args.network !== undefined ? { network: args.network } : {}),
+    ...(args.from_network !== undefined ? { fromNetwork: args.from_network } : {}),
+    // amount_sats is /^\d+$/-validated, so BigInt() never throws; the wallet
+    // rejects 0 with a typed INVALID_AMOUNT.
+    amount: BigInt(args.amount_sats),
+  };
+}
+
+function legQuoteToOutput(leg: RouteLegQuote) {
+  return {
+    provider: leg.provider,
+    method: leg.method,
+    from: leg.from,
+    from_network: leg.fromNetwork,
+    to: leg.to,
+    network: leg.network,
+    custodial: leg.custodial,
+    estimated_received_sats: leg.estimatedReceivedSats !== null ? leg.estimatedReceivedSats.toString() : null,
+    estimated_fee_sats: leg.estimatedFeeSats !== null ? leg.estimatedFeeSats.toString() : null,
+    fee_asset: leg.feeAsset,
+    ...(leg.note !== undefined ? { note: leg.note } : {}),
+  };
+}
+
+function routeQuoteToOutput(route: RouteQuote) {
+  return {
+    id: route.id,
+    hops: route.hops,
+    custodial: route.custodial,
+    estimated_received_sats:
+      route.estimatedReceivedSats !== null ? route.estimatedReceivedSats.toString() : null,
+    estimated_fee_total_sats:
+      route.estimatedFeeTotalSats !== null ? route.estimatedFeeTotalSats.toString() : null,
+    fee_asset: route.feeAsset,
+    estimate_complete: route.estimateComplete,
+    notes: [...route.notes],
+    legs: route.legs.map(legQuoteToOutput),
+  };
+}
+
+/** wallet_quote — enumerate + estimate EVERY candidate route (read-only). */
+export async function quoteTool(wallet: McpWalletFacade, args: McpIntentArgs) {
+  const routes = await wallet.quote(intentFromArgs(args));
+  return { routes: routes.map(routeQuoteToOutput) };
+}
+
+function fundingToOutput(funding: ConvertFunding) {
+  const out: Record<string, unknown> = { kind: funding.kind };
+  if (funding.address !== undefined) out.address = funding.address;
+  if (funding.invoice !== undefined) out.invoice = funding.invoice;
+  if (funding.network !== undefined) out.network = funding.network;
+  if (funding.min !== undefined) out.min = funding.min;
+  if (funding.max !== undefined) out.max = funding.max;
+  if (funding.expiresAt !== undefined) out.expires_at = funding.expiresAt;
+  return out;
+}
+
+function convertResultToOutput(r: ConvertResult) {
+  const out: Record<string, unknown> = {
+    route_id: r.route.id,
+    hops: r.route.hops,
+    custodial: r.custodial,
+    status: r.status,
+    txids: [...r.txids],
+    received_sats: r.receivedSats !== null ? r.receivedSats.toString() : null,
+  };
+  if (r.trackingId !== undefined) out.tracking_id = r.trackingId;
+  if (r.funding !== undefined) out.funding = fundingToOutput(r.funding);
+  if (r.nextStep !== undefined) out.next_step = r.nextStep;
+  return out;
+}
+
+/**
+ * wallet_convert — execute ONE conversion intent via the callable
+ * wallet.convert(). A MULTIPLE_ROUTES_AVAILABLE refusal propagates to
+ * mapToolError, which surfaces the candidate routes in error.data.routes plus a
+ * next_step (the tool is stateless — the agent re-calls with `route`).
+ */
+export async function convertTool(
+  wallet: McpWalletFacade,
+  args: McpIntentArgs & {
+    route?: string;
+    address?: string;
+    invoice?: string;
+    refund_address?: string;
+    wait?: boolean;
+    timeout_seconds?: number;
+  },
+  maxWaitSeconds: number = MAX_WAIT_SECONDS_CEILING,
+) {
+  const params: ConvertParams = {
+    ...intentFromArgs(args),
+    ...(args.route !== undefined ? { route: args.route } : {}),
+    ...(args.address !== undefined ? { address: args.address } : {}),
+    ...(args.invoice !== undefined ? { invoice: args.invoice } : {}),
+    ...(args.refund_address !== undefined ? { refundAddress: args.refund_address } : {}),
+    ...(args.wait !== undefined ? { wait: args.wait } : {}),
+    ...(args.timeout_seconds !== undefined
+      ? { timeoutMs: Math.min(args.timeout_seconds, maxWaitSeconds) * 1000 }
+      : {}),
+  };
+  const result = await wallet.convert(params);
+  return convertResultToOutput(result);
 }
 
 export async function shiftUsdtTool(

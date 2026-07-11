@@ -32,6 +32,8 @@ import type {
   ToStablecoinResult,
 } from "../../src/convert/boltz/convert.js";
 import type { StablecoinParams } from "../../src/convert/boltz/stablecoin.js";
+import type { ConvertParams, ConvertResult, RouteQuote } from "../../src/convert/intent.js";
+import type { ConvertIntent, Route } from "../../src/convert/routes.js";
 import type { SideSwapQuote, SwapExecuteResult, SwapQuoteParams } from "../../src/convert/sideswap.js";
 import type { SideShiftSendResult } from "../../src/convert/sideshift.js";
 import type { BuyGiftcardParams, BuyGiftcardResult } from "../../src/giftcards/namespace.js";
@@ -231,13 +233,87 @@ export class FakeGiftcards implements McpGiftcardsFacade {
  * values are preset public fields; an entry in `throws` makes that method reject
  * with the given error (to exercise mapToolError).
  */
+/** The single-hop route FakeWallet's intent fakes report. */
+const FAKE_MARKET_ROUTE: Route = {
+  id: "sideswap.swap:DEPIX@liquid>LBTC@liquid",
+  hops: 1,
+  custodial: false,
+  legs: [
+    {
+      provider: "sideswap",
+      method: "swap",
+      from: "DEPIX",
+      fromNetwork: "liquid",
+      to: "LBTC",
+      network: "liquid",
+      custodial: false,
+    },
+  ],
+};
+
 export class FakeWallet implements McpWalletFacade {
   calls: RecordedCall[] = [];
   throws: Partial<Record<keyof McpWalletFacade, unknown>> = {};
 
-  /** wallet.convert / wallet.giftcards fakes backing the fast-follow tools. */
-  readonly convert = new FakeConvert();
+  /**
+   * wallet.convert fake backing the fast-follow tools AND — like the real
+   * ConvertFacade — CALLABLE for wallet_convert. Property reads/writes proxy to
+   * the FakeConvert instance so `wallet.convert.stream`/`.boltzThrows = …`
+   * keep working; calling it records "convert" and returns `convertResult`.
+   */
+  readonly convert: McpWalletFacade["convert"] & FakeConvert;
   readonly giftcards = new FakeGiftcards();
+
+  quoteResult: RouteQuote[] = [
+    {
+      id: FAKE_MARKET_ROUTE.id,
+      hops: 1,
+      custodial: false,
+      estimatedReceivedSats: 900n,
+      estimatedFeeTotalSats: 31n,
+      feeAsset: "LBTC",
+      estimateComplete: true,
+      notes: [],
+      legs: [
+        {
+          ...FAKE_MARKET_ROUTE.legs[0]!,
+          estimatedReceivedSats: 900n,
+          estimatedFeeSats: 31n,
+          feeAsset: "LBTC",
+        },
+      ],
+    },
+  ];
+  convertResult: ConvertResult = {
+    route: FAKE_MARKET_ROUTE,
+    status: "settled",
+    txids: ["cv".repeat(32)],
+    receivedSats: 900n,
+    custodial: false,
+  };
+
+  constructor() {
+    const state = new FakeConvert();
+    // eslint-disable-next-line @typescript-eslint/no-this-alias
+    const self = this;
+    const callable = async (params: ConvertParams): Promise<ConvertResult> => {
+      self.rec("convert", [params]);
+      return self.convertResult;
+    };
+    this.convert = new Proxy(callable, {
+      get(target, prop, receiver) {
+        if (prop in state) return Reflect.get(state, prop);
+        return Reflect.get(target, prop, receiver);
+      },
+      set(_target, prop, value) {
+        (state as unknown as Record<PropertyKey, unknown>)[prop] = value;
+        return true;
+      },
+      has(target, prop) {
+        return prop in state || prop in target;
+      },
+    }) as McpWalletFacade["convert"] & FakeConvert;
+  }
 
   backupConfirmed = true;
   guardrails: GuardrailReadout = {
@@ -411,6 +487,10 @@ export class FakeWallet implements McpWalletFacade {
   async diagnostics(): Promise<WalletDiagnostics> {
     this.rec("diagnostics", []);
     return this.diagnosticsResult;
+  }
+  async quote(params: ConvertIntent): Promise<RouteQuote[]> {
+    this.rec("quote", [params]);
+    return this.quoteResult;
   }
 
   /** Convenience: find the args of the last recorded call to `method`. */
