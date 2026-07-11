@@ -145,7 +145,8 @@ describe("wallet.quote() — full enumeration on a real wallet", () => {
 // plan store. Everything else — a direct call, a forged planId — gets the full
 // choke point; the allowlist applies even to legitimate continuations.
 
-import { readFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
+import { base64 } from "@scure/base";
 import { runAsPlanContinuation } from "../src/convert/continuation.js";
 import { ConversionPlanStore, type StoredConversionPlan } from "../src/convert/plan-store.js";
 import { enumerateRoutes } from "../src/convert/routes.js";
@@ -256,6 +257,29 @@ describe("multi-hop count-once (§4.3) — the wallet's guardrail hooks", () => 
     // No such plan in the store.
     await expect(
       runAsPlanContinuation("plan-forged", () => wallet.convert.sideshift.send(SEND))
+    ).rejects.toSatisfy((e) => isDepixSdkError(e, "GUARDRAIL_PER_TX_LIMIT"));
+    expect(sendUsdtCalls).toHaveLength(0);
+  });
+
+  it("an EXISTING plan whose record fails GCM authentication (forged ciphertext) never authorizes the skip", async () => {
+    // Distinct from the forged-planId case (get() returns null): here the record
+    // EXISTS but decryption throws PLAN_VALIDATION_FAILED — the catch{} inside
+    // the wallet's isAuthorizedPlanContinuation must map that to "not
+    // authorized" (fail closed to the FULL choke point), never rethrow into the
+    // money path and never skip the ceilings over tampered data.
+    const { opts, sendUsdtCalls } = walletOpts();
+    wallet = await open(opts as Parameters<typeof open>[0]);
+    await seedWalletPlan(dataDir); // a VALID continuation-authorizing plan…
+    const path = join(dataDir, "conversion-plans.json");
+    const file = JSON.parse(await readFile(path, "utf8")) as { records: Array<{ id: string; ct: string }> };
+    expect(file.records.map((r) => r.id)).toEqual(["plan-wallet-1"]); // …that we now corrupt in place
+    const ct = Uint8Array.from(base64.decode(file.records[0]!.ct));
+    ct[0] = ct[0]! ^ 0xff;
+    file.records[0]!.ct = base64.encode(ct);
+    await writeFile(path, JSON.stringify(file));
+
+    await expect(
+      runAsPlanContinuation("plan-wallet-1", () => wallet.convert.sideshift.send(SEND))
     ).rejects.toSatisfy((e) => isDepixSdkError(e, "GUARDRAIL_PER_TX_LIMIT"));
     expect(sendUsdtCalls).toHaveLength(0);
   });

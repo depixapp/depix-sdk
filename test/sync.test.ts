@@ -126,6 +126,79 @@ describe("provider chain (spec §2.6)", () => {
   });
 });
 
+describe("rescan() vs a concurrent plain sync() — the 'joins this pass' guarantee (PR-D)", () => {
+  async function waitUntil(cond: () => boolean, what: string, ms = 5_000): Promise<void> {
+    const deadline = Date.now() + ms;
+    while (!cond()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+  }
+  const settleTicks = () => new Promise((resolve) => setTimeout(resolve, 25));
+
+  it("drains the in-flight stale scan FIRST, then a sync() during the rescan pass JOINS it — the stale wollet is never re-scanned", async () => {
+    // Deferred-controlled fullScan: each call records its target Wollet and
+    // resolves only when the test releases it.
+    const scans: Array<{ wollet: Wollet; release: () => void }> = [];
+    const factory = (): EsploraClientLike => ({
+      fullScan: (w: Wollet) =>
+        new Promise((resolve) => {
+          scans.push({ wollet: w, release: () => resolve(undefined) });
+        }),
+      broadcast: async () => {
+        throw new Error("not used");
+      },
+      free: () => {}
+    });
+    const engine = makeEngine({ factory });
+    const fresh = buildWollet(descriptorFromMnemonic(KNOWN_MNEMONIC));
+    try {
+      // 1. A stale-wollet scan is in flight.
+      const stalePass = engine.sync(wollet);
+      await waitUntil(() => scans.length === 1, "the stale scan to start");
+      expect(scans[0]!.wollet).toBe(wollet);
+
+      // 2. rescan() must NOT run beforeScan (the cache drop) while the stale
+      //    scan could still persist across it — it drains the pass first.
+      let beforeScanRan = 0;
+      const rescanPass = engine.rescan(fresh, async () => {
+        beforeScanRan++;
+      });
+      await settleTicks();
+      expect(beforeScanRan).toBe(0); // still draining — the clear has not run
+      expect(scans).toHaveLength(1); // and no second scan started either
+
+      // 3. Release the stale scan: the rescan pass claims the slot, runs
+      //    beforeScan, and cold-scans the FRESH (virgin) wollet.
+      scans[0]!.release();
+      await waitUntil(() => scans.length === 2, "the rescan's own scan to start");
+      expect(beforeScanRan).toBe(1);
+      expect(scans[1]!.wollet).toBe(fresh);
+
+      // 4. THE RACE UNDER TEST: a plain sync() issued while the rescan pass is
+      //    in flight must JOIN that pass instead of starting a new scan of the
+      //    stale wollet (which would race the cache clear and could persist an
+      //    orphan chain link).
+      const joined = engine.sync(wollet);
+      expect(engine.sync(wollet)).toBe(joined); // joiners share ONE in-flight pass
+      await settleTicks();
+      expect(scans).toHaveLength(2); // no third fullScan — nothing re-scanned the stale wollet
+
+      // 5. Release the rescan; every caller settles on the SAME pass's result.
+      scans[1]!.release();
+      const [staleResult, rescanResult, joinedResult] = await Promise.all([stalePass, rescanPass, joined]);
+      expect(staleResult).toEqual({ updated: false });
+      expect(rescanResult).toEqual({ updated: false });
+      expect(joinedResult).toEqual({ updated: false });
+      // Final tally: the stale wollet was scanned EXACTLY once (before the
+      // rescan), the fresh wollet exactly once — never interleaved.
+      expect(scans.map((s) => s.wollet)).toEqual([wollet, fresh]);
+    } finally {
+      fresh.free();
+    }
+  });
+});
+
 describe("inline scan timeout (spec §2.7 — withTimeout cannot cancel the wasm scan)", () => {
   it("a late-resolving inline scan is NOT applied — the timeout wins and its result is ignored", async () => {
     let lateResolved = 0;

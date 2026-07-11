@@ -85,6 +85,36 @@ describe("ConversionPlanStore — encrypted round-trip", () => {
   });
 });
 
+describe("ConversionPlanStore — claimLeg (the §4.1 intra-process CAS)", () => {
+  it("claims an unstarted leg exactly once: first caller 'claimed' (stamped in_flight), second 'already_active'", async () => {
+    const plan = makePlan();
+    plan.legResults = [{ state: "settled", txids: ["swap_txid"], receivedSats: 19_500n, trackingId: null }];
+    await store.put(plan);
+
+    expect(await store.claimLeg("plan-1", 1)).toBe("claimed");
+    const afterClaim = await store.get("plan-1");
+    expect(afterClaim!.currentLegIndex).toBe(1);
+    expect(afterClaim!.state).toBe("executing");
+    expect(afterClaim!.legResults[1]).toEqual({ state: "in_flight", txids: [], receivedSats: null, trackingId: null });
+
+    // A second claim of the SAME leg must refuse — re-executing it would be a
+    // second provider broadcast (double-spend).
+    expect(await store.claimLeg("plan-1", 1)).toBe("already_active");
+    // …and must not have disturbed the record.
+    expect(await store.get("plan-1")).toEqual(afterClaim);
+  });
+
+  it("returns 'not_found' when the plan was removed between a driver's snapshot and its claim", async () => {
+    await store.put(makePlan());
+    // The adversarial interleaving: a concurrent driver finished the plan and
+    // removed it AFTER this driver readAll()-snapshotted it.
+    await store.remove("plan-1");
+    expect(await store.claimLeg("plan-1", 1)).toBe("not_found");
+    // Nothing was resurrected.
+    expect(await store.count()).toBe(0);
+  });
+});
+
 describe("ConversionPlanStore — anti-tamper (GCM, AAD = planId)", () => {
   it("a ciphertext-tampered record fails authentication: get() throws, readAll() collects it", async () => {
     await store.put(makePlan());

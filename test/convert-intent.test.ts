@@ -621,7 +621,7 @@ describe("convertIntent — boltz (completion promises hidden)", () => {
     expect(res.receivedSats).toBe(null);
   });
 
-  it("a never-settling completion times out into status pending + recovery nextStep", async () => {
+  it("a never-settling completion times out into status pending + recovery nextStep — and NEVER a received amount", async () => {
     const boltz = makeFakeBoltz({ pay: { completion: new Promise(() => {}) } });
     const { deps } = makeDeps({ getBoltz: () => boltz });
     const res = await convertIntent(
@@ -630,6 +630,57 @@ describe("convertIntent — boltz (completion promises hidden)", () => {
     );
     expect(res.status).toBe("pending");
     expect(res.nextStep).toMatch(/recover|getPending/i);
+    // Non-terminal: the invoice has NOT been paid — a received amount here would
+    // read as delivered money.
+    expect(res.receivedSats).toBe(null);
+    expect(res.txids).toEqual(["lockup_txid"]);
+    expect(res.trackingId).toBe("SUB_1");
+  });
+
+  it("payLightningInvoice with wait:false returns pending immediately without awaiting the completion", async () => {
+    // A NEVER-resolving completion proves wait:false does not await it.
+    const boltz = makeFakeBoltz({ pay: { completion: new Promise(() => {}) } });
+    const { deps } = makeDeps({ getBoltz: () => boltz });
+    const res = await convertIntent(
+      { from: "LBTC", to: "BTC", network: "lightning", amount: 10_000n, invoice: "lnbc1xyz", wait: false },
+      deps
+    );
+    expect(res.status).toBe("pending");
+    expect(res.txids).toEqual(["lockup_txid"]);
+    expect(res.receivedSats).toBe(null); // in flight ≠ delivered
+    expect(res.trackingId).toBe("SUB_1");
+    expect(res.nextStep).toMatch(/recover|getPending/i);
+  });
+
+  it("payLightningInvoice maps refund_pending (non-terminal) with a recover() nextStep and no receipt", async () => {
+    const boltz = makeFakeBoltz({
+      pay: { completion: Promise.resolve({ swapId: "SUB_1", status: "refund_pending" }) }
+    });
+    const { deps } = makeDeps({ getBoltz: () => boltz });
+    const res = await convertIntent(
+      { from: "LBTC", to: "BTC", network: "lightning", amount: 10_000n, invoice: "lnbc1xyz" },
+      deps
+    );
+    expect(res.status).toBe("refund_pending");
+    expect(res.receivedSats).toBe(null);
+    expect(res.txids).toEqual(["lockup_txid"]);
+    expect(res.nextStep).toBe(
+      "the refund timeout has not been reached yet — wallet.recover() retries it; funds are safe."
+    );
+  });
+
+  it("payLightningInvoice maps failed with the retry nextStep and no receipt", async () => {
+    const boltz = makeFakeBoltz({
+      pay: { completion: Promise.resolve({ swapId: "SUB_1", status: "failed" }) }
+    });
+    const { deps } = makeDeps({ getBoltz: () => boltz });
+    const res = await convertIntent(
+      { from: "LBTC", to: "BTC", network: "lightning", amount: 10_000n, invoice: "lnbc1xyz" },
+      deps
+    );
+    expect(res.status).toBe("failed");
+    expect(res.receivedSats).toBe(null);
+    expect(res.nextStep).toBe("the swap failed before any settlement — check wallet.getPending() and retry.");
   });
 
   it("toStablecoin executes and settles (claim txid surfaced)", async () => {
@@ -654,6 +705,107 @@ describe("convertIntent — boltz (completion promises hidden)", () => {
     await expect(
       convertIntent({ from: "LBTC", to: "USDT", network: "tron", amount: 50_000n }, deps)
     ).rejects.toSatisfy((e) => isDepixSdkError(e, "INVALID_ADDRESS"));
+  });
+
+  // The nextStep text executeToStablecoin attaches to every non-terminal outcome.
+  const STABLECOIN_PENDING_NEXT_STEP =
+    "the L-BTC lockup is in flight; the EVM legs run in the background — crash-safe. " +
+    "wallet.recover() finishes (or refunds) it after a restart; wallet.getPending() tracks it.";
+
+  it("toStablecoin maps a pending outcome (post-lockup failure left for resume): no receipt, recover() nextStep", async () => {
+    const boltz = makeFakeBoltz({
+      stablecoin: { completion: Promise.resolve({ swapId: "CHAIN_1", status: "pending" }) }
+    });
+    const { deps } = makeDeps({ getBoltz: () => boltz });
+    const res = await convertIntent(
+      { from: "LBTC", to: "USDC", network: "base", amount: 50_000n, address: "0xAbCd" },
+      deps
+    );
+    expect(res.status).toBe("pending");
+    // The L-BTC is locked but NOTHING was delivered — a receipt here would read
+    // as delivered stablecoin (the money-adjacent invariant this suite guards).
+    expect(res.receivedSats).toBe(null);
+    expect(res.txids).toEqual(["chain_lockup_txid"]);
+    expect(res.trackingId).toBe("CHAIN_1");
+    expect(res.nextStep).toBe(STABLECOIN_PENDING_NEXT_STEP);
+  });
+
+  it("toStablecoin times out a never-settling completion into pending + recover() nextStep, receipt null", async () => {
+    const boltz = makeFakeBoltz({ stablecoin: { completion: new Promise(() => {}) } });
+    const { deps } = makeDeps({ getBoltz: () => boltz });
+    const res = await convertIntent(
+      { from: "LBTC", to: "USDC", network: "base", amount: 50_000n, address: "0xAbCd", timeoutMs: 10 },
+      deps
+    );
+    expect(res.status).toBe("pending");
+    expect(res.receivedSats).toBe(null);
+    expect(res.txids).toEqual(["chain_lockup_txid"]);
+    expect(res.trackingId).toBe("CHAIN_1");
+    expect(res.nextStep).toBe(STABLECOIN_PENDING_NEXT_STEP);
+  });
+
+  it("toStablecoin with wait:false returns pending immediately without awaiting the completion", async () => {
+    // A NEVER-resolving completion proves wait:false does not await it.
+    const boltz = makeFakeBoltz({ stablecoin: { completion: new Promise(() => {}) } });
+    const { deps } = makeDeps({ getBoltz: () => boltz });
+    const res = await convertIntent(
+      { from: "LBTC", to: "USDC", network: "base", amount: 50_000n, address: "0xAbCd", wait: false },
+      deps
+    );
+    expect(res.status).toBe("pending");
+    expect(res.receivedSats).toBe(null);
+    expect(res.txids).toEqual(["chain_lockup_txid"]);
+    expect(res.nextStep).toBe(STABLECOIN_PENDING_NEXT_STEP);
+  });
+
+  it("toStablecoin maps a refunded outcome: refund txid surfaced, receipt null (funds came back, not delivered)", async () => {
+    const boltz = makeFakeBoltz({
+      stablecoin: {
+        completion: Promise.resolve({ swapId: "CHAIN_1", status: "refunded", refundTxId: "chain_refund_txid" })
+      }
+    });
+    const { deps } = makeDeps({ getBoltz: () => boltz });
+    const res = await convertIntent(
+      { from: "LBTC", to: "USDT", network: "tron", amount: 50_000n, address: "TTronDest" },
+      deps
+    );
+    expect(res.status).toBe("refunded");
+    expect(res.receivedSats).toBe(null);
+    expect(res.txids).toEqual(["chain_lockup_txid", "chain_refund_txid"]);
+    expect(res.trackingId).toBe("CHAIN_1");
+    // Terminal without delivery — no nextStep is attached (G3 mandates one only
+    // for NON-terminal results).
+    expect(res.nextStep).toBeUndefined();
+  });
+
+  it("toStablecoin maps refund_pending (non-terminal): receipt null + the recover() nextStep", async () => {
+    const boltz = makeFakeBoltz({
+      stablecoin: { completion: Promise.resolve({ swapId: "CHAIN_1", status: "refund_pending" }) }
+    });
+    const { deps } = makeDeps({ getBoltz: () => boltz });
+    const res = await convertIntent(
+      { from: "LBTC", to: "USDC", network: "base", amount: 50_000n, address: "0xAbCd" },
+      deps
+    );
+    expect(res.status).toBe("refund_pending");
+    expect(res.receivedSats).toBe(null);
+    expect(res.txids).toEqual(["chain_lockup_txid"]);
+    expect(res.nextStep).toBe(STABLECOIN_PENDING_NEXT_STEP);
+  });
+
+  it("toStablecoin maps a failed outcome: receipt null, terminal (no nextStep)", async () => {
+    const boltz = makeFakeBoltz({
+      stablecoin: { completion: Promise.resolve({ swapId: "CHAIN_1", status: "failed" }) }
+    });
+    const { deps } = makeDeps({ getBoltz: () => boltz });
+    const res = await convertIntent(
+      { from: "LBTC", to: "USDC", network: "base", amount: 50_000n, address: "0xAbCd" },
+      deps
+    );
+    expect(res.status).toBe("failed");
+    expect(res.receivedSats).toBe(null);
+    expect(res.txids).toEqual(["chain_lockup_txid"]);
+    expect(res.nextStep).toBeUndefined();
   });
 
   it("receiveLightning returns the invoice immediately — never waits on the payer", async () => {
@@ -765,6 +917,64 @@ describe("convertIntent — sideshift (polling hidden, custodial signalled)", ()
     await expect(
       convertIntent({ from: "USDT", to: "USDT", network: "liquid", amount: 1n }, deps)
     ).rejects.toSatisfy((e) => isDepixSdkError(e, "MULTIPLE_ROUTES_AVAILABLE"));
+  });
+});
+
+describe("precision guards — the bigint→number boundary fails loud, never silently", () => {
+  it("a >8-decimal stablecoin estimate is refused (up-scaling would over-report) and surfaces as a route note", async () => {
+    // estimate-only path: the throw at intent.ts (est.decimals > 8) is caught by
+    // quoteRoute and becomes a null estimate + note — never a bad number.
+    const estimateStablecoin = vi.fn(async (p: { asset: string; networkId: string; amountSats: number }) => ({
+      receiveAmount: 950_000_000n,
+      decimals: 9, // a hypothetical future 9-decimal boltz variant
+      sendAmountSats: p.amountSats,
+      boltzPercent: 0.1,
+      minerFeesSats: 300,
+      minSats: 1_000,
+      maxSats: null
+    }));
+    const { deps } = makeDeps({ estimateStablecoin: estimateStablecoin as never });
+    const routes = await quoteRoutes({ from: "LBTC", to: "USDC", network: "base", amount: 50_000n }, deps);
+    expect(routes).toHaveLength(1); // single-hop boltz.toStablecoin
+    expect(estimateStablecoin).toHaveBeenCalledWith(
+      expect.objectContaining({ asset: "USDC", networkId: "base", amountSats: 50_000 })
+    );
+    const route = routes[0]!;
+    expect(route.estimatedReceivedSats).toBe(null); // NEVER a 10^(decimals-8)-over-reported number
+    expect(route.estimateComplete).toBe(false);
+    expect(route.legs[0]!.estimatedReceivedSats).toBe(null);
+    expect(route.notes.join(" ")).toMatch(/decimals 9 > 8 not supported/);
+  });
+
+  it("an amount above Number.MAX_SAFE_INTEGER is refused with INVALID_AMOUNT BEFORE the provider is called", async () => {
+    const { deps, boltz } = makeDeps();
+    const over = BigInt(Number.MAX_SAFE_INTEGER) + 1n;
+    await expect(
+      convertIntent({ from: "LBTC", to: "USDC", network: "base", amount: over, address: "0xAbCd" }, deps)
+    ).rejects.toSatisfy((e) => {
+      if (!isDepixSdkError(e, "INVALID_AMOUNT")) return false;
+      const nextStep = String((e as { details?: { nextStep?: string } }).details?.nextStep ?? "");
+      // The guard is actionable: it names the exact per-leg ceiling.
+      return nextStep.includes(String(Number.MAX_SAFE_INTEGER));
+    });
+    expect(boltz.toStablecoin).not.toHaveBeenCalled();
+
+    // The same guard protects the receiveLightning inflow narrow.
+    await expect(
+      convertIntent({ from: "BTC", to: "LBTC", network: "liquid", fromNetwork: "lightning", amount: over }, deps)
+    ).rejects.toSatisfy((e) => isDepixSdkError(e, "INVALID_AMOUNT"));
+    expect(boltz.receiveLightning).not.toHaveBeenCalled();
+  });
+
+  it("an amount of exactly Number.MAX_SAFE_INTEGER passes the bound and reaches the provider losslessly", async () => {
+    const { deps, boltz } = makeDeps();
+    const max = BigInt(Number.MAX_SAFE_INTEGER);
+    const res = await convertIntent(
+      { from: "BTC", to: "LBTC", network: "liquid", fromNetwork: "lightning", amount: max },
+      deps
+    );
+    expect(res.status).toBe("awaiting_funding");
+    expect(boltz.receiveLightning).toHaveBeenCalledWith({ amountSats: Number.MAX_SAFE_INTEGER });
   });
 });
 

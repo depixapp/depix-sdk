@@ -113,6 +113,81 @@ describe("USDt amount ↔ SideShift decimal", () => {
   });
 });
 
+// Deterministic seeded fuzz (no property-testing dep): a money-adjacent decimal
+// bug here silently mis-sizes a leg or mis-reports a receipt, so hammer the
+// round-trip over a wide range. The seed is FIXED — every failure reproduces.
+describe("USDt decimal round-trip — seeded fuzz", () => {
+  /** mulberry32 — tiny deterministic PRNG, good enough for value fuzzing. */
+  function mulberry32(seed: number): () => number {
+    let a = seed >>> 0;
+    return () => {
+      a = (a + 0x6d2b79f5) >>> 0;
+      let t = a;
+      t = Math.imul(t ^ (t >>> 15), t | 1);
+      t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  const ITERATIONS = 2_000;
+
+  it("sats → decimal → sats is the identity over [0, 10^16) (2000 seeded cases)", () => {
+    const rand = mulberry32(0xdec1a15);
+    for (let i = 0; i < ITERATIONS; i++) {
+      const hi = BigInt(Math.floor(rand() * 0x1_0000_0000));
+      const lo = BigInt(Math.floor(rand() * 0x1_0000_0000));
+      const sats = ((hi << 32n) | lo) % 10_000_000_000_000_000n;
+      const decimal = usdtSatsToDecimal(sats);
+      expect(usdtDecimalToSats(decimal), `sats=${sats} decimal=${decimal}`).toBe(sats);
+      // The rendered decimal is canonical: no trailing fractional zeros, no bare dot.
+      expect(decimal, `sats=${sats}`).not.toMatch(/\.$|\.\d*0$/);
+    }
+  });
+
+  it("decimal → sats → decimal is idempotent and ≤8-digit fractions always parse (2000 seeded cases)", () => {
+    const rand = mulberry32(0x5eed);
+    for (let i = 0; i < ITERATIONS; i++) {
+      const whole = Math.floor(rand() * 1_000_000_000);
+      const fracDigits = Math.floor(rand() * 9); // 0..8
+      const frac =
+        fracDigits === 0
+          ? ""
+          : "." + String(Math.floor(rand() * 10 ** fracDigits)).padStart(fracDigits, "0");
+      const input = `${whole}${frac}`;
+      const sats = usdtDecimalToSats(input);
+      expect(sats, `input=${input}`).not.toBeNull();
+      // Round-trip: the canonical decimal re-parses to the SAME sats (idempotence).
+      const canonical = usdtSatsToDecimal(sats!);
+      expect(usdtDecimalToSats(canonical), `input=${input} canonical=${canonical}`).toBe(sats);
+    }
+  });
+
+  it("a 9-digit fraction with a non-zero tail is ALWAYS rejected (unrepresentable, never rounded)", () => {
+    const rand = mulberry32(0xbad);
+    for (let i = 0; i < 500; i++) {
+      const whole = Math.floor(rand() * 1_000_000);
+      const first8 = String(Math.floor(rand() * 10 ** 8)).padStart(8, "0");
+      const nonZeroTail = 1 + Math.floor(rand() * 9); // 1..9 — beyond the 8-decimal grid
+      expect(usdtDecimalToSats(`${whole}.${first8}${nonZeroTail}`)).toBeNull();
+    }
+  });
+
+  it("the 6→8-decimal up-scale (EVM receiveAmount × 100) agrees with the decimal parser (2000 seeded cases)", () => {
+    // Mirrors intent.ts estimateLeg: a 6-decimal boltz stablecoin receipt is
+    // normalized by receiveAmount * 10^(8-6). The SAME value rendered as a
+    // 6-decimal string and parsed on the 8-decimal grid must agree exactly.
+    const rand = mulberry32(0x6e2e8);
+    for (let i = 0; i < ITERATIONS; i++) {
+      const hi = BigInt(Math.floor(rand() * 0x1_0000_0000));
+      const lo = BigInt(Math.floor(rand() * 0x1_0000_0000));
+      const receiveAmount6 = ((hi << 32n) | lo) % 100_000_000_000_000n; // 6-decimal base units
+      const whole = receiveAmount6 / 1_000_000n;
+      const frac = (receiveAmount6 % 1_000_000n).toString().padStart(6, "0");
+      const decimal6 = `${whole}.${frac}`;
+      expect(usdtDecimalToSats(decimal6), `receiveAmount6=${receiveAmount6}`).toBe(receiveAmount6 * 100n);
+    }
+  });
+});
+
 describe("SHIFT_STATUS taxonomy", () => {
   it("classifies pending / terminal / refund", () => {
     for (const s of ["waiting", "pending", "processing", "review", "settling"]) {

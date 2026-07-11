@@ -690,6 +690,36 @@ describe("resumeConversionPlans — concurrent recovery is double-spend-safe (§
     expect(await store.count()).toBe(1); // still tracked until the provider settles
   });
 
+  it("a plan removed between the resume's readAll snapshot and the leg claim is NOT driven (claimLeg → not_found)", async () => {
+    await seedPlan(); // leg 1 settled (19_500), leg 2 (toStablecoin) never started
+    // Adversarial interleaving: a CONCURRENT driver completes and removes the
+    // plan right after this pass snapshots it — the claim must then decide on
+    // the store's FRESH state (gone), never on the stale snapshot.
+    const raceStore = new Proxy(store, {
+      get(target, prop, receiver) {
+        if (prop === "readAll") {
+          return async () => {
+            const snapshot = await target.readAll();
+            await target.remove("plan-crash-1");
+            return snapshot;
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === "function" ? value.bind(target) : value;
+      }
+    }) as ConversionPlanStore;
+    const { deps, ss, bz } = makeDeps({ planStore: raceStore });
+
+    const summary = await resumeConversionPlans(deps, SILENT);
+
+    // THE proof: the snapshot said "drive leg 2", the claim said not_found —
+    // NOTHING was dispatched to any provider over the removed plan.
+    expect(bz.stablecoinCalls).toHaveLength(0);
+    expect(ss.executed).toHaveLength(0);
+    expect(summary).toMatchObject({ checked: 1, completed: 0, needsReview: 0, discarded: 0, failed: 0 });
+    expect(await store.count()).toBe(0); // nothing resurrected the record
+  });
+
   it("the normal SEQUENTIAL resume still drives the next leg exactly once (no regression)", async () => {
     await seedPlan();
     const { deps, ss, bz } = makeDeps();
