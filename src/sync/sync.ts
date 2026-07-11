@@ -183,6 +183,26 @@ export class SyncEngine {
     return this.syncPromise;
   }
 
+  /**
+   * Deep re-scan for wallet.sync({ rescan: true }) (PR-D). The caller passes a
+   * VIRGIN wollet (neverScanned() → the cold-start timeout applies), so LWK
+   * re-derives the whole history from zero instead of the incremental delta.
+   * Unlike sync(), this must NOT join an in-flight scan — that scan targets a
+   * DIFFERENT (the stale) wollet and joining it would return without ever
+   * scanning the fresh one. Any in-flight pass is awaited out first; failures
+   * of that pass are its own caller's to observe.
+   */
+  async rescan(wollet: Wollet): Promise<SyncResult> {
+    while (this.syncPromise) {
+      await this.syncPromise.catch(() => {});
+    }
+    const scan = this.syncInner(wollet).finally(() => {
+      this.syncPromise = null;
+    });
+    this.syncPromise = scan;
+    return scan;
+  }
+
   private async syncInner(wollet: Wollet): Promise<SyncResult> {
     const timeoutMs = wollet.neverScanned() ? this.coldStartTimeoutMs : this.syncTimeoutMs;
     const startIndex = Math.min(this.lastGoodProviderIndex, this.providers.length - 1);

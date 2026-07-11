@@ -19,6 +19,7 @@ import type {
   SendParams,
   SendResult,
   WalletBalances,
+  WalletDiagnostics,
   WalletTransaction,
   WithdrawParams,
   WithdrawResult,
@@ -104,6 +105,7 @@ export interface McpWalletFacade {
   waitForWithdrawal(id: string, options?: WaitOptions): Promise<StatusReadResponse>;
   recover(): Promise<RecoverySummary>;
   getPending(): Promise<PendingItem[]>;
+  diagnostics(): Promise<WalletDiagnostics>;
   readonly convert: McpConvertFacade;
   readonly giftcards: McpGiftcardsFacade;
 }
@@ -579,6 +581,39 @@ function pendingItemToOutput(item: PendingItem) {
 export async function pendingTool(wallet: McpWalletFacade) {
   const items = await wallet.getPending();
   return { pending: items.map(pendingItemToOutput) };
+}
+
+/**
+ * wallet_diagnostics (PR-D) — read-only health snapshot for support. Maps ONE
+ * wallet method (wallet.diagnostics()); the wallet layer guarantees the
+ * snapshot carries NO key material (getPending()'s fund-safety rule).
+ */
+export async function diagnosticsTool(wallet: McpWalletFacade) {
+  const d = await wallet.diagnostics();
+  return {
+    sdk_version: d.sdkVersion,
+    lwk_version: d.lwkVersion,
+    data_dir: d.dataDir,
+    backup_confirmed: d.backupConfirmed,
+    has_seed: d.hasSeed,
+    api_key_configured: d.apiKeyConfigured,
+    sync: {
+      last_scan_at: d.sync.lastScanAt,
+      last_success_at: d.sync.lastSuccessAt,
+      last_persist_failed_at: d.sync.lastPersistFailedAt,
+      last_persist_error_name: d.sync.lastPersistErrorName,
+      persisted_updates: d.sync.persistedUpdates,
+      wallet_loaded: d.sync.walletLoaded,
+    },
+    pending: {
+      withdrawals: d.pending.withdrawals,
+      boltz_swaps: d.pending.boltzSwaps,
+      pegins: d.pending.pegins,
+      sideshift_shifts: d.pending.sideshiftShifts,
+      plans: d.pending.plans,
+    },
+    guardrails: d.guardrails ? guardrailBudget(d.guardrails) : null,
+  };
 }
 
 export async function shiftUsdtTool(

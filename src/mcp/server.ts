@@ -25,6 +25,7 @@ import {
   buyGiftcardTool,
   createDepositTool,
   createWithdrawalTool,
+  diagnosticsTool,
   getAddressTool,
   getBalancesTool,
   getGuardrailsTool,
@@ -57,9 +58,10 @@ export const DEFAULT_SERVER_VERSION = "1.0.0";
  * The full catalog (§6.2), prefixed `wallet_` (G10). Exported for tests/docs.
  * The MVP 10 (PR8) plus the fast-follow conversions + gift cards (PR8b) plus
  * SideShift (PR5c) plus the recovery pair (wallet_recover / wallet_pending —
- * fund-safety wiring) — 20 tools. wallet_shift_usdt (§5.4/G4) is the ONE
- * CUSTODIAL tool: its description says so explicitly (G4 = documentation-
- * signalled, no gate).
+ * fund-safety wiring) plus wallet_diagnostics (PR-D — read-only support
+ * snapshot) — 21 tools. wallet_shift_usdt (§5.4/G4) is the ONE CUSTODIAL
+ * tool: its description says so explicitly (G4 = documentation-signalled,
+ * no gate).
  */
 export const WALLET_TOOL_NAMES = [
   "wallet_status",
@@ -82,6 +84,7 @@ export const WALLET_TOOL_NAMES = [
   "wallet_shift_usdt",
   "wallet_recover",
   "wallet_pending",
+  "wallet_diagnostics",
 ] as const;
 
 const INSTRUCTIONS = [
@@ -585,6 +588,24 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
       annotations: read,
     },
     () => run(() => pendingTool(wallet)),
+  );
+
+  // ── maintenance/support: read-only health snapshot (PR-D) ──
+
+  server.registerTool(
+    "wallet_diagnostics",
+    {
+      title: "Wallet diagnostics",
+      description:
+        "Read a health snapshot for support/debugging: SDK + LWK versions, data dir, backup state, sync health " +
+        "(last scan/success and the last update-persist failure), per-rail pending counters, and the guardrail " +
+        "budget. Read-only and local (no network, no signing) and carries NO key material — never the seed, " +
+        "mnemonic or descriptor. Moves no money.",
+      inputSchema: s.diagnosticsInput,
+      outputSchema: s.diagnosticsOutput,
+      annotations: read,
+    },
+    () => run(() => diagnosticsTool(wallet)),
   );
 
   return server;
