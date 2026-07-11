@@ -80,11 +80,28 @@ import {
   makeAdvancedNamespace,
   makeConvertFacade,
   quoteRoutes,
+  type CoinSelection,
   type ConvertFacade,
   type ConvertIntent,
   type IntentDeps,
   type RouteQuote,
-  type WalletAdvanced
+  type SelectCoinsParams,
+  type SendManyParams,
+  type SendManyRecipient,
+  type SendManyResult,
+  type WalletAdvanced,
+  type WalletUtxo
+} from "./convert/intent.js";
+
+// Re-exported so the primitive types are importable from the wallet module too
+// (they live next to WalletAdvanced in convert/intent.ts).
+export type {
+  CoinSelection,
+  SelectCoinsParams,
+  SendManyParams,
+  SendManyRecipient,
+  SendManyResult,
+  WalletUtxo
 } from "./convert/intent.js";
 import { LWK_VERSION, SDK_VERSION } from "./version.js";
 import type { GuardrailDestination } from "./guardrails/allowlist.js";
@@ -521,6 +538,100 @@ async function runRitual(mnemonic: string, io?: RitualIo): Promise<boolean> {
   }
 }
 
+// ─── wallet.advanced low-level primitives (PR-E) — pure planning helpers ─────
+
+/** One planned output of an advanced.sendMany() transaction. */
+export interface SendManyOutput {
+  assetKey: AssetKey;
+  amountSats: bigint;
+  address: string;
+  /** true → TxBuilder.addLbtcRecipient; false → addRecipient with the asset id. */
+  lbtc: boolean;
+}
+
+/** Validated output plan + the per-asset totals the guardrail values (§4.3). */
+export interface SendManyPlan {
+  /** The N outputs, in the caller's order. */
+  outputs: SendManyOutput[];
+  /**
+   * Sum of the output amounts per asset — this is what gets valued in BRL and
+   * enforced as ONE total by the §4.3 choke point, so N small outputs can
+   * never slice under the per-tx ceiling.
+   */
+  totalsByAsset: Map<AssetKey, bigint>;
+}
+
+/**
+ * Validate the sendMany recipients and produce the deterministic output plan.
+ * Pure (no lwk, no I/O) so the multi-output construction is unit-testable;
+ * address VALIDITY is checked separately by sendMany (it needs the lwk parser).
+ */
+export function planSendMany(recipients: readonly SendManyRecipient[]): SendManyPlan {
+  if (!Array.isArray(recipients) || recipients.length === 0) {
+    throw new WalletError(
+      "INVALID_ARGUMENT",
+      "sendMany requires a non-empty recipients array ({ asset, amountSats, address })"
+    );
+  }
+  const outputs: SendManyOutput[] = [];
+  const totalsByAsset = new Map<AssetKey, bigint>();
+  for (const recipient of recipients) {
+    const asset = ASSETS[recipient?.asset as AssetKey];
+    if (!asset) {
+      throw new WalletError("UNSUPPORTED_ASSET", `Unknown asset: ${String(recipient?.asset)}`);
+    }
+    if (typeof recipient.amountSats !== "bigint" || recipient.amountSats <= 0n) {
+      throw new WalletError(
+        "INVALID_AMOUNT",
+        "every sendMany recipient amountSats must be a positive bigint"
+      );
+    }
+    if (typeof recipient.address !== "string" || recipient.address.trim().length === 0) {
+      throw new WalletError(
+        "INVALID_ADDRESS",
+        "every sendMany recipient needs a Liquid address string"
+      );
+    }
+    outputs.push({
+      assetKey: asset.key,
+      amountSats: recipient.amountSats,
+      address: recipient.address,
+      lbtc: asset.key === "LBTC"
+    });
+    totalsByAsset.set(asset.key, (totalsByAsset.get(asset.key) ?? 0n) + recipient.amountSats);
+  }
+  return { outputs, totalsByAsset };
+}
+
+/**
+ * Greedy coin selection over an already-asset-filtered UTXO list: confirmed
+ * coins first (several counterparties refuse unconfirmed inputs — same shape
+ * as the SideSwap taker selection in convert/sideswap.ts), largest-first
+ * within each group, stopping at the first coin that covers the target. Pure
+ * and INFORMATIONAL — LWK's TxBuilder does its own selection at build time.
+ * Returns everything it accumulated even when the coins cannot cover (the
+ * caller decides whether that is an error).
+ */
+export function selectCoinsGreedy(
+  utxos: readonly WalletUtxo[],
+  targetSats: bigint
+): { selected: WalletUtxo[]; totalSats: bigint } {
+  const ordered = [...utxos].sort((a, b) => {
+    const aConfirmed = a.height !== null;
+    const bConfirmed = b.height !== null;
+    if (aConfirmed !== bConfirmed) return aConfirmed ? -1 : 1;
+    return b.amountSats > a.amountSats ? 1 : b.amountSats < a.amountSats ? -1 : 0;
+  });
+  const selected: WalletUtxo[] = [];
+  let totalSats = 0n;
+  for (const utxo of ordered) {
+    if (totalSats >= targetSats) break;
+    selected.push(utxo);
+    totalSats += utxo.amountSats;
+  }
+  return { selected, totalSats };
+}
+
 interface WalletParts {
   dataDir: string;
   passphrase: string | undefined;
@@ -793,8 +904,16 @@ export class DepixWallet {
     this.convert = makeConvertFacade(convertNs, this.intentDeps, () => this.assertOpen());
     // wallet.advanced (PR-D): the SAME ConvertNamespace instances re-exposed as
     // the canonical power-user surface — reference-identical to the facade's
-    // legacy getters, so provider state is shared, never duplicated.
-    this.advanced = makeAdvancedNamespace(convertNs);
+    // legacy getters, so provider state is shared, never duplicated. PR-E adds
+    // the low-level primitives as closures into THIS instance: listUtxos/
+    // selectCoins are read-only; sendMany routes through the same private
+    // machinery as send() (§4.3 choke point + opMutex + recordSpend), so the
+    // namespace carries no signing path of its own.
+    this.advanced = makeAdvancedNamespace(convertNs, {
+      listUtxos: () => this.advancedListUtxos(),
+      selectCoins: (params) => this.advancedSelectCoins(params),
+      sendMany: (params) => this.advancedSendMany(params)
+    });
     // Gift cards (§5.5): browse + buy via CryptoRefills, paid over Lightning by
     // REUSING the same BoltzConvert instance as wallet.convert.boltz (so the
     // guardrail choke point + refund/watch machinery is shared, not duplicated).
@@ -1370,6 +1489,240 @@ export class DepixWallet {
       const finalized = wollet.finalize(signed);
       const txid = await this.syncEngine.broadcast(finalized);
       return { txid };
+    });
+  }
+
+  // ─── low-level primitives (PR-E): wallet.advanced.* ───────────────────────
+
+  /**
+   * advanced.listUtxos() — READ-ONLY view of the wallet's unspent outputs.
+   * Signs nothing, moves nothing, records nothing; metadata only (no blinding
+   * factors — those stay inside the SideSwap taker seam, convert/sideswap.ts).
+   */
+  private async advancedListUtxos(): Promise<WalletUtxo[]> {
+    this.assertOpen();
+    const wollet = await this.ensureWollet();
+    // Confirmation count needs the chain tip; a never-synced wallet may not
+    // have one — report 0 confirmations rather than fail a read surface.
+    let tipHeight: number | null = null;
+    try {
+      const h = wollet.tip().height();
+      if (Number.isSafeInteger(h) && h > 0) tipHeight = h;
+    } catch {
+      // no tip yet — confirmations stay 0
+    }
+    const result: WalletUtxo[] = [];
+    for (const utxo of wollet.utxos()) {
+      try {
+        const outpoint = utxo.outpoint();
+        const unblinded = utxo.unblinded();
+        const assetId = unblinded.asset().toString();
+        const height = utxo.height() ?? null;
+        const confirmations =
+          height !== null && tipHeight !== null && tipHeight >= height
+            ? tipHeight - height + 1
+            : 0;
+        result.push({
+          asset: MAINNET_ASSET_ID_TO_KEY[assetId] ?? assetId,
+          amountSats: BigInt(unblinded.value()),
+          outpoint: { txid: outpoint.txid().toString(), vout: outpoint.vout() },
+          address: utxo.address().toString(),
+          height,
+          confirmations
+        });
+      } catch (err) {
+        // A malformed/unblindable entry is unspendable anyway, so dropping it
+        // is correct (parity with collectSwapUtxos). But selectCoins() consumes
+        // this list, so a silent drop could surface a false INSUFFICIENT_FUNDS
+        // from that informational helper — leave a debug breadcrumb naming the
+        // skipped outpoint (best-effort read; the throw may be the outpoint
+        // itself, in which case it stays "unknown").
+        let outpointRef = "unknown";
+        try {
+          const op = utxo.outpoint();
+          outpointRef = `${op.txid().toString()}:${op.vout()}`;
+        } catch {
+          // outpoint unreadable too — keep "unknown"
+        }
+        this.logger.debug("advanced.listUtxos: skipped unreadable UTXO", {
+          outpoint: outpointRef,
+          error: err instanceof Error ? err.message : String(err)
+        });
+      }
+    }
+    return result;
+  }
+
+  /**
+   * advanced.selectCoins() — READ-ONLY coin-selection helper: which UTXOs
+   * would cover `targetSats` of `asset` (greedy, confirmed-first,
+   * largest-first) and the estimated change. INFORMATIONAL: LWK's TxBuilder
+   * performs its own selection at build time, and the network fee is not
+   * modeled here. Nothing is reserved, signed or spent.
+   */
+  private async advancedSelectCoins(params: SelectCoinsParams): Promise<CoinSelection> {
+    this.assertOpen();
+    const asset = ASSETS[params?.asset];
+    if (!asset) {
+      throw new WalletError("UNSUPPORTED_ASSET", `Unknown asset: ${String(params?.asset)}`);
+    }
+    if (typeof params.targetSats !== "bigint" || params.targetSats <= 0n) {
+      throw new WalletError("INVALID_AMOUNT", "targetSats must be a positive bigint");
+    }
+    const candidates = (await this.advancedListUtxos()).filter((u) => u.asset === asset.key);
+    const { selected, totalSats } = selectCoinsGreedy(candidates, params.targetSats);
+    if (totalSats < params.targetSats) {
+      throw new WalletError(
+        "INSUFFICIENT_FUNDS",
+        `Wallet ${asset.key} UTXOs total ${totalSats} sats — cannot cover the ` +
+          `${params.targetSats} sats target`
+      );
+    }
+    return {
+      utxos: selected,
+      totalSats,
+      targetSats: params.targetSats,
+      changeSats: totalSats - params.targetSats
+    };
+  }
+
+  /**
+   * advanced.sendMany() — ONE Liquid transaction with N recipient outputs
+   * (possibly across assets), signed locally. SAME GUARDRAIL INVARIANT AS
+   * send() (§4.3), enforced on the TOTAL: the output amounts are summed per
+   * asset, each per-asset total is valued in BRL (§4.4 — non-DePix assets
+   * fail CLOSED without a quote), and the GRAND TOTAL crosses
+   * guardrails.enforce() as one intent — so N small outputs can never slice
+   * under the per-tx ceiling, and the rolling-24h window sees the full value.
+   * EVERY destination address is a `liquidAddress` allowlist destination.
+   * The whole enforce→build→sign→record→broadcast section runs under the
+   * per-wallet opMutex (§4.3 TOCTOU), and the spend is recorded at SIGNING
+   * time (§4.5) — exactly the send() cadence. There is no way to reach the
+   * signer through this method without crossing the choke point first.
+   */
+  private async advancedSendMany(params: SendManyParams): Promise<SendManyResult> {
+    this.assertOpen();
+    const plan = planSendMany(params?.recipients as readonly SendManyRecipient[]);
+    // Parse every address up front — INVALID_ADDRESS before the mutex, before
+    // any valuation or signing (parity with send()).
+    const parsed = plan.outputs.map((output) => {
+      try {
+        return { output, address: new Address(output.address) };
+      } catch (err) {
+        throw new WalletError("INVALID_ADDRESS", `Not a valid Liquid address: ${output.address}`, {
+          cause: err
+        });
+      }
+    });
+
+    // Serialize enforce→build→sign→record→broadcast per wallet instance —
+    // same §4.3 TOCTOU rationale as send(): without this, concurrent calls
+    // could all read the same window and jointly exceed the daily cap.
+    return this.opMutex.runExclusive(async () => {
+      // Choke point (§4.3) on the TOTAL — BEFORE anything is built or signed.
+      let brlCents = 0;
+      for (const [assetKey, totalSats] of plan.totalsByAsset) {
+        brlCents += await this.valuator.valuate(assetKey, totalSats);
+      }
+      await this.guardrails.enforce({
+        kind: "send-many",
+        brlCents,
+        destinations: plan.outputs.map((output) => ({
+          kind: "liquidAddress" as const,
+          address: output.address
+        }))
+      });
+
+      const wollet = await this.ensureWollet();
+      const network = mainnetNetwork();
+      let builder = new TxBuilder(network);
+      try {
+        for (const { output, address } of parsed) {
+          builder = output.lbtc
+            ? builder.addLbtcRecipient(address, output.amountSats)
+            : builder.addRecipient(
+                address,
+                output.amountSats,
+                new AssetId(ASSETS[output.assetKey].id)
+              );
+        }
+      } catch (err) {
+        throw new WalletError("INVALID_ADDRESS", "Recipient rejected by the transaction builder", {
+          cause: err
+        });
+      }
+
+      let pset;
+      try {
+        pset = builder.finish(wollet);
+      } catch (err) {
+        throw await this.classifySendManyFinishError(err, plan.totalsByAsset);
+      }
+
+      // Ephemeral signer, zeroed in finally (per-op auth §2.3 — as send()).
+      let signed;
+      {
+        let mnemonic: InstanceType<typeof Mnemonic> | null = null;
+        let signer: InstanceType<typeof Signer> | null = null;
+        try {
+          mnemonic = new Mnemonic(await this.decryptMnemonic());
+          signer = new Signer(mnemonic, network);
+          signed = signer.sign(pset);
+        } finally {
+          try {
+            signer?.free();
+            mnemonic?.free();
+          } catch {
+            // best effort
+          }
+        }
+      }
+
+      // Accounted at SIGNING time, not settlement (§4.5) — same as send().
+      await this.guardrails.recordSpend(brlCents, "send-many");
+
+      const finalized = wollet.finalize(signed);
+      const txid = await this.syncEngine.broadcast(finalized);
+      return { txid };
+    });
+  }
+
+  /**
+   * Multi-asset variant of classifyFinishError for sendMany: when EVERY
+   * per-asset output total is covered by the balances, the shortfall is the
+   * L-BTC network fee (unless an L-BTC output is itself part of the intent —
+   * then, like send()'s L-BTC branch, the two cannot be told apart).
+   */
+  private async classifySendManyFinishError(
+    err: unknown,
+    totals: ReadonlyMap<AssetKey, bigint>
+  ): Promise<WalletError> {
+    const message = String((err as Error)?.message ?? err ?? "").toLowerCase();
+    const insufficient = message.includes("insufficient") || message.includes("not enough");
+    if (!insufficient) {
+      return new WalletError("INVALID_AMOUNT", "Transaction build failed", { cause: err });
+    }
+    try {
+      const { balances } = await this.getBalances();
+      let covered = true;
+      for (const [assetKey, totalSats] of totals) {
+        if (balances[assetKey] < totalSats) {
+          covered = false;
+          break;
+        }
+      }
+      if (covered && !totals.has("LBTC")) {
+        return new WalletError(
+          "INSUFFICIENT_LBTC_FOR_FEE",
+          "Not enough L-BTC to pay the network fee — convert a little to L-BTC and retry",
+          { cause: err }
+        );
+      }
+    } catch {
+      // fall through to INSUFFICIENT_FUNDS
+    }
+    return new WalletError("INSUFFICIENT_FUNDS", "Insufficient funds for this multi-output send", {
+      cause: err
     });
   }
 
