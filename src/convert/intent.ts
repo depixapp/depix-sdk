@@ -970,15 +970,91 @@ export interface ConvertFacade {
   readonly boltz: BoltzConvert;
 }
 
+// ─── wallet.advanced low-level primitives (PR-E) ──────────────────────────────
+// The types live here (next to WalletAdvanced) so the namespace module is
+// self-contained; the implementations are private DepixWallet methods injected
+// via makeAdvancedNamespace — the namespace itself holds NO wallet machinery.
+
+/** One UTXO of the wallet — the read-only view of advanced.listUtxos(). */
+export interface WalletUtxo {
+  /** AssetKey for the three known mainnet assets; the raw hex asset id otherwise. */
+  asset: AssetKey | string;
+  /** Unblinded amount in base units (8 decimals on Liquid). */
+  amountSats: bigint;
+  outpoint: { txid: string; vout: number };
+  /** The confidential receive address this output pays. */
+  address: string;
+  /** Block height when confirmed; null while in the mempool. */
+  height: number | null;
+  /** tip − height + 1 when confirmed and the tip is known; 0 otherwise. */
+  confirmations: number;
+}
+
+export interface SelectCoinsParams {
+  asset: AssetKey;
+  /** Target amount to cover, in base units. */
+  targetSats: bigint;
+}
+
+/**
+ * advanced.selectCoins() result — INFORMATIONAL ONLY. LWK's TxBuilder performs
+ * its own coin selection at build time; this mirrors it (confirmed-first,
+ * largest-first greedy) so an agent can reason about which coins WOULD fund a
+ * target, but nothing here reserves or spends anything.
+ */
+export interface CoinSelection {
+  /** The UTXOs that would cover the target (greedy, confirmed-first, largest-first). */
+  utxos: WalletUtxo[];
+  totalSats: bigint;
+  targetSats: bigint;
+  /** totalSats − targetSats. The network fee is NOT modeled here. */
+  changeSats: bigint;
+}
+
+export interface SendManyRecipient {
+  asset: AssetKey;
+  amountSats: bigint;
+  address: string;
+}
+
+export interface SendManyParams {
+  recipients: readonly SendManyRecipient[];
+}
+
+export interface SendManyResult {
+  txid: string;
+}
+
+/**
+ * The low-level wallet primitives carried by `wallet.advanced` (PR-E).
+ *
+ * listUtxos/selectCoins are READ-ONLY — they move nothing and sign nothing.
+ * sendMany MOVES FUNDS and therefore crosses the §4.3 guardrail choke point
+ * EXACTLY like wallet.send(): the TOTAL BRL value of all outputs (summed per
+ * asset, valued via §4.4) is enforced against the per-tx and rolling-24h
+ * ceilings, EVERY destination address is checked against the allowlist, and
+ * the spend is recorded at signing time — all under the wallet op mutex.
+ * There is deliberately NO buildPset/signPset/broadcastPset here: a signed
+ * PSET is broadcastable by any code path, so signing outside the choke point
+ * would be a guardrail bypass (footgun documented in the PR-E decision).
+ */
+export interface WalletAdvancedPrimitives {
+  listUtxos(): Promise<WalletUtxo[]>;
+  selectCoins(params: SelectCoinsParams): Promise<CoinSelection>;
+  sendMany(params: SendManyParams): Promise<SendManyResult>;
+}
+
 /**
  * `wallet.advanced` (PR-D) — the power-user surface: the SAME provider
  * namespace instances that back wallet.convert()/wallet.quote(), exposed for
  * fine-grained control (SideSwap quote streams and pegStatus, Boltz manual
  * resume/refund watches, SideShift shift log and refund addresses…). Every
  * money-moving method still crosses the §4.3 guardrail choke point inside the
- * provider — this namespace adds NO signing path and NO bypass.
+ * provider — this namespace adds NO signing path and NO bypass. PR-E adds the
+ * low-level wallet primitives (listUtxos/selectCoins/sendMany) under the same
+ * invariant.
  */
-export interface WalletAdvanced {
+export interface WalletAdvanced extends WalletAdvancedPrimitives {
   /** SideSwap market swaps + BTC↔L-BTC peg (§5.1/§5.2 — non-custodial). */
   readonly sideswap: SideSwapNamespace;
   /** SideShift USDt cross-network (§5.4 — CUSTODIAL, signalled). */
@@ -1039,11 +1115,23 @@ export function makeConvertFacade(
  * watches) is shared, never duplicated. Same getter discipline as the facade:
  * non-enumerable, so spreading/serializing `wallet.advanced` never trips the
  * `.boltz` view-only WALLET_NOT_FOUND gate; direct access still gates.
+ *
+ * `primitives` (PR-E) are closures bound to the OWNING DepixWallet instance:
+ * the namespace never holds keys, guardrails or a signer of its own — sendMany
+ * delegates into the wallet, where the §4.3 choke point is structurally
+ * unavoidable (enforce→sign→record under the op mutex). Also non-enumerable,
+ * for the same spread/serialize hygiene.
  */
-export function makeAdvancedNamespace(ns: ConvertNamespace): WalletAdvanced {
+export function makeAdvancedNamespace(
+  ns: ConvertNamespace,
+  primitives: WalletAdvancedPrimitives
+): WalletAdvanced {
   const advanced = {} as WalletAdvanced;
   Object.defineProperty(advanced, "sideswap", { get: () => ns.sideswap, enumerable: false });
   Object.defineProperty(advanced, "sideshift", { get: () => ns.sideshift, enumerable: false });
   Object.defineProperty(advanced, "boltz", { get: () => ns.boltz, enumerable: false });
+  Object.defineProperty(advanced, "listUtxos", { value: primitives.listUtxos, enumerable: false });
+  Object.defineProperty(advanced, "selectCoins", { value: primitives.selectCoins, enumerable: false });
+  Object.defineProperty(advanced, "sendMany", { value: primitives.sendMany, enumerable: false });
   return advanced;
 }

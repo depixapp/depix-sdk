@@ -279,6 +279,42 @@ Every money-moving method still crosses the owner's guardrails before signing
 > still work (they alias the very same instances) but are deprecated — use
 > `wallet.advanced.*`. They will not be removed in 1.x.
 
+### Low-level wallet primitives (`wallet.advanced.*`)
+
+Three primitives for agents that need to see and shape transactions directly:
+
+```ts
+// READ-ONLY: every UTXO of the wallet (asset, amount, outpoint, address, confirmations).
+const utxos = await wallet.advanced.listUtxos();
+
+// READ-ONLY: which UTXOs would cover a target (greedy, confirmed-first, largest-first),
+// plus the estimated change. Informational — LWK's builder does its own selection
+// at build time, and the network fee is not modeled here.
+const pick = await wallet.advanced.selectCoins({ asset: "DEPIX", targetSats: 500_000_000n });
+
+// MOVES FUNDS: one Liquid tx with N recipient outputs (assets can be mixed).
+const { txid } = await wallet.advanced.sendMany({
+  recipients: [
+    { asset: "DEPIX", amountSats: 200_000_000n, address: "lq1…a" },
+    { asset: "DEPIX", amountSats: 300_000_000n, address: "lq1…b" },
+    { asset: "LBTC",  amountSats: 10_000n,      address: "lq1…c" }
+  ]
+});
+```
+
+`sendMany` crosses the **same guardrail choke point as `send()`, on the
+TOTAL**: output amounts are summed per asset, valued in BRL (non-DePix assets
+fail closed without a quote), and the grand total is enforced against the
+per-tx and rolling-24h ceilings — N small outputs cannot slice under the cap.
+With the allowlist on, **every** destination address must be opted in. The
+spend is recorded at signing time, all under the wallet op mutex.
+
+> **No raw PSET surface.** `buildPset`/`signPset`/`broadcastPset` are
+> deliberately not exposed: a signed PSET can be broadcast by any code path,
+> so signing arbitrary PSETs outside the choke point would be a guardrail
+> bypass. If you need a custom transaction shape, ask for a primitive that
+> can carry the guardrail with it (like `sendMany` does).
+
 ### SideShift (custodial USDt bridge)
 
 SideShift uses a deposit-address model: you **send USDt to an address they give
