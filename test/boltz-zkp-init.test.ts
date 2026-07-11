@@ -32,12 +32,7 @@ describe("ensureBoltzUtxoSecp — claim-path zkp wiring (mainnet e2e regression,
     expect(secp.confidential).toBeDefined();
   });
 
-  it("also initializes boltz-core/liquid's global secp (the verify-lockup taproot-tweak path)", async () => {
-    resetBoltzSecpForTests();
-    await ensureBoltzUtxoSecp();
-    // If the global secp weren't initialized, boltz-core/liquid's confidential
-    // helpers throw; a no-throw import+access is the observable signal here.
-    const liquid = (await import("boltz-core/liquid")) as unknown as Record<string, unknown>;
-    expect(liquid).toBeDefined();
-  });
+  // The boltz-core/liquid GLOBAL secp init (the verify-lockup taproot-tweak
+  // path) is covered end-to-end by boltz-verify-lockup.test.ts, which fails if
+  // that secp is absent — no weaker duplicate here.
 });

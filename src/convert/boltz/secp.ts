@@ -44,6 +44,11 @@ export function ensureBoltzUtxoSecp(): Promise<void> {
         (liquid as { confidential?: unknown; default?: { confidential?: unknown } }).confidential ??
         (liquid as { default?: { confidential?: unknown } }).default?.confidential
       ) as { Confidential: new (s: unknown) => unknown };
+      // NOTE: `modules` is boltz-swaps' internal Loader cache field (not a
+      // documented API). Pinned to boltz-swaps@0.0.8 (exact, no ^/~) — any bump
+      // must re-verify this field name and the { secpZkp, confidential } shape
+      // against boltz-swaps/dist/utxo/lazy.js, or claim construction breaks with
+      // no type error.
       const { utxoSecp } = (await import("boltz-swaps/lazy/utxo")) as unknown as {
         utxoSecp: { modules?: unknown };
       };
