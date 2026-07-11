@@ -323,4 +323,48 @@ describe("multi-hop plans in wallet.getPending() and wallet.recover()", () => {
     expect(await store.count()).toBe(0);
     expect((await wallet.getPending()).filter((i) => i.rail === "plan")).toHaveLength(0);
   });
+
+  it("TWO concurrent recover() calls drive a crash-between-legs plan's next leg EXACTLY ONCE (no double-spend, §4.1)", async () => {
+    const { fetchImpl } = fakeSideshiftFetch();
+    const sendUsdtCalls: Array<{ depositAddress: string; amountSats: bigint; brlCents: number }> = [];
+    wallet = await open({
+      dataDir,
+      passphrase: PASSPHRASE,
+      mnemonic: KNOWN_MNEMONIC,
+      quotes: QUOTES,
+      // R$50 caps — a NON-continuation R$100 send would bust them; the exit leg
+      // executes only because it authenticates as a plan continuation.
+      guardrails: { perTxLimitBrlCents: 5_000, dailyLimitBrlCents: 5_000 },
+      convert: {
+        sideshift: {
+          fetchImpl,
+          affiliateId: "test-affiliate",
+          sendUsdt: async (p: { depositAddress: string; amountSats: bigint; brlCents: number }) => {
+            sendUsdtCalls.push(p);
+            return { txid: "usdt_send_txid" };
+          }
+        }
+      }
+    });
+    // Crash BETWEEN legs: the market swap (leg 1) settled; the sideshift.send
+    // exit leg (leg 2) never started — recover() must drive leg 2.
+    const store = await seedWalletPlan(dataDir, {
+      currentLegIndex: 0,
+      legResults: [{ state: "settled", txids: ["swap_txid"], receivedSats: 2_000_000_000n, trackingId: null }]
+    });
+
+    // The parallel-call adversary the mutex targets (mutex.ts:5-10): two
+    // recover() passes at once, each driving from its own readAll() snapshot.
+    const [a, b] = await Promise.all([wallet.recover(), wallet.recover()]);
+
+    // THE proof: the exit leg's provider (SideShift sendUsdt) is dispatched
+    // ONCE — never twice. One pass claims and executes the send; the other,
+    // serialized behind the recovery mutex, finds it in flight and PROBES it to
+    // settled (fake REST) instead of re-broadcasting.
+    expect(sendUsdtCalls).toHaveLength(1);
+    // Combined, the two passes complete the plan exactly once; it is then gone.
+    expect(a.plans.completed + b.plans.completed).toBe(1);
+    expect(await store.count()).toBe(0);
+    expect((await wallet.getPending()).filter((i) => i.rail === "plan")).toHaveLength(0);
+  });
 });

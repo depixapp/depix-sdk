@@ -640,6 +640,68 @@ describe("resumeConversionPlans — crash recovery from the last completed leg",
   });
 });
 
+// ── concurrency: the double-spend guard (§4.1) ─────────────────────────────────
+//
+// resumeConversionPlans() drives each plan from a readAll() SNAPSHOT. Two
+// concurrent passes — Promise.all([recover(), recover()]) or parallel
+// wallet_recover MCP calls, the exact parallel-call adversary mutex.ts:5-10
+// names — both read the same pre-drive snapshot and would BOTH re-drive the
+// same leg, broadcasting a fresh Boltz swap / SideShift shift / Liquid send
+// TWICE (double-spend), because executeLeg has no idempotency key. The atomic
+// per-leg claim (ConversionPlanStore.claimLeg — a CAS under the store mutex)
+// makes exactly ONE pass win the leg; the loser sees it already claimed and
+// bails WITHOUT executing. These tests would broadcast twice before the fix.
+describe("resumeConversionPlans — concurrent recovery is double-spend-safe (§4.1)", () => {
+  it("TWO concurrent resumes over the SAME crash-between-legs plan execute the next leg EXACTLY ONCE (zero double-broadcast)", async () => {
+    await seedPlan(); // leg 1 settled (19_500), leg 2 (toStablecoin) never started
+    const { deps, ss, bz } = makeDeps(); // ONE shared set of provider spies
+    // The parallel-call adversary: both passes drive from their own stale snapshot.
+    const [a, b] = await Promise.all([
+      resumeConversionPlans(deps, SILENT),
+      resumeConversionPlans(deps, SILENT)
+    ]);
+    // THE proof: the exit-leg provider (Boltz toStablecoin) is dispatched ONCE,
+    // not twice — the losing concurrent pass was refused by the leg claim.
+    expect(bz.stablecoinCalls).toHaveLength(1);
+    expect(bz.stablecoinCalls[0]!.amountSats).toBe(19_500); // the settled leg-1 output
+    expect(bz.stablecoinCalls[0]!.continuation).toBe("plan-crash-1"); // still count-once
+    expect(ss.executed).toHaveLength(0); // leg 1 (the market swap) is never re-executed either
+    // Both passes returned (neither threw); the leg is in flight and still tracked, once.
+    expect([a, b].every((s) => s.failed === 0)).toBe(true);
+    expect(await store.count()).toBe(1);
+    const plan = await store.get("plan-crash-1");
+    expect(plan!.legResults[1]).toMatchObject({ state: "pending", trackingId: "CHAIN_1" });
+  });
+
+  it("two concurrent resumes over a plan whose next leg is ALREADY in flight both PROBE — neither re-executes", async () => {
+    await seedPlan({
+      currentLegIndex: 1,
+      legResults: [
+        { state: "settled", txids: ["swap_txid"], receivedSats: 19_500n, trackingId: null },
+        { state: "in_flight", txids: ["chain_lockup_txid"], receivedSats: null, trackingId: "CHAIN_1" }
+      ]
+    });
+    const { deps, ss, bz } = makeDeps({
+      probeBoltzSwap: async () => ({ type: "stablecoin", state: "locked_up" }) // still working
+    });
+    await Promise.all([resumeConversionPlans(deps, SILENT), resumeConversionPlans(deps, SILENT)]);
+    expect(bz.stablecoinCalls).toHaveLength(0); // both PROBED — a started leg is never re-executed
+    expect(ss.executed).toHaveLength(0);
+    expect(await store.count()).toBe(1); // still tracked until the provider settles
+  });
+
+  it("the normal SEQUENTIAL resume still drives the next leg exactly once (no regression)", async () => {
+    await seedPlan();
+    const { deps, ss, bz } = makeDeps();
+    const first = await resumeConversionPlans(deps, SILENT);
+    const second = await resumeConversionPlans(deps, SILENT); // second pass: leg now in flight
+    expect(bz.stablecoinCalls).toHaveLength(1); // executed once across BOTH passes
+    expect(ss.executed).toHaveLength(0);
+    expect(first.advanced).toBe(1);
+    expect(second.advanced).toBe(0); // the second pass advanced nothing (leg already claimed/in flight)
+  });
+});
+
 describe("listPendingPlans — metadata-only view for getPending()", () => {
   it("lists in-flight plans with route/leg metadata", async () => {
     await seedPlan();

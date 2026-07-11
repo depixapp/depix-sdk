@@ -522,6 +522,14 @@ export class DepixWallet {
   // nextReceiveIndex read-modify-write against concurrent in-process calls
   // (§4.3 TOCTOU fix; the dataDir lock only guards across processes).
   private readonly opMutex = new Mutex();
+  // Serializes multi-hop conversion-plan RECOVERY (§5/§4.1) against itself:
+  // resumeConversionPlans() drives legs from a readAll() snapshot, so two
+  // concurrent recover()/open() passes — or parallel wallet_recover calls —
+  // must not drive the same plan in parallel (that re-broadcasts a leg =
+  // double-spend). Distinct from opMutex (which only serializes signing): this
+  // guards the whole plan-driving sweep. Defense-in-depth with the per-leg
+  // atomic claim in ConversionPlanStore.claimLeg().
+  private readonly recoveryMutex = new Mutex();
 
   private constructor(parts: WalletParts) {
     this.dataDir = parts.dataDir;
@@ -1637,8 +1645,13 @@ export class DepixWallet {
     // legs re-drives the next leg with the previous leg's REAL settled
     // amount); a started leg is never re-executed. resumeConversionPlans()
     // never throws — the catch is belt-and-braces like the boltz rail's.
+    // Serialized under recoveryMutex (§4.1): two concurrent recover()/open()
+    // passes drive plans one after the other, so the second reads the first's
+    // in_flight/settled state and probes instead of re-broadcasting a leg.
     try {
-      summary.plans = await resumeConversionPlans(this.intentDeps, this.logger);
+      summary.plans = await this.recoveryMutex.runExclusive(() =>
+        resumeConversionPlans(this.intentDeps, this.logger)
+      );
     } catch (err) {
       summary.plans.failed++;
       this.logger.error("conversion-plan resume failed — will retry on the next resume", {

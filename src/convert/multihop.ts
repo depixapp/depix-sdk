@@ -245,13 +245,32 @@ async function drivePlan(args: DriveArgs): Promise<ConvertResult> {
     const leg = legs[i]!;
     const isFinal = i === legs.length - 1;
 
-    // Mark the leg started BEFORE executing it, so a crash mid-leg is visible
-    // to recovery (in_flight + no result = do not blindly re-execute).
-    await store.patch(plan.planId, (r) => {
-      r.currentLegIndex = i;
-      r.legResults[i] = { state: "in_flight", txids: [], receivedSats: null, trackingId: null };
-      r.state = "executing";
-    });
+    // Atomically CLAIM the leg BEFORE executing it (§4.1 concurrency guard) —
+    // stamp it `in_flight` iff it is still unstarted, deciding on the store's
+    // FRESH state, never this driver's readAll() snapshot. Two concurrent
+    // recovery passes (Promise.all([recover(), recover()]), or parallel
+    // wallet_recover calls) both drive from their OWN stale snapshot; the claim
+    // re-reads the encrypted record under the store mutex so only ONE wins. The
+    // loser sees the leg already claimed (or the plan already terminal) and
+    // BAILS instead of re-broadcasting the provider leg — the double-spend the
+    // unmutexed re-drive allowed. This restores the idempotent-by-construction
+    // invariant the withdrawal rail already has (§3.2.9). Marking `in_flight`
+    // before the leg runs also keeps a crash mid-leg visible to recovery
+    // (in_flight + no result = probe, never blindly re-execute).
+    const claim = await store.claimLeg(plan.planId, i);
+    if (claim !== "claimed") {
+      logger.warn("multi-hop leg already being driven by a concurrent recovery pass — not re-executing", {
+        planId: plan.planId,
+        leg: i + 1,
+        claim
+      });
+      return pendingResult(
+        route,
+        txids,
+        `${legLabel(route, i)} is already being driven (${claim}); another recover()/open() pass owns plan ` +
+          `${plan.planId} — wallet.getPending() tracks it.`
+      );
+    }
     plan.currentLegIndex = i;
 
     const legParams: ConvertParams = {
@@ -278,9 +297,21 @@ async function drivePlan(args: DriveArgs): Promise<ConvertResult> {
       outcome = i > valueLegIndex ? await runAsPlanContinuation(plan.planId, run) : await run();
     } catch (err) {
       if (i === 0 && !args.resumed) {
-        // Leg 1 refused/failed on the direct path: nothing of this plan moved
-        // (executors throw before any settlement) — single-hop parity: drop the
-        // plan and rethrow.
+        // Leg-0 failed on the direct path — single-hop parity: drop the plan and
+        // rethrow so the caller SEES the failure (never a silent pending). This
+        // is fund-safe by ROUTE CONSTRUCTION, not because executors always throw
+        // pre-broadcast (a market-swap leg 0 CAN throw post-broadcast — the
+        // takerSign read in sideswap.ts fails only after SideSwap broadcast). But
+        // EVERY multi-hop leg 0 is either an inflow entry (pegIn /
+        // receiveLightning / sideshift.receive → awaiting_funding: the wallet's
+        // OWN funds never moved) or a market swap whose PSET is protocolBound
+        // (validated to pay OUR OWN receive address → the swapped asset lands in
+        // THIS wallet). The exit legs that send funds OUT of the wallet (pegOut /
+        // toStablecoin / send / payLightning) are ALWAYS last, never leg 0. So a
+        // leg-0 failure can never strand funds externally: the intermediate asset
+        // is always recoverable in-wallet and the throw tells the caller to
+        // re-run. (The only edge cost of a post-broadcast leg-0 throw is a
+        // dropped auto-continuation — not lost funds.)
         await store.remove(plan.planId).catch(() => {});
         throw err;
       }

@@ -222,6 +222,39 @@ export class ConversionPlanStore {
     });
   }
 
+  /**
+   * Atomically CLAIM leg `legIndex` for execution — the concurrency guard that
+   * makes the plan rail idempotent-by-construction like the withdrawal rail
+   * (§3.2.9). The check-and-set runs under the SAME store mutex `patch`/`put`
+   * take, so it re-reads the ENCRYPTED record fresh and decides on live state,
+   * never a caller's stale readAll() snapshot:
+   *   - leg UNSET (null/absent — never started) → stamp it `in_flight` (and
+   *     advance currentLegIndex/state), return `"claimed"` — the caller executes;
+   *   - leg already carries a result (another recover()/resume pass claimed it,
+   *     or it settled) → leave the record untouched, return `"already_active"` —
+   *     the caller must NOT execute (a second provider broadcast = double-spend);
+   *   - plan gone (a concurrent driver reached a terminal outcome and removed it)
+   *     → return `"not_found"`.
+   * Two concurrent recovery passes (`Promise.all([recover(), recover()])`, or
+   * parallel `wallet_recover` calls — §4.1) therefore can never BOTH drive the
+   * same leg: exactly one gets `"claimed"`.
+   */
+  async claimLeg(planId: string, legIndex: number): Promise<"claimed" | "already_active" | "not_found"> {
+    return this.mutex.runExclusive(async () => {
+      const envelopes = await this.readEnvelopes();
+      const idx = envelopes.findIndex((e) => e.id === planId);
+      if (idx === -1) return "not_found";
+      const record = await this.decrypt(envelopes[idx]!);
+      if ((record.legResults[legIndex] ?? null) !== null) return "already_active";
+      record.currentLegIndex = legIndex;
+      record.legResults[legIndex] = { state: "in_flight", txids: [], receivedSats: null, trackingId: null };
+      record.state = "executing";
+      envelopes[idx] = await this.encrypt(record);
+      await this.writeEnvelopes(envelopes);
+      return "claimed";
+    });
+  }
+
   async remove(planId: string): Promise<void> {
     await this.mutex.runExclusive(async () => {
       const envelopes = await this.readEnvelopes();
