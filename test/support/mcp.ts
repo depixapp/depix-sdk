@@ -19,6 +19,7 @@ import type {
   SendParams,
   SendResult,
   WalletBalances,
+  WalletDiagnostics,
   WalletTransaction,
   WithdrawParams,
   WithdrawResult,
@@ -326,6 +327,30 @@ export class FakeWallet implements McpWalletFacade {
       network: "tron",
     },
   ];
+  diagnosticsResult: WalletDiagnostics = {
+    sdkVersion: "1.0.0",
+    lwkVersion: "0.18.0",
+    dataDir: "/home/agent/.depix-wallet",
+    backupConfirmed: true,
+    hasSeed: true,
+    apiKeyConfigured: true,
+    sync: {
+      lastScanAt: 1_720_000_100_000,
+      lastSuccessAt: 1_720_000_100_000,
+      lastPersistFailedAt: null,
+      lastPersistErrorName: null,
+      persistedUpdates: 3,
+      walletLoaded: true,
+    },
+    pending: { withdrawals: 1, boltzSwaps: 2, pegins: 0, sideshiftShifts: 1, plans: 0 },
+    guardrails: {
+      usedCents: 12_000,
+      dailyLimitCents: 50_000,
+      perTxLimitCents: 10_000,
+      remainingCents: 38_000,
+      allowlistEnabled: false,
+    },
+  };
   lastWaitOptions?: WaitOptions;
 
   private rec(method: keyof McpWalletFacade, args: unknown[]): void {
@@ -382,6 +407,10 @@ export class FakeWallet implements McpWalletFacade {
   async getPending(): Promise<PendingItem[]> {
     this.rec("getPending", []);
     return this.pendingItems;
+  }
+  async diagnostics(): Promise<WalletDiagnostics> {
+    this.rec("diagnostics", []);
+    return this.diagnosticsResult;
   }
 
   /** Convenience: find the args of the last recorded call to `method`. */

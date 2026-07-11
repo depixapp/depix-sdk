@@ -521,6 +521,41 @@ export const listGiftcardOrdersOutput = {
 export const recoverInput = {} as const;
 export const pendingInput = {} as const;
 
+// ── maintenance/support: wallet_diagnostics (PR-D) ────────────────────────────
+
+export const diagnosticsInput = {} as const;
+
+export const diagnosticsOutput = {
+  sdk_version: z.string().describe("The @depixapp/sdk version this wallet runs."),
+  lwk_version: z.string().describe("The exact pinned lwk_node (LWK) version this build ships."),
+  data_dir: z.string().describe("The wallet data directory (local path — no key material lives in this snapshot)."),
+  backup_confirmed: z.boolean().describe("Whether the seed backup was confirmed (§2.9)."),
+  has_seed: z.boolean().describe("false on a view-only/wiped wallet. A boolean only — never the material."),
+  api_key_configured: z.boolean().describe("Whether a DePix API key is set (deposit/withdraw need one)."),
+  sync: z
+    .object({
+      last_scan_at: z.number().int().nullable().describe("Epoch-ms of the last completed scan pass, or null."),
+      last_success_at: z.number().int().nullable().describe("Epoch-ms of the last scan that also persisted, or null."),
+      last_persist_failed_at: z.number().int().nullable().describe("Epoch-ms of the last update-persist failure (§2.5), or null."),
+      last_persist_error_name: z.string().nullable().describe("Error NAME of the last failed persist (never a message/path), or null."),
+      persisted_updates: z.number().int().describe("Persisted update-chain links on disk."),
+      wallet_loaded: z.boolean().describe("Whether the in-memory LWK state is initialized."),
+    })
+    .describe("Sync health (§2.5 meta): when the wallet last scanned/persisted and whether persistence is failing."),
+  pending: z
+    .object({
+      withdrawals: z.number().int().describe("Pending Pix withdrawals (§3.2.9)."),
+      boltz_swaps: z.number().int().describe("In-flight Boltz swaps (§5.3)."),
+      pegins: z.number().int().describe("Tracked SideSwap peg-ins (§5.2)."),
+      sideshift_shifts: z.number().int().describe("Non-terminal SideShift shifts (§5.4)."),
+      plans: z.number().int().describe("In-flight multi-hop conversion plans (PR-C)."),
+    })
+    .describe("Per-rail pending counters — the wallet_pending tally; use wallet_recover to re-drive them."),
+  guardrails: guardrailBudget()
+    .nullable()
+    .describe("Guardrail config + rolling-24h usage, or null when the readout is unavailable on this wallet."),
+} as const;
+
 export const recoverOutput = {
   withdrawals: withdrawalsResumeSummary().describe(
     "Pix withdrawals re-driven (§3.2.9): re-broadcast SAME bytes / re-POST same Idempotency-Key — never a double-pay.",

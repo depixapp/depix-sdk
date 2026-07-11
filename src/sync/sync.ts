@@ -183,6 +183,39 @@ export class SyncEngine {
     return this.syncPromise;
   }
 
+  /**
+   * Deep re-scan for wallet.sync({ rescan: true }) (PR-D). The caller passes a
+   * VIRGIN wollet (neverScanned() → the cold-start timeout applies), so LWK
+   * re-derives the whole history from zero instead of the incremental delta.
+   * Unlike sync(), this must NOT join an in-flight scan — that scan targets a
+   * DIFFERENT (the stale) wollet and joining it would return without ever
+   * scanning the fresh one. Any in-flight pass is drained out FIRST; failures
+   * of that pass are its own caller's to observe.
+   *
+   * `beforeScan` (e.g. dropping the persisted update-chain cache) runs AFTER the
+   * stale scan is drained AND after this pass has claimed the sync slot, so a
+   * concurrent non-mutexed sync() of the stale wollet can neither still be
+   * persisting across it nor start a new stale scan during it — it joins this
+   * pass instead. That closes the orphan-chain-link window a bare pre-clear had.
+   */
+  async rescan(wollet: Wollet, beforeScan?: () => Promise<void>): Promise<SyncResult> {
+    // Drain the in-flight stale scan. The loop exits with syncPromise === null
+    // (the drained scan's own finally cleared it); we then claim the slot
+    // synchronously (no await between the exit and the assignment below), so no
+    // concurrent sync() can slip a stale scan in ahead of this pass.
+    while (this.syncPromise) {
+      await this.syncPromise.catch(() => {});
+    }
+    const scan = (async () => {
+      if (beforeScan) await beforeScan();
+      return this.syncInner(wollet);
+    })().finally(() => {
+      this.syncPromise = null;
+    });
+    this.syncPromise = scan;
+    return scan;
+  }
+
   private async syncInner(wollet: Wollet): Promise<SyncResult> {
     const timeoutMs = wollet.neverScanned() ? this.coldStartTimeoutMs : this.syncTimeoutMs;
     const startIndex = Math.min(this.lastGoodProviderIndex, this.providers.length - 1);

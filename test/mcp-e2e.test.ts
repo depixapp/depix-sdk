@@ -84,10 +84,10 @@ async function openReal(): Promise<void> {
 }
 
 describe("MCP facade e2e over a real wallet (sandbox, offline)", () => {
-  it("handshakes and lists the 10 MVP + 8 fast-follow + 2 recovery tools over a REAL wallet", async () => {
+  it("handshakes and lists the 10 MVP + 8 fast-follow + 2 recovery + 1 maintenance tools over a REAL wallet", async () => {
     await openReal();
     const names = (await client.listTools()).tools.map((t) => t.name);
-    expect(names).toHaveLength(20);
+    expect(names).toHaveLength(21);
     expect(names).toContain("wallet_create_deposit");
     expect(names).toContain("wallet_create_withdrawal");
     // The real DepixWallet satisfies the extended facade → fast-follows registered.
@@ -98,6 +98,8 @@ describe("MCP facade e2e over a real wallet (sandbox, offline)", () => {
     // Recovery wiring (fund-safety): re-drive every rail + the unified pending view.
     expect(names).toContain("wallet_recover");
     expect(names).toContain("wallet_pending");
+    // Maintenance/support (PR-D): read-only health snapshot, never key material.
+    expect(names).toContain("wallet_diagnostics");
   });
 
   it("wallet_create_deposit returns the sandbox QR", async () => {
@@ -138,6 +140,23 @@ describe("MCP facade e2e over a real wallet (sandbox, offline)", () => {
     const status = waited.structuredContent as Record<string, unknown>;
     expect(status.status).toBe("confirmed"); // sandbox terminal success
     expect(status.sandbox).toBe(true);
+  });
+
+  it("wallet_diagnostics returns the REAL wallet's snapshot with no key material", async () => {
+    await openReal();
+    const res = await client.callTool({ name: "wallet_diagnostics", arguments: {} });
+    expect(res.isError).toBeFalsy();
+    const out = res.structuredContent as Record<string, unknown>;
+    expect(out.data_dir).toBe(dataDir);
+    expect(out.backup_confirmed).toBe(true);
+    expect(out.has_seed).toBe(true);
+    expect(out.api_key_configured).toBe(true);
+    expect(typeof out.sdk_version).toBe("string");
+    expect(typeof out.lwk_version).toBe("string");
+    // The fund-safety invariant end to end: no mnemonic word, no passphrase.
+    const flat = JSON.stringify(out);
+    expect(flat).not.toContain("abandon");
+    expect(flat).not.toContain(PASSPHRASE);
   });
 
   it("never leaks the API key to stderr across a tool call", async () => {

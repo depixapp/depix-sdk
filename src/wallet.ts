@@ -14,7 +14,7 @@
 // `mnemonicSecured: true`.
 
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { base64 } from "@scure/base";
 import type { Wollet } from "lwk_node";
 import { ASSETS, MAINNET_ASSET_ID_TO_KEY, type AssetKey } from "./assets.js";
@@ -77,13 +77,16 @@ import { ConvertNamespace, type ConvertNamespaceOptions } from "./convert/namesp
 import type { ConvertWalletHooks } from "./convert/hooks.js";
 import {
   intentDepsFromNamespace,
+  makeAdvancedNamespace,
   makeConvertFacade,
   quoteRoutes,
   type ConvertFacade,
   type ConvertIntent,
   type IntentDeps,
-  type RouteQuote
+  type RouteQuote,
+  type WalletAdvanced
 } from "./convert/intent.js";
+import { LWK_VERSION, SDK_VERSION } from "./version.js";
 import type { GuardrailDestination } from "./guardrails/allowlist.js";
 import { BoltzConvert, type BoltzConvertDeps, type BoltzResumeSummary } from "./convert/boltz/convert.js";
 import { BoltzSwapStore } from "./convert/boltz/store.js";
@@ -109,6 +112,17 @@ export interface WalletSyncOptions {
   worker?: boolean;
   /** Advanced/testing: inject fake Esplora clients (broadcast seam). */
   clientFactory?: (provider: EsploraProvider) => EsploraClientLike;
+}
+
+/** Per-call options of wallet.sync() (PR-D). */
+export interface WalletSyncCallOptions {
+  /**
+   * true → deep re-scan from zero: drop the persisted update-chain cache and
+   * cold-scan a fresh LWK state (useful when the wallet looks desynchronized —
+   * missing transactions, stale balances). Slower than the default incremental
+   * sync (cold-start timeout applies). Default false (incremental).
+   */
+  rescan?: boolean;
 }
 
 export interface OpenOptions {
@@ -289,6 +303,55 @@ export interface GuardrailReadout {
   allowlistEnabled: boolean;
 }
 
+/** Sync-health slice of wallet.diagnostics() (PR-D) — mirrors §2.5 meta.json. */
+export interface WalletDiagnosticsSync {
+  /** Epoch-ms of the last completed scan pass, or null before any scan. */
+  lastScanAt: number | null;
+  /** Epoch-ms of the last scan whose result also persisted, or null. */
+  lastSuccessAt: number | null;
+  /** Epoch-ms of the last update-persist failure (§2.5), or null. */
+  lastPersistFailedAt: number | null;
+  /** Error NAME of the last failed persist (never a message/path), or null. */
+  lastPersistErrorName: string | null;
+  /** Persisted update-chain links on disk (0 after a wipe/rescan-clear). */
+  persistedUpdates: number;
+  /** Whether the in-memory LWK state is initialized (a sync/read already ran). */
+  walletLoaded: boolean;
+}
+
+/** Per-rail pending counters of wallet.diagnostics() — the getPending() tally. */
+export interface WalletDiagnosticsPending {
+  withdrawals: number;
+  boltzSwaps: number;
+  pegins: number;
+  sideshiftShifts: number;
+  plans: number;
+}
+
+/**
+ * wallet.diagnostics() snapshot (PR-D) — a read-only health report for
+ * support. Same fund-safety rule as getPending(): METADATA ONLY, never key
+ * material (no seed, mnemonic, passphrase, descriptor or store secrets).
+ */
+export interface WalletDiagnostics {
+  /** This SDK's version (package.json), or "unknown". */
+  sdkVersion: string;
+  /** The exact pinned lwk_node version this build ships, or "unknown". */
+  lwkVersion: string;
+  dataDir: string;
+  backupConfirmed: boolean;
+  /** false on a view-only/wiped wallet. A boolean only — never the material. */
+  hasSeed: boolean;
+  apiKeyConfigured: boolean;
+  sync: WalletDiagnosticsSync;
+  pending: WalletDiagnosticsPending;
+  /**
+   * Guardrail config + rolling-24h usage, or null when the readout is
+   * unavailable (e.g. the state key cannot be derived on this wallet).
+   */
+  guardrails: GuardrailReadout | null;
+}
+
 export interface ResumeSummary {
   /** rebroadcast + reposted. */
   resumed: number;
@@ -411,6 +474,25 @@ function resolveDataDir(explicit?: string): string {
   return explicit ?? process.env.DEPIX_WALLET_DIR ?? join(homedir(), ".depix-wallet");
 }
 
+/**
+ * Redact the OS home-directory prefix of an absolute path down to `~`. Used
+ * ONLY for the dataDir VALUE surfaced by diagnostics() / the wallet_diagnostics
+ * MCP tool: an absolute dataDir routinely embeds the OS username, which becomes
+ * privacy-sensitive once the snapshot reaches an MCP host or is pasted into a
+ * support thread. Not key material — the path is still support-useful, just
+ * without the username. The real dataDir is kept intact everywhere else (dir
+ * lock, stores, error messages). Boundary-safe: only a full leading path
+ * segment is redacted (never `/home/bob-2` when home is `/home/bob`).
+ */
+export function redactHomePath(p: string): string {
+  const home = homedir();
+  if (!home) return p;
+  if (p === home) return "~";
+  const prefix = home.endsWith(sep) ? home : home + sep;
+  if (p.startsWith(prefix)) return "~" + sep + p.slice(prefix.length);
+  return p;
+}
+
 function resolvePassphrase(explicit?: string): string | undefined {
   return explicit ?? process.env.DEPIX_WALLET_PASSPHRASE;
 }
@@ -472,11 +554,20 @@ export class DepixWallet {
   private readonly valuator: BrlValuator;
   /**
    * Conversions (§5). CALLABLE — `wallet.convert({ from, to, network, amount })`
-   * executes a single-hop intent (routing table PR-B; wallet.quote() enumerates
-   * the candidates) — AND still carries the advanced provider namespaces:
-   * wallet.convert.sideswap.* / .boltz.* / .sideshift.*.
+   * executes an intent (routing table PR-B; wallet.quote() enumerates the
+   * candidates). For backward compatibility it still carries the provider
+   * namespaces (wallet.convert.sideswap.* / .boltz.* / .sideshift.* —
+   * deprecated aliases); their canonical home is wallet.advanced.* (PR-D).
    */
   readonly convert: ConvertFacade;
+  /**
+   * The power-user surface (PR-D): the SAME provider namespace instances that
+   * back wallet.convert()/quote() — wallet.advanced.sideswap/.boltz/.sideshift
+   * — for fine-grained control (quote streams, pegStatus, manual resume…).
+   * The legacy wallet.convert.{sideswap,boltz,sideshift} getters alias these
+   * very instances and stay supported (deprecated in docs) for 1.x.
+   */
+  readonly advanced: WalletAdvanced;
   /** Intent-layer deps (PR-B) — shared by wallet.quote() and the convert facade. */
   private readonly intentDeps: IntentDeps;
   /** Gift cards (§5.5): wallet.giftcards.list()/buy()/listOrders(). */
@@ -700,6 +791,10 @@ export class DepixWallet {
     // Pass assertOpen so the callable facade fails fast on a closed wallet — parity
     // with wallet.quote() (§ money methods all assertOpen() first).
     this.convert = makeConvertFacade(convertNs, this.intentDeps, () => this.assertOpen());
+    // wallet.advanced (PR-D): the SAME ConvertNamespace instances re-exposed as
+    // the canonical power-user surface — reference-identical to the facade's
+    // legacy getters, so provider state is shared, never duplicated.
+    this.advanced = makeAdvancedNamespace(convertNs);
     // Gift cards (§5.5): browse + buy via CryptoRefills, paid over Lightning by
     // REUSING the same BoltzConvert instance as wallet.convert.boltz (so the
     // guardrail choke point + refund/watch machinery is shared, not duplicated).
@@ -1089,11 +1184,63 @@ export class DepixWallet {
     });
   }
 
-  /** Sync against the provider chain (§2.6), worker fullScan by default (§2.7). */
-  async sync(): Promise<{ updated: boolean }> {
+  /**
+   * Sync against the provider chain (§2.6), worker fullScan by default (§2.7).
+   * Default: INCREMENTAL — LWK scans forward from the current in-memory state.
+   * `{ rescan: true }` (PR-D) deep-scans from ZERO instead: the persisted
+   * update-chain cache is dropped and a virgin LWK state is cold-scanned (the
+   * §2.7 cold-start timeout applies) — the recovery move when the wallet looks
+   * desynchronized (missing transactions, stale balances).
+   */
+  async sync(options: WalletSyncCallOptions = {}): Promise<{ updated: boolean }> {
     this.assertOpen();
+    if (options.rescan === true) return this.rescanFromZero();
     const wollet = await this.ensureWollet();
     return this.syncEngine.sync(wollet);
+  }
+
+  /**
+   * Deep re-scan (PR-D). Serialized under the op mutex so no signing operation
+   * can hold the stale Wollet across the swap. Ordering is fail-safe:
+   *   1. join any in-flight Wollet build (never abandon a half-built instance);
+   *   2. hand the cache-drop to the engine's rescan pass as `beforeScan` — it
+   *      runs AFTER the in-flight incremental scan of the stale state is drained
+   *      and after the pass claims the sync slot, so a concurrent non-mutexed
+   *      sync() cannot persist an orphan chain-link across the clear (rescan
+   *      means "trust nothing cached"; the cache is rebuilt by this very scan,
+   *      §2.5 recoverable);
+   *   3. cold-scan a VIRGIN wollet via that same rescan pass (never joined onto
+   *      an in-flight incremental scan of the stale state);
+   *   4. only on success, swap the fresh wollet in and free the stale one — a
+   *      failed rescan leaves the current in-memory state fully usable.
+   */
+  private async rescanFromZero(): Promise<{ updated: boolean }> {
+    return this.opMutex.runExclusive(async () => {
+      await this.ensureWollet();
+      const fresh = buildWollet(this.requireDescriptor());
+      let result: { updated: boolean };
+      try {
+        result = await this.syncEngine.rescan(fresh, () => this.updateStore.clearAll());
+      } catch (err) {
+        try {
+          fresh.free();
+        } catch {
+          // best effort
+        }
+        throw err;
+      }
+      const stale = this.wollet;
+      this.wollet = fresh;
+      this.wolletReady = true;
+      if (stale) {
+        try {
+          stale.free();
+        } catch {
+          // best effort
+        }
+      }
+      return result;
+    });
   }
 
   /**
@@ -1757,6 +1904,75 @@ export class DepixWallet {
     }
 
     return items;
+  }
+
+  /**
+   * Read-only health snapshot for support (PR-D): sync state (§2.5 meta —
+   * last scan/success, last persist failure), versions (SDK + pinned lwk),
+   * per-rail pending counters (the getPending() tally), dataDir, backup state
+   * and the guardrail usage readout. Local only — no network, no signing —
+   * and NEVER key material (getPending()'s fund-safety rule applies verbatim:
+   * no seed, mnemonic, passphrase, descriptor or store secrets).
+   */
+  async diagnostics(): Promise<WalletDiagnostics> {
+    this.assertOpen();
+    const meta = await this.updateStore.readMeta();
+    const statuses = await this.updateStore.listStatuses();
+
+    const pending: WalletDiagnosticsPending = {
+      withdrawals: 0,
+      boltzSwaps: 0,
+      pegins: 0,
+      sideshiftShifts: 0,
+      plans: 0
+    };
+    for (const item of await this.getPending()) {
+      const rail = item.rail;
+      if (rail === "withdrawal") pending.withdrawals++;
+      else if (rail === "boltz") pending.boltzSwaps++;
+      else if (rail === "pegin") pending.pegins++;
+      else if (rail === "sideshift") pending.sideshiftShifts++;
+      else if (rail === "plan") pending.plans++;
+      else {
+        // Compile-time exhaustiveness: a rail added to PendingItem without a
+        // branch here fails tsc (`rail` narrows to never). At runtime a support
+        // snapshot must not throw, so an unknown rail is logged and SKIPPED —
+        // never silently miscounted into plans.
+        const _unknownRail: never = rail;
+        this.logger.warn("diagnostics: skipping pending item with unknown rail", String(_unknownRail));
+      }
+    }
+
+    // Best effort: the readout needs the seed-derived state key, which a
+    // view-only/wiped wallet cannot derive — a support snapshot must degrade
+    // to null there, never throw.
+    let guardrails: GuardrailReadout | null = null;
+    try {
+      guardrails = await this.getGuardrails();
+    } catch {
+      // unavailable on this wallet — reported as null
+    }
+
+    return {
+      sdkVersion: SDK_VERSION,
+      lwkVersion: LWK_VERSION,
+      // Home-prefix redacted to `~` — the value leaves the process (MCP host /
+      // support). The real dataDir stays intact everywhere else in this class.
+      dataDir: redactHomePath(this.dataDir),
+      backupConfirmed: this.isBackupConfirmed(),
+      hasSeed: Boolean(this.file.encryptedSeed),
+      apiKeyConfigured: this.api !== null,
+      sync: {
+        lastScanAt: meta.lastScanAt ?? null,
+        lastSuccessAt: meta.lastSuccessAt ?? null,
+        lastPersistFailedAt: meta.lastPersistFailedAt ?? null,
+        lastPersistErrorName: meta.lastPersistErrorName ?? null,
+        persistedUpdates: statuses.length,
+        walletLoaded: this.wolletReady
+      },
+      pending,
+      guardrails
+    };
   }
 
   /**

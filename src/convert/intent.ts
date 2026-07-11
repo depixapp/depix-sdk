@@ -952,15 +952,41 @@ export async function convertIntent(params: ConvertParams, deps: IntentDeps): Pr
 // ─── wallet facade: callable convert() carrying the advanced namespaces ───────
 
 /**
- * `wallet.convert` — callable ({intent} → result) AND the home of the advanced
- * provider namespaces (`.sideswap`, `.boltz`, `.sideshift`), which remain fully
- * supported for provider-specific control.
+ * `wallet.convert` — callable ({intent} → result) AND, for backward
+ * compatibility, still carrying the provider namespaces (`.sideswap`, `.boltz`,
+ * `.sideshift`). The namespaces' canonical home is now `wallet.advanced.*`
+ * (PR-D); these getters alias the SAME instances and stay supported in 1.x.
  */
 export interface ConvertFacade {
   (params: ConvertParams): Promise<ConvertResult>;
+  /** @deprecated Use `wallet.advanced.sideswap` — the same instance. */
   readonly sideswap: SideSwapNamespace;
+  /** @deprecated Use `wallet.advanced.sideshift` — the same instance. */
   readonly sideshift: SideShiftNamespace;
-  /** Throws WALLET_NOT_FOUND on a view-only/wiped wallet (no seed to sign). */
+  /**
+   * Throws WALLET_NOT_FOUND on a view-only/wiped wallet (no seed to sign).
+   * @deprecated Use `wallet.advanced.boltz` — the same instance, same gate.
+   */
+  readonly boltz: BoltzConvert;
+}
+
+/**
+ * `wallet.advanced` (PR-D) — the power-user surface: the SAME provider
+ * namespace instances that back wallet.convert()/wallet.quote(), exposed for
+ * fine-grained control (SideSwap quote streams and pegStatus, Boltz manual
+ * resume/refund watches, SideShift shift log and refund addresses…). Every
+ * money-moving method still crosses the §4.3 guardrail choke point inside the
+ * provider — this namespace adds NO signing path and NO bypass.
+ */
+export interface WalletAdvanced {
+  /** SideSwap market swaps + BTC↔L-BTC peg (§5.1/§5.2 — non-custodial). */
+  readonly sideswap: SideSwapNamespace;
+  /** SideShift USDt cross-network (§5.4 — CUSTODIAL, signalled). */
+  readonly sideshift: SideShiftNamespace;
+  /**
+   * Boltz Lightning/stablecoin swaps (§5.3 — non-custodial). Throws
+   * WALLET_NOT_FOUND on a view-only/wiped wallet (no seed to sign).
+   */
   readonly boltz: BoltzConvert;
 }
 
@@ -1005,4 +1031,19 @@ export function makeConvertFacade(
   Object.defineProperty(facade, "sideshift", { get: () => ns.sideshift, enumerable: false });
   Object.defineProperty(facade, "boltz", { get: () => ns.boltz, enumerable: false });
   return facade;
+}
+
+/**
+ * Build `wallet.advanced` over the SAME ConvertNamespace the facade wraps —
+ * reference-identical instances, so state (shift logs, peg tracking, Boltz
+ * watches) is shared, never duplicated. Same getter discipline as the facade:
+ * non-enumerable, so spreading/serializing `wallet.advanced` never trips the
+ * `.boltz` view-only WALLET_NOT_FOUND gate; direct access still gates.
+ */
+export function makeAdvancedNamespace(ns: ConvertNamespace): WalletAdvanced {
+  const advanced = {} as WalletAdvanced;
+  Object.defineProperty(advanced, "sideswap", { get: () => ns.sideswap, enumerable: false });
+  Object.defineProperty(advanced, "sideshift", { get: () => ns.sideshift, enumerable: false });
+  Object.defineProperty(advanced, "boltz", { get: () => ns.boltz, enumerable: false });
+  return advanced;
 }

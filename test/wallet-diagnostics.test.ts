@@ -1,0 +1,252 @@
+// wallet.diagnostics() (PR-D) — a read-only health snapshot for support:
+// sync-state (last scan/success, last persist failure §2.5), versions (SDK +
+// pinned lwk), pending counters (reusing getPending()), dataDir and
+// backupConfirmed, plus the guardrail usage readout. The fund-safety rule of
+// getPending() applies verbatim: NEVER any key material — no seed, mnemonic,
+// passphrase or descriptor in the snapshot.
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { homedir, tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { DepixWallet, redactHomePath } from "../src/wallet.js";
+import { descriptorFromMnemonic } from "../src/engine/lwk.js";
+import type { EsploraClientLike } from "../src/sync/sync.js";
+import { PendingWithdrawals } from "../src/pending.js";
+import { SideShiftStore, type StoredSideShift } from "../src/convert/sideshift-store.js";
+import { ConversionPlanStore, type StoredConversionPlan } from "../src/convert/plan-store.js";
+import { isDepixSdkError } from "../src/errors.js";
+
+const PASSPHRASE = "correct-horse-battery-staple";
+const KNOWN_MNEMONIC =
+  "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+let dataDir: string;
+let wallet: DepixWallet;
+
+beforeEach(async () => {
+  dataDir = await mkdtemp(join(tmpdir(), "depix-sdk-diag-"));
+});
+afterEach(async () => {
+  await wallet?.close().catch(() => {});
+  await rm(dataDir, { recursive: true, force: true });
+});
+
+const fakeClient = (): EsploraClientLike => ({
+  fullScan: async () => undefined,
+  broadcast: async () => {
+    throw new Error("not used");
+  },
+  free: () => {}
+});
+
+async function restore(extra: Record<string, unknown> = {}): Promise<DepixWallet> {
+  return DepixWallet.restore({
+    dataDir,
+    passphrase: PASSPHRASE,
+    mnemonic: KNOWN_MNEMONIC,
+    sync: {
+      clientFactory: fakeClient,
+      providers: [{ name: "p0", url: "http://localhost:1", waterfalls: false }]
+    },
+    ...extra
+  });
+}
+
+async function packageManifest(): Promise<{ version: string; dependencies: Record<string, string> }> {
+  return JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+}
+
+describe("wallet.diagnostics() — the support snapshot", () => {
+  it("reports versions, dataDir, backup state and a zeroed sync/pending baseline", async () => {
+    wallet = await restore();
+    const diag = await wallet.diagnostics();
+    const pkg = await packageManifest();
+
+    expect(diag.sdkVersion).toBe(pkg.version);
+    expect(diag.lwkVersion).toBe(pkg.dependencies.lwk_node);
+    expect(diag.dataDir).toBe(dataDir);
+    expect(diag.backupConfirmed).toBe(true); // restore() is born confirmed
+    expect(diag.hasSeed).toBe(true);
+    expect(diag.apiKeyConfigured).toBe(false);
+    expect(diag.sync).toEqual({
+      lastScanAt: null,
+      lastSuccessAt: null,
+      lastPersistFailedAt: null,
+      lastPersistErrorName: null,
+      persistedUpdates: 0,
+      walletLoaded: false
+    });
+    expect(diag.pending).toEqual({
+      withdrawals: 0,
+      boltzSwaps: 0,
+      pegins: 0,
+      sideshiftShifts: 0,
+      plans: 0
+    });
+    expect(diag.guardrails).toEqual(await wallet.getGuardrails());
+  });
+
+  it("reflects sync state after a sync (lastScanAt/lastSuccessAt stamped, wollet loaded)", async () => {
+    wallet = await restore();
+    await wallet.sync();
+    const diag = await wallet.diagnostics();
+    expect(diag.sync.lastScanAt).toEqual(expect.any(Number));
+    expect(diag.sync.lastSuccessAt).toEqual(expect.any(Number));
+    expect(diag.sync.lastPersistFailedAt).toBeNull();
+    expect(diag.sync.lastPersistErrorName).toBeNull();
+    expect(diag.sync.walletLoaded).toBe(true);
+  });
+
+  it("counts pending items per rail via the same stores as getPending()", async () => {
+    wallet = await restore({
+      resumePendingWithdrawalsOnOpen: false,
+      resumePendingConversionsOnOpen: false
+    });
+    const salt = JSON.parse(await readFile(join(dataDir, "wallet.json"), "utf8")).salt as string;
+    await new PendingWithdrawals({ dataDir, passphrase: PASSPHRASE, saltB64: salt }).putRequested({
+      idempotencyKey: "idem-1",
+      request: { pixKey: "k", taxNumber: "t", depositAmountInCents: 500 }
+    });
+    const shift: StoredSideShift = {
+      id: "sh_1",
+      type: "send",
+      asset: "USDT",
+      network: "tron",
+      depositAddress: "lq1qdeposit",
+      settleAddress: "T" + "x".repeat(33),
+      refundAddress: null,
+      status: "waiting",
+      createdAt: 1_720_000_000_000,
+      updatedAt: 1_720_000_000_000
+    };
+    await new SideShiftStore({ dataDir }).save(shift);
+
+    const diag = await wallet.diagnostics();
+    expect(diag.pending).toEqual({
+      withdrawals: 1,
+      boltzSwaps: 0,
+      pegins: 0,
+      sideshiftShifts: 1,
+      plans: 0
+    });
+  });
+
+  // A pending conversion plan must land in `plans` via the EXPLICIT
+  // `else if (rail === "plan")` branch — not a catch-all that would silently
+  // absorb any (future) unrecognized rail into the plans counter.
+  it("counts a pending conversion plan into plans (explicit rail branch)", async () => {
+    wallet = await restore({
+      resumePendingWithdrawalsOnOpen: false,
+      resumePendingConversionsOnOpen: false
+    });
+    const salt = JSON.parse(await readFile(join(dataDir, "wallet.json"), "utf8")).salt as string;
+    const plan: StoredConversionPlan = {
+      planId: "plan_1",
+      intent: { from: "BTC", to: "USDT", network: "tron", amountSats: 100_000n },
+      route: { id: "route-x", legs: [], hops: 2, custodial: false },
+      params: {},
+      currentLegIndex: 0,
+      legResults: [null],
+      state: "pending",
+      createdAt: 1_720_000_000_000
+    };
+    await new ConversionPlanStore({ dataDir, passphrase: PASSPHRASE, saltB64: salt }).put(plan);
+
+    const diag = await wallet.diagnostics();
+    expect(diag.pending).toEqual({
+      withdrawals: 0,
+      boltzSwaps: 0,
+      pegins: 0,
+      sideshiftShifts: 0,
+      plans: 1
+    });
+  });
+
+  it("NEVER leaks key material — no mnemonic word, passphrase or descriptor", async () => {
+    wallet = await restore();
+    const diag = await wallet.diagnostics();
+    const flat = JSON.stringify(diag);
+    expect(flat).not.toContain("abandon"); // any mnemonic word
+    expect(flat).not.toContain(PASSPHRASE);
+    expect(flat).not.toContain(descriptorFromMnemonic(KNOWN_MNEMONIC));
+    expect(flat).not.toContain("slip77"); // the confidential descriptor's blinding-key marker
+    expect(flat.toLowerCase()).not.toContain("mnemonic");
+    expect(flat.toLowerCase()).not.toContain("xprv");
+  });
+
+  it("works on a view-only (wiped) wallet — hasSeed false, snapshot still complete", async () => {
+    wallet = await restore();
+    await wallet.wipe();
+    await wallet.close();
+    wallet = await DepixWallet.open({ dataDir });
+    const diag = await wallet.diagnostics();
+    expect(diag.hasSeed).toBe(false);
+    expect(diag.dataDir).toBe(dataDir);
+    expect(diag.pending).toEqual({
+      withdrawals: 0,
+      boltzSwaps: 0,
+      pegins: 0,
+      sideshiftShifts: 0,
+      plans: 0
+    });
+  });
+
+  it("fails fast with WALLET_NOT_FOUND on a closed wallet", async () => {
+    wallet = await restore();
+    await wallet.close();
+    await expect(wallet.diagnostics()).rejects.toSatisfy((err: unknown) =>
+      isDepixSdkError(err, "WALLET_NOT_FOUND")
+    );
+  });
+
+  // The dataDir surfaced by diagnostics() (and echoed by the wallet_diagnostics
+  // MCP tool) has its home-dir prefix redacted to `~` so the OS username the
+  // absolute path routinely embeds does not leak to an MCP host / support.
+  it("redacts the home-dir prefix of dataDir to ~ in the snapshot", async () => {
+    // A real dataDir UNDER the home dir (mkdtemp keeps it isolated + cleaned).
+    const homeDataDir = await mkdtemp(join(homedir(), ".depix-sdk-diag-home-"));
+    let homeWallet: DepixWallet | undefined;
+    try {
+      homeWallet = await DepixWallet.restore({
+        dataDir: homeDataDir,
+        passphrase: PASSPHRASE,
+        mnemonic: KNOWN_MNEMONIC,
+        sync: {
+          clientFactory: fakeClient,
+          providers: [{ name: "p0", url: "http://localhost:1", waterfalls: false }]
+        }
+      });
+      const diag = await homeWallet.diagnostics();
+      expect(diag.dataDir.startsWith("~")).toBe(true);
+      expect(diag.dataDir).toBe(redactHomePath(homeDataDir));
+      expect(diag.dataDir).not.toContain(homedir()); // no absolute home prefix / username leaked
+    } finally {
+      await homeWallet?.close().catch(() => {});
+      await rm(homeDataDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("redactHomePath — home prefix down to ~", () => {
+  it("replaces an exact homedir with ~", () => {
+    expect(redactHomePath(homedir())).toBe("~");
+  });
+
+  it("replaces the homedir prefix with ~ on a nested path", () => {
+    const p = join(homedir(), ".depix-wallet", "sub");
+    const red = redactHomePath(p);
+    expect(red.startsWith("~")).toBe(true);
+    expect(red).not.toContain(homedir());
+    expect(red).toBe(join("~", ".depix-wallet", "sub"));
+  });
+
+  it("leaves a path outside the home dir untouched", () => {
+    const p = join(tmpdir(), "depix-outside-home");
+    expect(redactHomePath(p)).toBe(p);
+  });
+
+  it("is boundary-safe: a sibling sharing the home prefix is NOT redacted", () => {
+    const sibling = homedir() + "-sibling";
+    expect(redactHomePath(sibling)).toBe(sibling);
+  });
+});

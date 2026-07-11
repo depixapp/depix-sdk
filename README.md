@@ -132,13 +132,18 @@ owner must have WhatsApp verified in the app or deposit/withdraw return
 ```ts
 await wallet.send({ asset: "LBTC", amountSats: 5000n, address: "lq1…" });
 
-// SideSwap market swap (non-custodial): a live quote stream, then execute.
-const stream = await wallet.convert.sideswap.quote({ from: "DEPIX", to: "LBTC", amountSats: 500_000_000n });
+// Converting: quote every candidate route, then execute one — the PRIMARY surface.
+const routes = await wallet.quote({ from: "DEPIX", to: "LBTC", network: "liquid", amount: 500_000_000n });
+const result = await wallet.convert({ from: "DEPIX", to: "LBTC", network: "liquid", amount: 500_000_000n });
+
+// Power users: the per-provider namespaces live under wallet.advanced.*
+// (e.g. drive the SideSwap quote stream yourself, tick by tick).
+const stream = await wallet.advanced.sideswap.quote({ from: "DEPIX", to: "LBTC", amountSats: 500_000_000n });
 const quote = await stream.next();
 const swap = await stream.execute(quote);
 stream.close();
 
-// Lightning, refunds and gift cards live under wallet.convert.* / wallet.giftcards.*.
+// Lightning, refunds and gift cards live under wallet.advanced.* / wallet.giftcards.*.
 // A documented cross-network USDt route is custodial and marked custodial: true.
 ```
 
@@ -183,13 +188,15 @@ npx -p @depixapp/sdk depix-wallet-mcp
 Tools: `wallet_status`, `wallet_get_address`, `wallet_get_balances`,
 `wallet_list_transactions`, `wallet_send`, `wallet_create_deposit`,
 `wallet_wait_deposit`, `wallet_create_withdrawal`, `wallet_wait_withdrawal`,
-`wallet_get_guardrails`, plus swap/lightning/gift-card fast-follows and the
+`wallet_get_guardrails`, plus swap/lightning/gift-card fast-follows, the
 recovery pair `wallet_recover` / `wallet_pending` (re-drive everything pending
 across all rails; list what is in flight — crash recovery also runs
-automatically at boot). Monetary fields name their unit (`amount_cents` for
-Pix/BRL, `amount_sats` for sends/swaps). There is **no** tool that exports the
-seed/mnemonic or changes guardrails — those are never reachable by a tool call,
-even from a fully injected model.
+automatically at boot) and the read-only `wallet_diagnostics` health snapshot
+(versions, sync health, pending counters — never key material). Monetary
+fields name their unit (`amount_cents` for Pix/BRL, `amount_sats` for
+sends/swaps). There is **no** tool that exports the seed/mnemonic or changes
+guardrails — those are never reachable by a tool call, even from a fully
+injected model.
 
 > **Two hosts, one wallet dir?** Each host spawns its own process; a second
 > process on the same `DEPIX_WALLET_DIR` fails fast with `WALLET_DIR_LOCKED`.
@@ -241,13 +248,36 @@ One private key covers N wallets; the secret doesn't disappear, it changes shape
 
 ## Conversions
 
-`wallet.convert.*` moves between the three Liquid assets and out to other rails.
-All are **non-custodial** — the SDK signs locally and funds return to your wallet
+Conversions move between the three Liquid assets and out to other rails. All
+are **non-custodial** — the SDK signs locally and funds return to your wallet
 — **except SideShift**, which is custodial and signalled as such (see below).
 
-- `wallet.convert.sideswap.*` — market swaps + BTC↔L-BTC peg (non-custodial).
-- `wallet.convert.boltz.*` — Lightning send/receive + L-BTC→USDC/USDT EVM (non-custodial).
-- `wallet.convert.sideshift.*` — **USDt cross-network — CUSTODIAL, signalled.**
+**Primary surface — the intent layer.** `wallet.quote()` enumerates every
+candidate route (single- and multi-hop) with per-leg estimates; the callable
+`wallet.convert({ from, to, network, amount })` executes one, hiding the
+provider mechanics (quote streams, watches, polling) and waiting for
+settlement by default:
+
+```ts
+const routes = await wallet.quote({ from: "DEPIX", to: "LBTC", network: "liquid", amount: 500_000_000n });
+const result = await wallet.convert({ from: "DEPIX", to: "LBTC", network: "liquid", amount: 500_000_000n, route: routes[0].id });
+```
+
+**Advanced surface — `wallet.advanced.*`.** The per-provider namespaces, for
+power users who want fine-grained control (drive the quote stream tick by
+tick, poll `pegStatus`, resume Boltz swaps manually, manage SideShift refund
+addresses):
+
+- `wallet.advanced.sideswap.*` — market swaps + BTC↔L-BTC peg (non-custodial).
+- `wallet.advanced.boltz.*` — Lightning send/receive + L-BTC→USDC/USDT EVM (non-custodial).
+- `wallet.advanced.sideshift.*` — **USDt cross-network — CUSTODIAL, signalled.**
+
+Every money-moving method still crosses the owner's guardrails before signing
+— the advanced surface adds no bypass.
+
+> **Deprecated aliases.** `wallet.convert.sideswap` / `.boltz` / `.sideshift`
+> still work (they alias the very same instances) but are deprecated — use
+> `wallet.advanced.*`. They will not be removed in 1.x.
 
 ### SideShift (custodial USDt bridge)
 
@@ -261,7 +291,7 @@ custodial nature is documented, not gated (decision G4).
 
 ```ts
 // SEND — USDt Liquid → another network (guardrailed: value + settle/refund allowlist).
-const shift = await wallet.convert.sideshift.send({
+const shift = await wallet.advanced.sideshift.send({
   network: "tron",              // ethereum | tron | bsc | polygon | solana
   amountSats: 10_000_000n,      // USDt base units (8 decimals on Liquid)
   settleAddress: "T…",          // FINAL destination on the target network
@@ -270,14 +300,37 @@ const shift = await wallet.convert.sideshift.send({
 console.log(shift.custodial);   // true
 
 // RECEIVE — external network → USDt into this wallet (an inflow; no guardrail).
-await wallet.convert.sideshift.receive({ network: "tron" });
-await wallet.convert.sideshift.getStatus(shift.shiftId);
+await wallet.advanced.sideshift.receive({ network: "tron" });
+await wallet.advanced.sideshift.getStatus(shift.shiftId);
 ```
 
 With the guardrail allowlist enabled, a SEND requires the `settleAddress` (mapped
 to its network class — `evmAddresses` / `tronAddresses`) **and** the
 `refundAddress` (`sideshiftRefundAddresses`) to be opted in. A Solana settle has
 no representable allowlist class, so it is fail-closed when the allowlist is on.
+
+---
+
+## Maintenance & diagnostics
+
+```ts
+// Incremental sync (the default) — scans forward from the current state.
+await wallet.sync();
+
+// Deep re-scan from ZERO — drops the local scan cache and re-derives the whole
+// history. The recovery move when the wallet looks desynchronized (missing
+// transactions, stale balances). Slower: the cold-start timeout applies.
+await wallet.sync({ rescan: true });
+
+// Read-only health snapshot for support: SDK/LWK versions, dataDir, backup
+// state, sync health (last scan/success, last persist failure), per-rail
+// pending counters and the guardrail budget. NEVER key material — no seed,
+// mnemonic, passphrase or descriptor.
+const diag = await wallet.diagnostics();
+```
+
+The same snapshot is exposed to MCP hosts as the read-only `wallet_diagnostics`
+tool.
 
 ---
 
