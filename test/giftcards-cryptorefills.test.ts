@@ -17,7 +17,11 @@ import {
   isLightningRailAvailable,
   mapOrderStatus,
   normalizeBrands,
-  requiresExternalCheckout
+  normalizeProduct,
+  normalizeProducts,
+  priceToSats,
+  requiresExternalCheckout,
+  satsFromBtcAmount
 } from "../src/giftcards/cryptorefills.js";
 import { CryptorefillsApiError } from "../src/errors.js";
 
@@ -143,6 +147,82 @@ describe("normalizeBrands / filterBrands / KYC gate", () => {
     expect(cryptorefillsBrandUrl({ family: "Rewarble" }, "BR")).toBe(
       "https://www.cryptorefills.com/en/brazil/gift_cards/rewarble"
     );
+  });
+});
+
+describe("satsFromBtcAmount / priceToSats", () => {
+  it("parses a BTC decimal into whole sats (truncating sub-sat), rejecting junk", () => {
+    expect(satsFromBtcAmount("0.00025000")).toBe(25_000n);
+    expect(satsFromBtcAmount("1")).toBe(100_000_000n);
+    expect(satsFromBtcAmount("0.000000009")).toBe(0n); // sub-sat truncated
+    expect(satsFromBtcAmount("")).toBeNull();
+    expect(satsFromBtcAmount("abc")).toBeNull();
+    expect(satsFromBtcAmount(null)).toBeNull();
+  });
+
+  it("priceToSats reads coin_amount → Number sats, or null", () => {
+    expect(priceToSats({ coin_amount: "0.00075000" })).toBe(75_000);
+    expect(priceToSats({})).toBeNull();
+    expect(priceToSats(null)).toBeNull();
+  });
+});
+
+describe("normalizeProduct / normalizeProducts (denomination discovery)", () => {
+  it("normalizes a FIXED product: coin_amount → coinAmountSats, face_value → fiat price", () => {
+    const p = normalizeProduct({
+      denomination: "25 BRL",
+      localized_denomination: "R$ 25",
+      is_dynamic: false,
+      coin_amount: "0.00025000",
+      face_value: { currency_code: "BRL", amount: { price: 25 } }
+    });
+    expect(p).toEqual({
+      denomination: "25 BRL",
+      localizedDenomination: "R$ 25",
+      isDynamic: false,
+      coinAmountSats: 25_000,
+      faceValue: { currency: "BRL", price: 25 }
+    });
+  });
+
+  it("normalizes a RANGE product: no coinAmountSats, min/max from amount (minimum|maximum too)", () => {
+    const p = normalizeProduct({
+      denomination: "range",
+      is_dynamic: true,
+      coin_amount: "0.001", // ignored for range
+      face_value: { currency_code: "BRL", amount: { minimum: 10, maximum: 500 } }
+    });
+    expect(p).toEqual({
+      denomination: "range",
+      isDynamic: true,
+      faceValue: { currency: "BRL", min: 10, max: 500 }
+    });
+    expect(p.coinAmountSats).toBeUndefined();
+  });
+
+  it("picks the brand-matching entry with products, keeping BOTH fixed and range", () => {
+    const raw = [
+      { brand: "Other", products: [{ denomination: "x", is_dynamic: false, coin_amount: "0.0001" }] },
+      {
+        brand: "Amazon",
+        products: [
+          { denomination: "25 BRL", is_dynamic: false, coin_amount: "0.00025000" },
+          { denomination: "range", is_dynamic: true, face_value: { amount: { min: 5, max: 100 } } }
+        ]
+      }
+    ];
+    const products = normalizeProducts(raw, "Amazon");
+    expect(products.map((p) => p.denomination)).toEqual(["25 BRL", "range"]);
+    expect(products[0]!.coinAmountSats).toBe(25_000);
+    expect(products[1]!.isDynamic).toBe(true);
+  });
+
+  it("falls back to the first non-empty entry and tolerates a non-array", () => {
+    expect(normalizeProducts([{ brand: "Z", products: [{ denomination: "d", is_dynamic: false }] }], "Nope")).toHaveLength(
+      1
+    );
+    expect(normalizeProducts(null, "Amazon")).toEqual([]);
+    expect(normalizeProducts([], "Amazon")).toEqual([]);
   });
 });
 

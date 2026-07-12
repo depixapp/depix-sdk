@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { defaultLogger, type Logger } from "../logger.js";
 import { Mutex } from "../mutex.js";
 import { ensureDir, writeFileDurable } from "../store/fs-util.js";
+import type { OrderDelivery } from "./cryptorefills.js";
 
 export const GIFTCARD_ORDERS_FILE = "giftcard-orders.json";
 export const MAX_STORED_ORDERS = 100;
@@ -34,6 +35,12 @@ export interface StoredGiftcardOrder {
   lockupTxid?: string;
   /** Last-known CryptoRefills order phase (from mapOrderStatus). */
   phase: string;
+  /**
+   * Last-known redemption delivery (from extractDelivery) — the code/URL the
+   * buyer redeems. null until delivered; absent on legacy records (parity with
+   * the frontend, which persists { phase, delivery } per order).
+   */
+  delivery?: OrderDelivery | null;
   createdAt: number;
   updatedAt: number;
 }

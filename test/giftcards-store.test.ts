@@ -82,6 +82,23 @@ describe("GiftcardOrderStore", () => {
     expect((await reopened.get("a"))?.phase).toBe("delivered");
   });
 
+  it("round-trips the redemption delivery and tolerates legacy records without it", async () => {
+    await store.save(order("a", { delivery: { kind: "code", value: "PIN-42" } }));
+    expect((await store.get("a"))?.delivery).toEqual({ kind: "code", value: "PIN-42" });
+    await store.update("a", { phase: "delivered", delivery: { kind: "url", value: "https://redeem/x" } });
+    expect((await store.get("a"))?.delivery).toEqual({ kind: "url", value: "https://redeem/x" });
+    // A legacy record written before `delivery` existed loads without crashing.
+    const legacy = order("legacy");
+    delete (legacy as Partial<StoredGiftcardOrder>).delivery; // the helper omits it anyway
+    await writeFile(
+      join(dataDir, GIFTCARD_ORDERS_FILE),
+      JSON.stringify({ format: "depix-giftcard-orders", version: 1, orders: [legacy] })
+    );
+    const got = await store.get("legacy");
+    expect(got?.orderId).toBe("legacy");
+    expect(got?.delivery).toBeUndefined();
+  });
+
   it("discards a corrupt log instead of throwing", async () => {
     await writeFile(join(dataDir, GIFTCARD_ORDERS_FILE), "{ not json");
     await expect(store.list()).resolves.toEqual([]);

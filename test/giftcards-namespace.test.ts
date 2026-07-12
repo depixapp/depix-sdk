@@ -64,12 +64,20 @@ function fakeBoltzClient(over: Partial<Record<keyof BoltzClient, unknown>> = {})
   } as unknown as BoltzClient;
 }
 
+// A payment_vias matrix that offers an unsuspended USER_WALLET→BTC→Lightning path.
+const LIGHTNING_AVAILABLE_VIAS = [
+  { name: "USER_WALLET", currencies: [{ name: "BTC", networks: [{ name: "Lightning", is_suspended: false }] }] }
+];
+
 interface FakeCryptorefills {
   client: CryptorefillsClient;
   createOrder: ReturnType<typeof vi.fn>;
   validateOrder: ReturnType<typeof vi.fn>;
   listBrands: ReturnType<typeof vi.fn>;
   getOrderStatus: ReturnType<typeof vi.fn>;
+  getPaymentVias: ReturnType<typeof vi.fn>;
+  listProductsForCountry: ReturnType<typeof vi.fn>;
+  getProductPrice: ReturnType<typeof vi.fn>;
 }
 
 function fakeCryptorefills(over: {
@@ -77,6 +85,10 @@ function fakeCryptorefills(over: {
   createOrderImpl?: () => Promise<CryptorefillsOrder>;
   brands?: unknown;
   statusOrder?: CryptorefillsOrder;
+  paymentVias?: unknown;
+  paymentViasError?: unknown;
+  products?: unknown;
+  price?: unknown;
 } = {}): FakeCryptorefills {
   // REAL CryptoRefills POST /v5/orders shape: the id comes back as `order_id`
   // (proven by the frontend fixture depix-frontend/tests/cryptorefills.test.js),
@@ -102,8 +114,31 @@ function fakeCryptorefills(over: {
       }
   );
   const getOrderStatus = vi.fn(async () => over.statusOrder ?? { id: "ord-1", order_state: "Done", pin_code: "CODE-42" });
-  const client = { createOrder, validateOrder, listBrands, getOrderStatus } as unknown as CryptorefillsClient;
-  return { client, createOrder, validateOrder, listBrands, getOrderStatus };
+  const getPaymentVias = vi.fn(async () => {
+    if (over.paymentViasError) throw over.paymentViasError;
+    return over.paymentVias ?? LIGHTNING_AVAILABLE_VIAS;
+  });
+  const listProductsForCountry = vi.fn(async () => over.products ?? []);
+  const getProductPrice = vi.fn(async () => over.price ?? { coin_amount: "0.00010000" });
+  const client = {
+    createOrder,
+    validateOrder,
+    listBrands,
+    getOrderStatus,
+    getPaymentVias,
+    listProductsForCountry,
+    getProductPrice
+  } as unknown as CryptorefillsClient;
+  return {
+    client,
+    createOrder,
+    validateOrder,
+    listBrands,
+    getOrderStatus,
+    getPaymentVias,
+    listProductsForCountry,
+    getProductPrice
+  };
 }
 
 let dataDir: string;
@@ -310,11 +345,113 @@ describe("gift cards — list() + getOrderStatus() (§5.5)", () => {
     expect(cat.categories).toContain("e-commerce");
   });
 
-  it("getOrderStatus() polls CryptoRefills, maps the phase, and folds it into the log", async () => {
+  it("getOrderStatus() polls CryptoRefills, maps the phase, and folds phase+delivery into the log", async () => {
     const { wallet: w } = await restore({ guardrails: { perTxLimitBrlCents: 1_000 } });
     await w.giftcards.buy(buyParams).catch(() => {}); // seeds the order log
     const phase = await w.giftcards.getOrderStatus("ord-1");
     expect(phase).toMatchObject({ phase: "delivered", terminal: true, delivery: { kind: "code", value: "CODE-42" } });
-    expect((await w.giftcards.listOrders())[0]?.phase).toBe("delivered");
+    // BOTH phase and the redeemed delivery are persisted (parity with frontend).
+    const stored = (await w.giftcards.listOrders())[0];
+    expect(stored?.phase).toBe("delivered");
+    expect(stored?.delivery).toEqual({ kind: "code", value: "CODE-42" });
+  });
+});
+
+describe("gift cards — Lightning-rail pre-check in buy() (§5.5 parity)", () => {
+  it("fails fast with GIFTCARD_RAIL_UNAVAILABLE BEFORE createOrder when Lightning is suspended", async () => {
+    const cr = fakeCryptorefills({
+      paymentVias: [
+        { name: "USER_WALLET", currencies: [{ name: "BTC", networks: [{ name: "Lightning", is_suspended: true }] }] }
+      ]
+    });
+    const { wallet: w } = await restore({ cryptorefills: cr });
+    await expect(w.giftcards.buy(buyParams)).rejects.toSatisfy((e: unknown) =>
+      isDepixSdkError(e, "GIFTCARD_RAIL_UNAVAILABLE")
+    );
+    expect(cr.getPaymentVias).toHaveBeenCalled();
+    expect(cr.createOrder).not.toHaveBeenCalled();
+  });
+
+  it("proceeds past the pre-check when the matrix cannot be fetched (fail-open)", async () => {
+    const cr = fakeCryptorefills({ paymentViasError: new Error("network down") });
+    const { wallet: w } = await restore({ cryptorefills: cr });
+    // Can't determine the rail state → don't block; the empty wallet then fails
+    // at the lockup build, proving the flow proceeded to the payment step.
+    await expect(w.giftcards.buy(buyParams)).rejects.toSatisfy((e: unknown) =>
+      isDepixSdkError(e, "INSUFFICIENT_FUNDS")
+    );
+    expect(cr.createOrder).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("gift cards — product/denomination discovery (§5.5)", () => {
+  // A brand entry mixing a FIXED denomination and a RANGE (dynamic) product.
+  const PRODUCTS = [
+    {
+      brand: "Amazon",
+      products: [
+        {
+          denomination: "25 BRL",
+          localized_denomination: "R$ 25",
+          is_dynamic: false,
+          coin_amount: "0.00025000",
+          face_value: { currency_code: "BRL", amount: { price: 25 } }
+        },
+        {
+          denomination: "range",
+          is_dynamic: true,
+          face_value: { currency_code: "BRL", amount: { minimum: 10, maximum: 500 } }
+        }
+      ]
+    }
+  ];
+
+  it("listProducts returns the FULL list — fixed (priceSats) AND range (min/max) — for a mixed brand", async () => {
+    const cr = fakeCryptorefills({ products: PRODUCTS });
+    const { wallet: w } = await restore({ cryptorefills: cr });
+    const products = await w.giftcards.listProducts({ brandName: "Amazon" });
+    expect(products).toHaveLength(2);
+    expect(products[0]).toEqual({
+      denomination: "25 BRL",
+      label: "R$ 25",
+      isDynamic: false,
+      priceSats: 25_000, // 0.00025000 BTC → 25_000 sats
+      currency: "BRL",
+      min: null,
+      max: null
+    });
+    expect(products[1]).toEqual({
+      denomination: "range",
+      label: "range",
+      isDynamic: true,
+      priceSats: null,
+      currency: "BRL",
+      min: 10,
+      max: 500
+    });
+    expect(cr.listProductsForCountry).toHaveBeenCalledWith("BR", { brandName: "Amazon", coin: "BTC" });
+  });
+
+  it("price() quotes a custom (range) value in sats", async () => {
+    const cr = fakeCryptorefills({ price: { coin_amount: "0.00075000", currency_code: "BRL" } });
+    const { wallet: w } = await restore({ cryptorefills: cr });
+    const quote = await w.giftcards.price({ brandName: "Amazon", faceValue: 150 });
+    expect(quote).toEqual({ priceSats: 75_000, currency: "BRL" });
+    expect(cr.getProductPrice).toHaveBeenCalledWith({
+      brandName: "Amazon",
+      countryCode: "BR",
+      faceValue: 150,
+      coin: "BTC"
+    });
+  });
+
+  it("listProducts + price are gated on giftcardEnabled", async () => {
+    const { wallet: w } = await restore({ config: { ...ENABLED_CONFIG, enabled: false } });
+    await expect(w.giftcards.listProducts({ brandName: "Amazon" })).rejects.toSatisfy((e: unknown) =>
+      isDepixSdkError(e, "GIFTCARDS_DISABLED")
+    );
+    await expect(w.giftcards.price({ brandName: "Amazon", faceValue: 50 })).rejects.toSatisfy((e: unknown) =>
+      isDepixSdkError(e, "GIFTCARDS_DISABLED")
+    );
   });
 });

@@ -29,11 +29,15 @@ import {
   cryptorefillsBrandUrl,
   extractLightningInvoice,
   filterBrands,
+  isLightningRailAvailable,
   mapOrderStatus,
   normalizeBrands,
+  normalizeProducts,
+  priceToSats,
   requiresExternalCheckout,
   type CryptorefillsBrand,
   type CryptorefillsClient,
+  type CryptorefillsProduct,
   type OrderPhase
 } from "./cryptorefills.js";
 
@@ -51,6 +55,45 @@ export interface GiftcardCatalog {
   brands: CryptorefillsBrand[];
   popularBrands: CryptorefillsBrand[];
   categories: string[];
+}
+
+export interface ListProductsParams {
+  /** Brand/family name from list() (e.g. "Amazon"). */
+  brandName: string;
+  /** ISO 3166-1 alpha-2; default: config `countryDefault`. */
+  countryCode?: string;
+}
+
+/** One product/denomination of a brand — the agent-facing selection shape (§5.5). */
+export interface GiftcardProduct {
+  /** The exact `denomination` to pass to buy() for a FIXED product (e.g. "25 BRL"). */
+  denomination: string;
+  /** Human label (localized denomination, falling back to the denomination). */
+  label: string;
+  /** true = range/custom-value product: buy with denomination "range" + `productValue`. */
+  isDynamic: boolean;
+  /** BTC price in sats for a FIXED product; null for a range product (price it via price()). */
+  priceSats: number | null;
+  /** Fiat currency code of the face value (e.g. "BRL"), when known. */
+  currency: string | null;
+  /** Range lower bound (fiat) for a dynamic product; null otherwise. */
+  min: number | null;
+  /** Range upper bound (fiat) for a dynamic product; null otherwise. */
+  max: number | null;
+}
+
+export interface GiftcardPriceParams {
+  brandName: string;
+  /** The custom face value to quote (within the range product's min/max). */
+  faceValue: string | number;
+  countryCode?: string;
+}
+
+export interface GiftcardPrice {
+  /** The BTC cost in sats for the requested custom (range) value. */
+  priceSats: number;
+  /** Fiat currency code, when the price response carries it (else null). */
+  currency: string | null;
 }
 
 export interface BuyGiftcardParams {
@@ -142,6 +185,52 @@ export class GiftcardsNamespace {
   }
 
   /**
+   * List a brand's products/denominations (§5.5) so an agent can discover the
+   * FIXED denominations and whether a product is a RANGE (custom-value) product
+   * plus its min/max bounds — the piece needed to complete the selection flow
+   * before buy(). Gated on `giftcardEnabled`. Returns the FULL product list
+   * (fixed AND range), unlike the frontend UI which collapses a mixed brand to a
+   * single range input.
+   */
+  async listProducts(params: ListProductsParams): Promise<GiftcardProduct[]> {
+    const cfg = await this.requireEnabled();
+    const brandName = String(params.brandName ?? "").trim();
+    if (!brandName) throw new TypeError("giftcards.listProducts requires `brandName`.");
+    const cc = params.countryCode ?? cfg.countryDefault;
+    const raw = await this.cryptorefills.listProductsForCountry(cc, { brandName, coin: "BTC" });
+    return normalizeProducts(raw, brandName).map(toGiftcardProduct);
+  }
+
+  /**
+   * Quote a CUSTOM value for a RANGE (dynamic) product in sats (§5.5) — GET
+   * /v4/products/price. Lets an agent price an arbitrary face value within the
+   * product's min/max before buy(). Gated on `giftcardEnabled`.
+   */
+  async price(params: GiftcardPriceParams): Promise<GiftcardPrice> {
+    const cfg = await this.requireEnabled();
+    const brandName = String(params.brandName ?? "").trim();
+    if (!brandName) throw new TypeError("giftcards.price requires `brandName`.");
+    if (params.faceValue == null || String(params.faceValue).trim() === "") {
+      throw new TypeError("giftcards.price requires `faceValue`.");
+    }
+    const cc = params.countryCode ?? cfg.countryDefault;
+    const priced = await this.cryptorefills.getProductPrice({
+      brandName,
+      countryCode: cc,
+      faceValue: params.faceValue,
+      coin: "BTC"
+    });
+    const priceSats = priceToSats(priced);
+    if (priceSats == null) {
+      throw new CryptorefillsApiError("CryptoRefills price response has no usable coin_amount for this value.", {
+        status: 200,
+        body: priced
+      });
+    }
+    return { priceSats, currency: readPriceCurrency(priced) };
+  }
+
+  /**
    * Buy a gift card and pay it over Lightning via the Boltz submarine flow
    * (§5.5). Gated on `giftcardEnabled`. The KYC-gated "e-money" category is not
    * sellable → GIFTCARD_KYC_CATEGORY (with the external deep-link). The payment
@@ -176,6 +265,26 @@ export class GiftcardsNamespace {
     const brand = params.brand ?? (await this.resolveBrand(params.brandName, countryCode));
     if (brand && requiresExternalCheckout(brand)) {
       throw this.kycError(brand, countryCode);
+    }
+
+    // Lightning-rail pre-check (parity with the frontend's isLightningRailAvailable
+    // gate, shop-ui.js): never create an order we can't pay over Lightning. The
+    // payment_vias matrix is public + unauthenticated. Best-effort — if it can't
+    // be fetched we fall through (createOrder is the backstop); a payment_vias
+    // outage must not block an otherwise-payable buy. We fail closed only on an
+    // EXPLICITLY unavailable/suspended USER_WALLET→BTC→Lightning rail.
+    let paymentVias: unknown;
+    try {
+      paymentVias = await this.cryptorefills.getPaymentVias();
+    } catch {
+      paymentVias = undefined; // can't determine → don't block
+    }
+    if (paymentVias !== undefined && !isLightningRailAvailable(paymentVias)) {
+      throw new ConversionError(
+        "GIFTCARD_RAIL_UNAVAILABLE",
+        "CryptoRefills' USER_WALLET → BTC → Lightning payment rail is currently unavailable or suspended — a " +
+          "gift-card invoice cannot be paid over Lightning right now. Try again later."
+      );
     }
 
     const orderBody = buildLightningOrderBody({
@@ -253,6 +362,7 @@ export class GiftcardsNamespace {
       expectedAmountSats: 0,
       swapId: "",
       phase: mapOrderStatus(order).phase,
+      delivery: null,
       createdAt,
       updatedAt: createdAt
     };
@@ -306,7 +416,10 @@ export class GiftcardsNamespace {
   async getOrderStatus(orderId: string): Promise<OrderPhase> {
     const order = await this.cryptorefills.getOrderStatus(orderId);
     const phase = mapOrderStatus(order);
-    await this.store.update(orderId, { phase: phase.phase }).catch(() => {});
+    // Persist BOTH phase and delivery (parity with the frontend, which patches
+    // { phase, delivery } every poll) so the redeemed code/URL survives restarts
+    // and is surfaced by listOrders(). delivery is undefined until "delivered".
+    await this.store.update(orderId, { phase: phase.phase, delivery: phase.delivery ?? null }).catch(() => {});
     return phase;
   }
 
@@ -366,4 +479,36 @@ export class GiftcardsNamespace {
       return undefined;
     }
   }
+}
+
+/** Flatten a normalized CryptorefillsProduct into the agent-facing GiftcardProduct. */
+function toGiftcardProduct(p: CryptorefillsProduct): GiftcardProduct {
+  return {
+    denomination: p.denomination,
+    label: p.localizedDenomination ?? p.denomination,
+    isDynamic: p.isDynamic,
+    priceSats: p.coinAmountSats ?? null,
+    currency: p.faceValue?.currency ?? null,
+    min: p.faceValue?.min ?? null,
+    max: p.faceValue?.max ?? null
+  };
+}
+
+/**
+ * Best-effort currency read from a /v4/products/price response. The documented
+ * field is `coin_amount` (currency is not guaranteed); an agent already learns
+ * the currency from listProducts, so this returns null when absent rather than
+ * inventing one.
+ */
+function readPriceCurrency(priced: unknown): string | null {
+  const rec = priced && typeof priced === "object" ? (priced as Record<string, unknown>) : null;
+  if (!rec) return null;
+  const direct = rec.currency_code ?? rec.currency;
+  if (typeof direct === "string" && direct.trim()) return direct;
+  const fv = rec.face_value;
+  if (fv && typeof fv === "object") {
+    const c = (fv as Record<string, unknown>).currency_code;
+    if (typeof c === "string" && c.trim()) return c;
+  }
+  return null;
 }

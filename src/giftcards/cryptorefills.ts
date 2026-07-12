@@ -129,6 +129,73 @@ export interface LightningOrderBodyParams {
   quantity?: number;
 }
 
+// ── product / denomination shapes (GET /v5/products/country + /v4/products/price)
+//    — typed only for the fields we read (raw passthrough elsewhere) ────────────
+
+/** A face-value block on a product: fiat currency + (fixed) price / (range) bounds. */
+export interface CryptorefillsFaceValue {
+  currency_code?: string;
+  amount?: {
+    price?: number | string;
+    min?: number | string;
+    minimum?: number | string;
+    max?: number | string;
+    maximum?: number | string;
+    [k: string]: unknown;
+  };
+  [k: string]: unknown;
+}
+
+/** A raw product (denomination) inside a /v5/products/country entry. */
+export interface CryptorefillsRawProduct {
+  denomination?: string;
+  localized_denomination?: string;
+  /** The fixed-vs-range decider (Boolean(is_dynamic) === range/custom-value). */
+  is_dynamic?: boolean;
+  /** BTC amount for a FIXED product (→ sats via satsFromBtcAmount). */
+  coin_amount?: string;
+  face_value?: CryptorefillsFaceValue;
+  [k: string]: unknown;
+}
+
+/** A /v5/products/country entry — a brand plus its nested products[]. */
+export interface CryptorefillsProductsEntry {
+  brand?: string;
+  products?: CryptorefillsRawProduct[];
+  [k: string]: unknown;
+}
+
+/** The /v4/products/price response for a range (dynamic) product's custom value. */
+export interface CryptorefillsPrice {
+  coin_amount?: string;
+  [k: string]: unknown;
+}
+
+/**
+ * A normalized product/denomination — a faithful projection of a
+ * CryptorefillsRawProduct: `is_dynamic` becomes `isDynamic`; a FIXED product's
+ * BTC `coin_amount` becomes `coinAmountSats`; the `face_value` block becomes the
+ * fiat `{ currency, price, min, max }`. Range products carry no coinAmountSats
+ * (they are priced per value via getProductPrice).
+ */
+export interface CryptorefillsProduct {
+  /** The exact denomination string to pass to buy() for a FIXED product. */
+  denomination: string;
+  /** Localized label, when the API provides one. */
+  localizedDenomination?: string;
+  /** true = range/custom-value ("range" + productValue); false = fixed. */
+  isDynamic: boolean;
+  /** BTC price in sats for a FIXED product; absent for a range product. */
+  coinAmountSats?: number;
+  /** Fiat face value: currency + (fixed) price and (range) min/max bounds. */
+  faceValue?: {
+    currency?: string;
+    price?: number;
+    min?: number;
+    max?: number;
+  };
+}
+
 function resolveFetch(fetchImpl?: CryptorefillsFetch): CryptorefillsFetch {
   const impl =
     fetchImpl ??
@@ -242,7 +309,7 @@ export class CryptorefillsClient {
   listProductsForCountry(
     countryCode: string,
     opts: { brandName?: string; familyName?: string; coin?: string; paymentMethod?: string; lang?: string } = {}
-  ): Promise<unknown> {
+  ): Promise<CryptorefillsProductsEntry[]> {
     const cc = requireCountry(countryCode);
     const params = new URLSearchParams();
     if (opts.brandName) params.set("brand_name", opts.brandName);
@@ -250,7 +317,9 @@ export class CryptorefillsClient {
     if (opts.coin) params.set("coin", opts.coin);
     if (opts.paymentMethod) params.set("payment_method", opts.paymentMethod);
     params.set("lang", opts.lang || DEFAULT_LANG);
-    return this.crFetch(`/v5/products/country/${cc}?${params.toString()}`, { method: "GET" });
+    return this.crFetch<CryptorefillsProductsEntry[]>(`/v5/products/country/${cc}?${params.toString()}`, {
+      method: "GET"
+    });
   }
 
   /** GET /v4/products/price — exact crypto price for a RANGE (dynamic) product. */
@@ -260,7 +329,7 @@ export class CryptorefillsClient {
     faceValue: string | number;
     coin?: string;
     promoCode?: string;
-  }): Promise<unknown> {
+  }): Promise<CryptorefillsPrice> {
     const cc = requireCountry(params.countryCode);
     const q = new URLSearchParams({
       brand_name: String(params.brandName ?? ""),
@@ -269,7 +338,7 @@ export class CryptorefillsClient {
       coin: params.coin ?? "BTC"
     });
     if (params.promoCode) q.set("promo_code", params.promoCode);
-    return this.crFetch(`/v4/products/price?${q.toString()}`, { method: "GET" });
+    return this.crFetch<CryptorefillsPrice>(`/v4/products/price?${q.toString()}`, { method: "GET" });
   }
 
   // --- Orders ---------------------------------------------------------------
@@ -453,6 +522,88 @@ export function filterBrands(
     .map((b, i) => ({ b, i }))
     .sort((a, c) => (a.b.is_out_of_stock ? 1 : 0) - (c.b.is_out_of_stock ? 1 : 0) || a.i - c.i)
     .map((x) => x.b);
+}
+
+/**
+ * Parse a BTC decimal amount ("0.00025000" or a number) into whole sats as a
+ * BigInt — faithful port of the frontend `satsFromBtcAmount` (shop-logic.js).
+ * Sub-sat precision is truncated; returns null for malformed input.
+ */
+export function satsFromBtcAmount(btc: unknown): bigint | null {
+  if (btc == null) return null;
+  const s = String(btc).trim();
+  if (!/^\d+(\.\d+)?$/.test(s)) return null;
+  const [intPart = "0", fracRaw = ""] = s.split(".");
+  const frac = (fracRaw + "00000000").slice(0, 8);
+  try {
+    return BigInt(intPart) * 100_000_000n + BigInt(frac);
+  } catch {
+    return null;
+  }
+}
+
+/** The /v4/products/price coin_amount → whole sats as a Number, or null. */
+export function priceToSats(price: CryptorefillsPrice | null | undefined): number | null {
+  const sats = satsFromBtcAmount(price?.coin_amount);
+  return sats == null ? null : Number(sats);
+}
+
+function numOrNull(v: unknown): number | null {
+  if (v == null || v === "") return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizeFaceValue(fv: CryptorefillsFaceValue | undefined): CryptorefillsProduct["faceValue"] | undefined {
+  if (!fv || typeof fv !== "object") return undefined;
+  const amount = fv.amount && typeof fv.amount === "object" ? fv.amount : {};
+  const out: NonNullable<CryptorefillsProduct["faceValue"]> = {};
+  if (typeof fv.currency_code === "string" && fv.currency_code.trim()) out.currency = fv.currency_code;
+  const price = numOrNull(amount.price);
+  if (price != null) out.price = price;
+  const min = numOrNull(amount.min ?? amount.minimum);
+  if (min != null) out.min = min;
+  const max = numOrNull(amount.max ?? amount.maximum);
+  if (max != null) out.max = max;
+  return Object.keys(out).length ? out : undefined;
+}
+
+/** Project one raw product (denomination) into the normalized CryptorefillsProduct. */
+export function normalizeProduct(raw: CryptorefillsRawProduct | null | undefined): CryptorefillsProduct {
+  const isDynamic = Boolean(raw?.is_dynamic);
+  const product: CryptorefillsProduct = { denomination: String(raw?.denomination ?? ""), isDynamic };
+  const label = raw?.localized_denomination;
+  if (typeof label === "string" && label.trim()) product.localizedDenomination = label;
+  // Fixed products carry their BTC price directly; range products are priced per
+  // value on demand via getProductPrice, so they get no coinAmountSats here.
+  if (!isDynamic) {
+    const sats = satsFromBtcAmount(raw?.coin_amount);
+    if (sats != null) product.coinAmountSats = Number(sats);
+  }
+  const faceValue = normalizeFaceValue(raw?.face_value);
+  if (faceValue) product.faceValue = faceValue;
+  return product;
+}
+
+/**
+ * Normalize a /v5/products/country response into a brand's products. Mirrors the
+ * frontend entry-selection (shop-ui.js): the response is a list of brand
+ * entries; pick the one matching `brandName` that has products, else the first
+ * non-empty entry. Returns ALL products (fixed AND range) — unlike the frontend
+ * UI, which collapses a mixed brand to a single range input.
+ */
+export function normalizeProducts(
+  raw: CryptorefillsProductsEntry[] | null | undefined,
+  brandName?: string
+): CryptorefillsProduct[] {
+  const entries = Array.isArray(raw) ? raw : [];
+  const want = String(brandName ?? "").trim();
+  const hasProducts = (e: CryptorefillsProductsEntry | undefined): boolean =>
+    Boolean(e && Array.isArray(e.products) && e.products.length);
+  const entry =
+    (want ? entries.find((e) => e?.brand === want && hasProducts(e)) : undefined) ?? entries.find(hasProducts);
+  const products = entry && Array.isArray(entry.products) ? entry.products : [];
+  return products.map(normalizeProduct);
 }
 
 /** True when a product takes a free-form amount within a min/max range. */
