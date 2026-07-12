@@ -404,7 +404,7 @@ export interface PrepareStablecoinDeps {
     from: string;
     to: string;
     pairs: unknown;
-    preimageHash: Uint8Array;
+    preimageHash: string;
     claimAddress: string;
     refundPublicKey: string;
     userLockAmount: number;
@@ -591,7 +591,12 @@ export async function prepareStablecoinRoute(
     from: LBTC_VIA_ASSET,
     to: variant,
     pairs,
-    preimageHash: keys.preimageHash,
+    // boltz-swaps' chain-swap createRoute wants preimageHash as a HEX STRING (it
+    // spreads args raw into the POST /v2/swap/chain body) — same as reverse.ts.
+    // A raw Uint8Array JSON-serializes to {"0":..,"1":..} and Boltz rejects the
+    // request with "invalid parameter: preimageHash". Keep this hex.encode() in
+    // sync with reverse.ts so the asymmetry doesn't creep back in.
+    preimageHash: hex.encode(keys.preimageHash),
     claimAddress: signerAddress,
     refundPublicKey: hex.encode(keys.refundPublicKey),
     userLockAmount: params.amountSats
@@ -889,7 +894,7 @@ async function defaultCreateRoute(args: {
   from: string;
   to: string;
   pairs: unknown;
-  preimageHash: Uint8Array;
+  preimageHash: string;
   claimAddress: string;
   refundPublicKey: string;
   userLockAmount: number;

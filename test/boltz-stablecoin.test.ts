@@ -254,6 +254,30 @@ describe("prepareStablecoinRoute — fail-closed guard cadence (§5.3)", () => {
     expect(verify.mock.calls[0]![0]).toMatchObject({ swapType: "chain", expectedHash: hex.encode(new Uint8Array(32).fill(2)) });
   });
 
+  it("hex-encodes preimageHash for createRoute — regression: boltz-swaps' chain-swap createRoute expects a hex STRING (like reverse.ts), not raw bytes, or Boltz rejects the request with 'invalid parameter: preimageHash'", async () => {
+    const { fn: createRoute, calls } = fakeCreateRoute();
+    const preimage = new Uint8Array(32).fill(9);
+    const preimageHash = sha256(preimage);
+    const { deps } = baseDeps({
+      createRoute,
+      deriveKeys: () => ({
+        preimage,
+        preimageHash,
+        refundPrivateKey: new Uint8Array(32).fill(3),
+        refundPublicKey: new Uint8Array(33).fill(4),
+        evmPrivateKey: new Uint8Array(32).fill(0x42)
+      })
+    });
+    await prepareStablecoinRoute(
+      { asset: "USDC", networkId: "arbitrum", amountSats: 10_000, claimAddress: VALID_EVM },
+      deps
+    );
+    const sentPreimageHash = calls[0]!.preimageHash;
+    expect(typeof sentPreimageHash).toBe("string");
+    expect(sentPreimageHash).toMatch(/^[0-9a-f]{64}$/);
+    expect(sentPreimageHash).toBe(hex.encode(preimageHash));
+  });
+
   it("supports a Tron destination (base58check, no viem needed to validate)", async () => {
     const { deps } = baseDeps();
     const prepared = await prepareStablecoinRoute(
