@@ -134,3 +134,33 @@ describe("wallet.sync({ rescan: true }) — deep re-scan from zero", () => {
     );
   });
 });
+
+describe("wallet sync options — timeout bounds are plumbed to the sync engine", () => {
+  it("honors a custom coldStartTimeoutMs — a hung deep/cold scan fails at that bound, not the 10min default", async () => {
+    // A scan that never resolves: the timeout is the ONLY way out. A freshly
+    // restored wallet is virgin (neverScanned), so the COLD-start bound applies —
+    // with the default (600s) this would hang; a plumbed 40ms fails fast.
+    // (syncTimeoutMs is plumbed through the identical path for the warm case.)
+    const hangingFactory = (): EsploraClientLike => ({
+      fullScan: () => new Promise<undefined>(() => {}),
+      broadcast: async () => {
+        throw new Error("not used");
+      },
+      free: () => {}
+    });
+    wallet = await DepixWallet.restore({
+      dataDir,
+      passphrase: PASSPHRASE,
+      mnemonic: KNOWN_MNEMONIC,
+      sync: {
+        coldStartTimeoutMs: 40,
+        clientFactory: hangingFactory,
+        providers: [{ name: "p0", url: "http://localhost:1", waterfalls: false }]
+      }
+    });
+    const start = Date.now();
+    await expect(wallet.sync()).rejects.toThrow(/timed out after 40ms/);
+    // Fired at the custom 40ms bound, NOT the 600s COLD_START default.
+    expect(Date.now() - start).toBeLessThan(3000);
+  });
+});
