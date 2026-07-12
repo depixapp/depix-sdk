@@ -367,6 +367,49 @@ describe("toStablecoin — funded happy path: chain → DEX → bridge, sponsor 
   });
 });
 
+describe("toStablecoin — bridge-fee guard blocks an uneconomical BRIDGED amount BEFORE any lockup (fund-safety port)", () => {
+  const PAIRS = { chain: { "L-BTC": { TBTC: { limits: { minimal: 1000, maximal: 100_000_000 } } } } };
+  // Bridge fee resolves to 6000 sats (> the 5000-sat amount) → bridge_fee reject.
+  const feeQuoteWei = (6000n * 10_000_000_000n).toString();
+  const bridgedRouteQuote = () => async () => ({
+    receiveAmount: 950_000n,
+    sendAmount: 5000,
+    legs: [
+      { kind: "chain-swap", receiveAmount: 4_800n, fees: { percentage: 0.1, minerFees: { server: 10, userLockup: 20, userClaim: 30 } } },
+      { kind: "dex", chain: "arbitrum", tokenIn: "0xTBTC", tokenOut: "0xUSDT" },
+      { kind: "bridge", messagingFee: { amount: 1_000_000_000_000_000n } }
+    ]
+  });
+
+  it("THROWS SWAP_VALIDATION_FAILED and NEVER calls lockupLbtc (no L-BTC locked, nothing persisted)", async () => {
+    const { deps } = stablecoinDeps();
+    const prepare = deps.stablecoin!.prepare!;
+    // Drive the REAL estimate so bridgeFeeSats is derived from the route legs.
+    delete prepare.estimate;
+    prepare.getPairs = async () => PAIRS;
+    prepare.quoteRouteAmountOut = bridgedRouteQuote();
+    prepare.quoteDexAmountOut = async () => [{ quote: feeQuoteWei }];
+
+    dataDir = await mkdtemp(join(tmpdir(), "depix-sdk-stable-"));
+    const store = new BoltzSwapStore({ dataDir, passphrase: PASSPHRASE, saltB64: SALT_B64 });
+    const lockupLbtc = vi.fn(async () => ({ txid: "should-not-be-called" }));
+    const ctx: BoltzWalletContext = {
+      store,
+      logger: SILENT_LOGGER,
+      lockupLbtc,
+      getReceiveAddress: async () => LOCKUP_ADDRESS
+    };
+    const convert = new BoltzConvert(ctx, deps);
+
+    await expect(
+      convert.toStablecoin({ asset: "USDT", networkId: "tron", amountSats: 5000, claimAddress: VALID_TRON })
+    ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "SWAP_VALIDATION_FAILED"));
+    // The guard fired pre-lockup: no L-BTC ever moved, no crash-safe record written.
+    expect(lockupLbtc).not.toHaveBeenCalled();
+    await expect(store.get("chain-swap-1")).resolves.toBeNull();
+  });
+});
+
 describe("resume() — refunds an expired stablecoin (chain) lockup from boltz-swaps.json (§5.3)", () => {
   it("drives refundChainSwap for an expired chain lockup and drops the record", async () => {
     const refundSpy = vi.fn<(record: ChainRefundRecord, deps: ChainRefundDeps) => Promise<RefundResult>>(async () => ({
