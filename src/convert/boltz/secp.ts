@@ -12,10 +12,22 @@
 // hashForWitnessV1 / setCooperativeWitness) re-run that broken loader on every
 // call. We therefore (a) resolve the factory with the node-ESM nesting
 // ourselves, (b) init boltz-core/liquid's module-global secp (the taproot-tweak
-// path used by verify-lockup), and (c) PRE-POPULATE boltz-swaps' lazy `utxoSecp`
+// path used by verify-lockup), (c) PRE-POPULATE boltz-swaps' lazy `utxoSecp`
 // cache with the same instance so its claim helpers return ours instead of the
-// broken loader. Without (c), the reverse claim / lockup refund threw
-// "zkp is not a function" for every real (locked) swap (mainnet e2e, 2026-07-12).
+// broken loader, and (d) init the SECOND boltz-core/liquid copy that boltz-swaps
+// itself resolves. (d) is needed because boltz-core@5 does NOT satisfy
+// boltz-swaps' `^4.0.5` peer, so under Node ESM npm forks TWO physical boltz-core
+// copies (top-level + nested under this package); (b) inits this package's copy,
+// but boltz-swaps' claim CONSTRUCTION (constructClaimTransaction → boltz-core
+// liquid Utils.js → confidentialLiquid) reads the OTHER one. Without (c) a real
+// claim threw "zkp is not a function"; without (d) it threw "Cannot read
+// properties of undefined (reading 'unblindOutputWithKey')" — both on every real
+// (locked) reverse/chain claim (mainnet e2e, 2026-07-12; the 118-sat reverse
+// claim, confirmed on-chain once (d) was applied). The frontend never hit either
+// because esbuild bundles everything into a single module graph.
+
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 
 let inited: Promise<void> | null = null;
 
@@ -33,8 +45,23 @@ export function ensureBoltzUtxoSecp(): Promise<void> {
       const zkpFactory = (mod.default?.default ?? mod.default ?? zkpModule) as () => Promise<unknown>;
       const secp = await zkpFactory();
 
-      // (b) boltz-core/liquid module-global — the taproot-tweak path.
+      // (b) boltz-core/liquid module-global (THIS package's copy) — the
+      // taproot-tweak path (verify-lockup) + the SDK's own boltz-core usage.
       (init as (z: unknown) => void)(secp);
+
+      // (d) the boltz-core/liquid copy boltz-swaps resolves from ITS OWN dir —
+      // the one its constructClaimTransaction → Utils.js → confidentialLiquid
+      // reads, which may be a physically distinct copy under Node ESM (header).
+      // Resolve it via boltz-swaps' location and init that module-global too.
+      try {
+        const req = createRequire(import.meta.url);
+        const bsDir = dirname(req.resolve("boltz-swaps/utxo"));
+        const bcLiquidEntry = req.resolve("boltz-core/liquid", { paths: [bsDir] });
+        const bcInit = req(join(dirname(bcLiquidEntry), "init.js")) as { init?: (z: unknown) => void };
+        bcInit.init?.(secp);
+      } catch {
+        // Deduped single-copy layout: (b) already covered it.
+      }
 
       // (c) boltz-swaps' lazy cache — the claim/refund construction path. Its
       // Loader.get() returns `modules` verbatim when set, skipping the broken
