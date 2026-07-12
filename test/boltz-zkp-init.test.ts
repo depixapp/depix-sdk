@@ -15,6 +15,8 @@
 // correctly node-ESM-resolved secp. Pre-fix: utxoSecp.get() below throws
 // "zkp is not a function". Post-fix: it returns the initialized modules.
 // Verified to fail on the pre-fix secp.ts and pass after.
+import { createRequire } from "node:module";
+import { dirname, join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { ensureBoltzUtxoSecp, resetBoltzSecpForTests } from "../src/convert/boltz/secp.js";
 
@@ -32,7 +34,30 @@ describe("ensureBoltzUtxoSecp — claim-path zkp wiring (mainnet e2e regression,
     expect(secp.confidential).toBeDefined();
   });
 
-  // The boltz-core/liquid GLOBAL secp init (the verify-lockup taproot-tweak
-  // path) is covered end-to-end by boltz-verify-lockup.test.ts, which fails if
-  // that secp is absent — no weaker duplicate here.
+  it("initializes confidentialLiquid on the boltz-core/liquid copy the claim construction reads", async () => {
+    // The claim CONSTRUCTION (constructClaimTransaction → boltz-core liquid
+    // Utils.js) reads `confidentialLiquid` from the boltz-core/liquid copy
+    // resolved from boltz-swaps' OWN dir. ensureBoltzUtxoSecp must wire it.
+    //
+    // COVERAGE NOTE: the SDK's own (root) install deduplicates boltz-core to a
+    // single copy, so here step (b) already inits the copy this test resolves —
+    // this asserts the confidential global is wired, but does NOT isolate step
+    // (d) (which only matters in the TWO-copy fork of a consumer install, where
+    // boltz-core@5 fails boltz-swaps' ^4.0.5 peer). The two-copy fork + (d) were
+    // validated out-of-band: a fresh consumer install of the tarball, plus the
+    // mainnet e2e (the stuck 118-sat reverse claim confirmed on-chain once (d)
+    // was applied).
+    resetBoltzSecpForTests();
+    await ensureBoltzUtxoSecp();
+    const require = createRequire(import.meta.url);
+    const bsDir = dirname(require.resolve("boltz-swaps/utxo"));
+    const bcEntry = require.resolve("boltz-core/liquid", { paths: [bsDir] });
+    // require() (boltz-core@5.0.0 is CommonJS) — the LIVE exports its Utils.js
+    // reads; import() would give a static snapshot that misses init()'s write.
+    const bcInit = require(join(dirname(bcEntry), "init.js")) as {
+      confidentialLiquid?: { unblindOutputWithKey?: unknown };
+    };
+    expect(bcInit.confidentialLiquid).toBeDefined();
+    expect(typeof bcInit.confidentialLiquid?.unblindOutputWithKey).toBe("function");
+  });
 });
