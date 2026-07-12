@@ -3,9 +3,9 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ASSETS } from "../src/assets.js";
-import { Address } from "../src/engine/lwk.js";
+import { Address, AssetId, TxBuilder, mainnetNetwork } from "../src/engine/lwk.js";
 import { DepixWallet } from "../src/wallet.js";
 import { PendingWithdrawals } from "../src/pending.js";
 import { isDepixSdkError } from "../src/errors.js";
@@ -190,6 +190,50 @@ describe("assertWithdrawPsetOutputs (§3.2.5 — output A script + explicit outp
   });
 });
 
+// ─── LWK 0.18.0 recipient-method contract (regression pin §3.2.5) ────────────
+// The fee output pays an EXPLICIT (ex1) address so the F0.9 cron can read its
+// asset+value on-chain. LWK 0.18.0 splits the recipient methods STRICTLY:
+// addRecipient accepts confidential (lq1) only, addExplicitRecipient explicit
+// (ex1) only. The withdraw build must route the confidential Eulen output
+// through addRecipient and the explicit fee output through addExplicitRecipient.
+// This block pins the real-LWK contract so a future bump that re-merges the
+// methods (as 0.17.x did) is caught — it was the un-pinned assumption that let
+// the fee output regress to addRecipient and throw on every fee'd withdraw.
+describe("LWK 0.18.0 recipient-method contract (regression pin §3.2.5)", () => {
+  const depix = () => new AssetId(DEPIX_ID);
+  const SATS = 1_000_000n;
+
+  it("addRecipient REJECTS an explicit (ex1) address; addExplicitRecipient ACCEPTS it", () => {
+    const ex1 = new Address(EULEN_LQ1).toUnconfidential();
+    expect(ex1.isBlinded()).toBe(false);
+    // Exactly the shape the fee output pays — pre-fix code used addRecipient here.
+    expect(() => new TxBuilder(mainnetNetwork()).addRecipient(ex1, SATS, depix())).toThrow(/confidential/i);
+    expect(() => new TxBuilder(mainnetNetwork()).addExplicitRecipient(ex1, SATS, depix())).not.toThrow();
+  });
+
+  it("addExplicitRecipient REJECTS a confidential (lq1) address (the inverse split)", () => {
+    const conf = new Address(EULEN_LQ1);
+    expect(conf.isBlinded()).toBe(true);
+    // The Eulen deposit output stays on addRecipient — the inverse must hold too.
+    expect(() => new TxBuilder(mainnetNetwork()).addExplicitRecipient(conf, SATS, depix())).toThrow(/explicit/i);
+    expect(() => new TxBuilder(mainnetNetwork()).addRecipient(conf, SATS, depix())).not.toThrow();
+  });
+
+  it("builds the withdraw shape: confidential deposit (addRecipient) + explicit fee (addExplicitRecipient)", () => {
+    // Validation that the FIX is buildable: the same two-output shape
+    // buildSignPersistWithdraw now emits. A full .finish() needs funded UTXOs
+    // (unavailable offline), so this pins the address/method acceptance — the
+    // exact point the pre-fix code threw "Address must be confidential".
+    const deposit = new Address(EULEN_LQ1); // confidential — Eulen output A
+    const fee = new Address(FEE_EX1); // explicit — fee output B
+    expect(() =>
+      new TxBuilder(mainnetNetwork())
+        .addRecipient(deposit, 990n * SATS_PER_CENT, depix())
+        .addExplicitRecipient(fee, 10n * SATS_PER_CENT, depix())
+    ).not.toThrow();
+  });
+});
+
 // ─── end-to-end through the wallet ───────────────────────────────────────────
 
 let dataDir: string;
@@ -232,6 +276,76 @@ afterEach(async () => {
 });
 
 describe("withdraw() flow", () => {
+  it("routes the DEPOSIT output through addRecipient and the FEE output through addExplicitRecipient (§3.2.5)", async () => {
+    // A fee'd withdraw WITHIN the guardrail caps — the case no pre-existing test
+    // reached (the fee-branch tests all trip the guardrail or a contract check
+    // BEFORE the build). Spy the two recipient methods and assert the build routes
+    // the confidential Eulen output through addRecipient and the EXPLICIT fee
+    // output through addExplicitRecipient (LWK 0.18.0's strict split). Pre-fix the
+    // fee went through addRecipient → "Address must be confidential" on every
+    // fee'd withdraw; this test fails RED there (fee routed via addRecipient) and
+    // passes GREEN once the fee output uses addExplicitRecipient.
+    wallet = await makeWallet({
+      json: {
+        response: {
+          withdrawalId: "w-route",
+          depositAddress: EULEN_LQ1, // confidential — Eulen output A
+          depositAmountInCents: 500,
+          payoutAmountInCents: 490,
+          totalDepositAmountInCents: 505, // GROSS R$5.05 — within both caps
+          fee_cents: 5,
+          fee_address: FEE_EX1 // explicit — fee output B
+        }
+      }
+    });
+
+    const calls: Array<{ method: string; blinded: boolean; script: string }> = [];
+    const origAdd = TxBuilder.prototype.addRecipient;
+    const origAddExplicit = TxBuilder.prototype.addExplicitRecipient;
+    const record = (method: string, addr: InstanceType<typeof Address>) =>
+      calls.push({ method, blinded: addr.isBlinded(), script: addr.scriptPubkey().toString() });
+    vi.spyOn(TxBuilder.prototype, "addRecipient").mockImplementation(function (
+      this: InstanceType<typeof TxBuilder>,
+      addr,
+      sats,
+      asset
+    ) {
+      record("addRecipient", addr);
+      return origAdd.call(this, addr, sats, asset);
+    });
+    vi.spyOn(TxBuilder.prototype, "addExplicitRecipient").mockImplementation(function (
+      this: InstanceType<typeof TxBuilder>,
+      addr,
+      sats,
+      asset
+    ) {
+      record("addExplicitRecipient", addr);
+      return origAddExplicit.call(this, addr, sats, asset);
+    });
+
+    try {
+      // The empty wallet has no UTXOs: after BOTH recipients are added the build
+      // fails at finish() (INSUFFICIENT_FUNDS once fixed, or the raw LWK
+      // "must be confidential" throw pre-fix). Only the routing matters here.
+      await wallet.withdraw({ ...BASE_PARAMS, amountCents: 500 }).catch(() => {});
+    } finally {
+      vi.restoreAllMocks();
+    }
+
+    const depositScript = new Address(EULEN_LQ1).scriptPubkey().toString();
+    const feeScript = new Address(FEE_EX1).scriptPubkey().toString();
+    const depositCall = calls.find((c) => c.script === depositScript);
+    const feeCall = calls.find((c) => c.script === feeScript);
+
+    // Confidential Eulen deposit → addRecipient; explicit fee → addExplicitRecipient.
+    expect(depositCall).toBeDefined();
+    expect(depositCall?.blinded).toBe(true);
+    expect(depositCall?.method).toBe("addRecipient");
+    expect(feeCall).toBeDefined();
+    expect(feeCall?.blinded).toBe(false);
+    expect(feeCall?.method).toBe("addExplicitRecipient");
+  });
+
   it("fails CLOSED with FEE_ADDRESS_NOT_EXPLICIT when fee_address is confidential — before signing", async () => {
     wallet = await makeWallet({
       json: {

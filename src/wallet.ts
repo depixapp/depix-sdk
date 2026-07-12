@@ -2464,7 +2464,15 @@ export class DepixWallet {
     if (norm.hasFee) {
       const feeAddr = new Address(norm.feeAddress as string);
       feeScriptHex = feeAddr.scriptPubkey().toString();
-      builder = builder.addRecipient(feeAddr, feeSats as bigint, new AssetId(ASSETS.DEPIX.id));
+      // EXPLICIT (ex1) fee output — readable asset+value on-chain so the F0.9 cron
+      // can verify the platform fee was paid (§3.2.5). LWK 0.18.0 splits the
+      // recipient methods strictly: addRecipient accepts CONFIDENTIAL addresses
+      // only (throws "Address must be confidential" on ex1), addExplicitRecipient
+      // accepts EXPLICIT addresses only. assertFeeAddressExplicit already required
+      // the fee_address be unblinded, so it MUST go through addExplicitRecipient —
+      // addRecipient here would throw on every fee'd withdraw (regression from the
+      // 0.17.x→0.18.0 bump, when a single addRecipient took both forms).
+      builder = builder.addExplicitRecipient(feeAddr, feeSats as bigint, new AssetId(ASSETS.DEPIX.id));
     }
 
     const pset = await this.finishWithdrawPset(builder, wollet, grossSats);
