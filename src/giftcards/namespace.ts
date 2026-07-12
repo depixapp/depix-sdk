@@ -214,7 +214,11 @@ export class GiftcardsNamespace {
       throw this.mapCryptorefillsError(err, brand, countryCode);
     }
 
-    const orderId = String(order?.id ?? "").trim();
+    // The live POST /v5/orders response returns the id as `order_id`; read the
+    // same three-way fallback as the frontend (order_id first), NOT `id` alone —
+    // reading only `id` yielded an empty id against the real API and broke every
+    // buy (the SDK's own fixtures used to mask this with the wrong field).
+    const orderId = String(order?.order_id ?? order?.id ?? order?.orderId ?? "").trim();
     const invoice = extractLightningInvoice(order);
     if (!orderId || !invoice) {
       throw new CryptorefillsApiError(

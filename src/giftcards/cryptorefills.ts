@@ -89,7 +89,14 @@ export interface NormalizedBrands {
 }
 
 export interface CryptorefillsOrder {
+  /**
+   * The order id. The LIVE POST /v5/orders response returns it as `order_id`;
+   * `id`/`orderId` are accepted as fallbacks (the frontend reads all three,
+   * order_id first). Always resolve via the three-way fallback, never `id` alone.
+   */
+  order_id?: string;
   id?: string;
+  orderId?: string;
   order_state?: string;
   payment_state?: string;
   wallet_address?: string;

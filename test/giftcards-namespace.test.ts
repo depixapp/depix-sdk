@@ -78,8 +78,12 @@ function fakeCryptorefills(over: {
   brands?: unknown;
   statusOrder?: CryptorefillsOrder;
 } = {}): FakeCryptorefills {
+  // REAL CryptoRefills POST /v5/orders shape: the id comes back as `order_id`
+  // (proven by the frontend fixture depix-frontend/tests/cryptorefills.test.js),
+  // NOT `id`. The fixture mirrors the real field so the tests exercise the same
+  // read path buy() takes against the live API.
   const order = over.order ?? {
-    id: "ord-1",
+    order_id: "ord-1",
     wallet_address: TEST_INVOICE,
     order_state: "WaitingForPayment",
     payment_state: "WaitingForPayment"
@@ -271,6 +275,29 @@ describe("gift cards — order body + tracking (§5.5)", () => {
     await w.giftcards.buy({ ...buyParams, validate: false }).catch(() => {});
     expect(cr.validateOrder).not.toHaveBeenCalled();
     expect(cr.createOrder).toHaveBeenCalledTimes(1);
+  });
+
+  it("reads the order id from the real `order_id` field, not `id` (regression)", async () => {
+    // The live CryptoRefills POST /v5/orders response returns the id as
+    // `order_id` (the frontend reads order_id FIRST). With ONLY `order_id` (no
+    // `id`), buy() must resolve a valid id and proceed to the Lightning payment —
+    // the empty wallet then fails at the lockup build (INSUFFICIENT_FUNDS), NOT
+    // with "missing order id". Before the fix, reading only `order.id` yielded an
+    // empty id and threw a CryptorefillsApiError, breaking every real buy().
+    const cr = fakeCryptorefills({
+      order: {
+        order_id: "gc-real-1",
+        wallet_address: TEST_INVOICE,
+        order_state: "WaitingForPayment",
+        payment_state: "WaitingForPayment"
+      }
+    });
+    const { wallet: w } = await restore({ cryptorefills: cr });
+    await expect(w.giftcards.buy(buyParams)).rejects.toSatisfy((e: unknown) =>
+      isDepixSdkError(e, "INSUFFICIENT_FUNDS")
+    );
+    const orders = await w.giftcards.listOrders();
+    expect(orders[0]?.orderId).toBe("gc-real-1");
   });
 });
 
