@@ -57,6 +57,17 @@ export function ensureBoltzUtxoSecp(): Promise<void> {
         const req = createRequire(import.meta.url);
         const bsDir = dirname(req.resolve("boltz-swaps/utxo"));
         const bcLiquidEntry = req.resolve("boltz-core/liquid", { paths: [bsDir] });
+        // Load init.js via require() — NOT import(). boltz-core@5.0.0 is
+        // CommonJS (package.json has no "type":"module"; exports["./liquid"]
+        // resolves to a CJS dist; init.js is `exports.confidentialLiquid = …`).
+        // Its Utils.js reads that global via `require("./init")` — the LIVE
+        // exports object — so we must init THAT same live CJS module. require()
+        // of a CJS file works on every supported Node (no ERR_REQUIRE_ESM, which
+        // only applies to require of ESM). import() would give a STATIC
+        // ESM-wrapped namespace whose `confidentialLiquid` never reflects
+        // init()'s mutation, so it does NOT fix the claim (empirically verified,
+        // 2026-07-12). Pinned to boltz-core@5.0.0 (exact) — re-verify on a bump
+        // (a future ESM boltz-core would need import() + live bindings instead).
         const bcInit = req(join(dirname(bcLiquidEntry), "init.js")) as { init?: (z: unknown) => void };
         bcInit.init?.(secp);
       } catch {
