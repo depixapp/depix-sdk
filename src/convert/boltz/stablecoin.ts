@@ -718,7 +718,7 @@ export interface ExecuteStablecoinDeps {
   executeRoute?: (args: {
     createdSwap: unknown;
     plan: unknown;
-    preimage: Uint8Array;
+    preimage: string;
     signer: LocalEvmSigner;
     recipient: string;
   }) => Promise<{ claimTransactionId: string }>;
@@ -752,7 +752,11 @@ export async function executeStablecoinRoute(
   await deps.waitForServerLockup(record.swapId);
 
   const executeRoute = deps.executeRoute ?? defaultExecuteRoute;
-  const preimage = hex.decode(record.preimageHex);
+  // boltz-swaps' executeRoute wants the preimage as a HEX STRING — its EVM claim
+  // leg calls prefix0x(val) => (val.startsWith("0x") ? …) on it, and a Uint8Array
+  // has no .startsWith (throws "val.startsWith is not a function"). record.preimageHex
+  // is already bare hex; boltz-swaps normalizes it. Same class as the preimageHash fix.
+  const preimage = record.preimageHex;
   const keyBytes = hex.decode(record.evmPrivateKeyHex);
   const { claimTransactionId } = await withEphemeralEvmSigner(
     keyBytes,
@@ -908,12 +912,12 @@ async function defaultCreateRoute(args: {
 async function defaultExecuteRoute(args: {
   createdSwap: unknown;
   plan: unknown;
-  preimage: Uint8Array;
+  preimage: string;
   signer: LocalEvmSigner;
   recipient: string;
 }): Promise<{ claimTransactionId: string }> {
   const { executeRoute } = (await import("boltz-swaps/routeExecute")) as unknown as {
-    executeRoute: (a: { createdSwap: unknown; plan: unknown; preimage: Uint8Array; signer: unknown; recipient: string }) => Promise<{ claimTransactionId: string }>;
+    executeRoute: (a: { createdSwap: unknown; plan: unknown; preimage: string; signer: unknown; recipient: string }) => Promise<{ claimTransactionId: string }>;
   };
   return executeRoute({ ...args, signer: args.signer.walletClient });
 }

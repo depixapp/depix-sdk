@@ -433,10 +433,13 @@ describe("executeStablecoinRoute — chain claim → DEX → bridge (sponsor gas
       seenSignerHex = h;
       return { address: "0xSIGNER", walletClient: { tag: "wc" }, provider: {}, rdns: "gas-abstraction" };
     });
-    const executeRoute = vi.fn(async (a: { signer: LocalEvmSigner; recipient: string; preimage: Uint8Array }) => {
+    const executeRoute = vi.fn(async (a: { signer: LocalEvmSigner; recipient: string; preimage: string }) => {
       seenRecipient = a.recipient;
       seenSignerRdns = a.signer.rdns;
-      seenPreimage = hex.encode(a.preimage);
+      // Regression: boltz-swaps' executeRoute takes preimage as a HEX STRING, not
+      // bytes (a Uint8Array throws "val.startsWith is not a function" in its EVM
+      // claim leg). Capture it verbatim — no hex.encode — and assert below.
+      seenPreimage = a.preimage;
       return { claimTransactionId: "claim-tx-1" };
     });
 
@@ -456,6 +459,7 @@ describe("executeStablecoinRoute — chain claim → DEX → bridge (sponsor gas
     expect(waitForServerLockup).toHaveBeenCalledWith("chain-swap-1");
     expect(seenRecipient).toBe(VALID_EVM); // delivered to the FINAL user address
     expect(seenSignerRdns).toBe("gas-abstraction"); // gas paid by the hosted sponsor
+    expect(typeof seenPreimage).toBe("string"); // regression: hex string, not Uint8Array
     expect(seenPreimage).toBe("ab".repeat(32));
     // The signer was built from the ephemeral key's 0x-hex …
     expect(seenSignerHex).toBe(("0x" + evmHex) as `0x${string}`);
