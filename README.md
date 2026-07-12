@@ -355,12 +355,22 @@ no representable allowlist class, so it is fail-closed when the allowlist is on.
 
 ```ts
 // Incremental sync (the default) — scans forward from the current state.
+// Can take up to ~1 min (default timeout 60s, WARM_SYNC_TIMEOUT_MS). It polls
+// the esplora provider chain, rotating to the next on failure.
 await wallet.sync();
 
 // Deep re-scan from ZERO — drops the local scan cache and re-derives the whole
 // history. The recovery move when the wallet looks desynchronized (missing
-// transactions, stale balances). Slower: the cold-start timeout applies.
+// transactions, stale balances). Can take SEVERAL MINUTES (default timeout 600s
+// / 10 min, COLD_START_TIMEOUT_MS — a virgin cold scan also uses this bound).
 await wallet.sync({ rescan: true });
+
+// NOTE ON TIMEOUTS: sync() owns its own timeout + provider rotation — do NOT wrap
+// it in a shorter race (e.g. Promise.race with a 10s cap): that aborts a scan
+// that would have finished, leaving stale balances. A warm sync may legitimately
+// run up to ~1 min and a deep re-scan up to ~10 min. Both bounds are tunable when
+// constructing the wallet (syncTimeoutMs / coldStartTimeoutMs); raise them for a
+// heavily-used wallet or a slow provider rather than capping sync() externally.
 
 // Read-only health snapshot for support: SDK/LWK versions, dataDir, backup
 // state, sync health (last scan/success, last persist failure), per-rail

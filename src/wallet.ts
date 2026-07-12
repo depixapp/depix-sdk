@@ -129,6 +129,17 @@ export interface WalletSyncOptions {
   worker?: boolean;
   /** Advanced/testing: inject fake Esplora clients (broadcast seam). */
   clientFactory?: (provider: EsploraProvider) => EsploraClientLike;
+  /**
+   * Incremental-sync timeout (ms). Default 60_000 (~1 min). Raise it for a
+   * heavily-used wallet or a slow provider — a warm sync legitimately runs up to
+   * ~1 min, so do NOT cap sync() below this externally.
+   */
+  syncTimeoutMs?: number;
+  /**
+   * Deep-rescan / virgin cold-start timeout (ms). Default 600_000 (10 min). A
+   * `sync({ rescan: true })` or a first cold scan can take several minutes.
+   */
+  coldStartTimeoutMs?: number;
 }
 
 /** Per-call options of wallet.sync() (PR-D). */
@@ -772,6 +783,8 @@ export class DepixWallet {
       providers: parts.sync?.providers,
       worker: parts.sync?.worker,
       clientFactory: parts.sync?.clientFactory,
+      ...(parts.sync?.syncTimeoutMs !== undefined ? { syncTimeoutMs: parts.sync.syncTimeoutMs } : {}),
+      ...(parts.sync?.coldStartTimeoutMs !== undefined ? { coldStartTimeoutMs: parts.sync.coldStartTimeoutMs } : {}),
       logger: this.logger
     });
     // API client — only when an apiKey is configured. Its base defaults to the
@@ -1310,6 +1323,14 @@ export class DepixWallet {
    * update-chain cache is dropped and a virgin LWK state is cold-scanned (the
    * §2.7 cold-start timeout applies) — the recovery move when the wallet looks
    * desynchronized (missing transactions, stale balances).
+   *
+   * TIMING: an incremental sync can run up to ~1 min (WARM_SYNC_TIMEOUT_MS = 60s);
+   * a deep re-scan (or a virgin cold scan) up to SEVERAL MINUTES (COLD_START_-
+   * TIMEOUT_MS = 600s / 10 min). This call OWNS its timeout and rotates across
+   * esplora providers — do NOT wrap it in a shorter external race (e.g. a 10s
+   * Promise.race), which aborts a scan that would have completed and leaves stale
+   * balances. Both bounds are configurable (syncTimeoutMs / coldStartTimeoutMs);
+   * raise them for a heavily-used wallet or a slow provider.
    */
   async sync(options: WalletSyncCallOptions = {}): Promise<{ updated: boolean }> {
     this.assertOpen();
