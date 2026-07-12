@@ -37,11 +37,14 @@ import {
 } from "./reverse.js";
 import {
   CHAIN_SWAP_FAILURE_STATUSES,
+  chainSwapNeverLocked,
   executeStablecoinRoute,
   getStablecoinNetwork,
+  isPermanentRouteError,
   mapChainSwapStatus,
   prepareStablecoinRoute,
   type ExecuteStablecoinDeps,
+  type GetChainSwapTransactions,
   type PrepareStablecoinDeps,
   type StablecoinAsset,
   type StablecoinParams
@@ -113,6 +116,13 @@ export interface BoltzConvertDeps {
     execute?: Omit<ExecuteStablecoinDeps, "waitForServerLockup">;
     /** Injected chain refund driver (default refundChainSwap). */
     refundChain?: (record: ChainRefundRecord, deps: ChainRefundDeps) => Promise<RefundResult>;
+    /**
+     * Probe for the DEFINITIVE never-locked orphan check (tests) — default:
+     * boltz-swaps/client getChainSwapTransactions (via chainSwapNeverLocked). Lets
+     * refundStablecoin drop a chain record that locked no L-BTC instead of
+     * re-erroring on it every resume.
+     */
+    getChainSwapTransactions?: GetChainSwapTransactions;
     /** How long to wait for Boltz's destination lockup before giving up (ms). */
     serverLockupTimeoutMs?: number;
   };
@@ -608,6 +618,23 @@ export class BoltzConvert {
         swapId,
         error: String((err as Error)?.message ?? err)
       });
+      // A PERMANENT route failure ("amount too small to cover bridge messaging
+      // fee", RouteUnavailable, "no route", "unsupported") will NEVER succeed on
+      // retry — re-running executeStablecoin on every resume just strands the
+      // L-BTC until the swap expires (weeks later, at the timeout). Steer the
+      // record to the refund path NOW by marking outcome:"refund", so
+      // resumeStablecoin's existing `record.outcome === "refund"` branch drives
+      // refundStablecoin instead of re-executing. TRANSIENT errors (network blip,
+      // dynamic-import chunk 404) keep the retry-on-next-resume behavior — the
+      // record is left untouched. NEVER drop the record here: the refund key must
+      // survive. Port of depix-frontend/wallet/swap-ui.js:2339-2345.
+      if (isPermanentRouteError(err)) {
+        await this.ctx.store
+          .patch(swapId, (r) => {
+            (r as StoredStablecoinSwap).outcome = "refund";
+          })
+          .catch(() => {});
+      }
       return { swapId, status: "pending" };
     }
   }
@@ -664,7 +691,24 @@ export class BoltzConvert {
    */
   private async refundStablecoin(
     record: StoredStablecoinSwap
-  ): Promise<{ refunded: boolean; refundTxId?: string | null }> {
+  ): Promise<{ refunded: boolean; refundTxId?: string | null; dropped?: boolean }> {
+    // A chain swap that NEVER locked any L-BTC on-chain (created then abandoned,
+    // or Boltz-expired before the user funded it) has nothing to sweep — the
+    // refund would throw "lockup transaction unavailable" (refund.ts), which
+    // resume() counts as a failure and KEEPS the record, so it re-errors on this
+    // orphan on EVERY open() forever. Drop it instead. FAIL-SAFE: only a
+    // DEFINITIVE "no coins were locked up yet" from Boltz clears it
+    // (chainSwapNeverLocked); on ANY ambiguity/transient error the record is kept
+    // and the refund proceeds below — never drop a record that might still guard
+    // locked funds. Port of depix-frontend/wallet/swap-ui.js:2272-2273.
+    if (await chainSwapNeverLocked(record.swapId, this.deps.stablecoin?.getChainSwapTransactions)) {
+      await this.ctx.store.remove(record.swapId).catch(() => {});
+      this.logger.info("boltz stablecoin swap never locked any L-BTC — dropping orphan record", {
+        swapId: record.swapId
+      });
+      return { refunded: false, dropped: true };
+    }
+
     const refundFn = this.deps.stablecoin?.refundChain ?? refundChainSwap;
     const refundDeps: ChainRefundDeps = {
       getRefundAddress: () => this.ctx.getReceiveAddress(),
@@ -899,7 +943,8 @@ export class BoltzConvert {
     }
     if (record.outcome === "refund" || bucket === "refund" || record.state === "refund_pending") {
       const r = await this.refundStablecoin(record);
-      if (r.refunded) summary.stablecoinRefunded++;
+      if (r.dropped) summary.removed++; // never-locked orphan — dropped, not refunded
+      else if (r.refunded) summary.stablecoinRefunded++;
       else summary.stablecoinResumed++; // refund_pending — will retry next resume
       return;
     }

@@ -10,8 +10,10 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { base58, hex } from "@scure/base";
 import {
   boltzVariantKey,
+  chainSwapNeverLocked,
   checkStablecoinAmount,
   deriveStablecoinKeys,
+  isPermanentRouteError,
   isValidTronAddress,
   mapChainSwapStatus,
   loadViem,
@@ -136,6 +138,64 @@ describe("mapChainSwapStatus — recovery bucket", () => {
     expect(mapChainSwapStatus("transaction.failed")).toBe("refund");
     expect(mapChainSwapStatus("swap.created")).toBeNull();
     expect(mapChainSwapStatus(undefined)).toBeNull();
+  });
+});
+
+describe("isPermanentRouteError — permanent vs transient route-execution failures", () => {
+  it("flags each PERMANENT pattern the boltz-swaps route engine throws (mirrors the frontend regex)", () => {
+    // The four patterns from depix-frontend/wallet/swap-ui.js:2258-2261.
+    expect(isPermanentRouteError(new Error("amount too small to cover bridge messaging fee"))).toBe(true);
+    expect(isPermanentRouteError(new Error("RouteUnavailable"))).toBe(true);
+    expect(isPermanentRouteError(new Error("no route found for this pair"))).toBe(true);
+    expect(isPermanentRouteError(new Error("no valid route"))).toBe(true);
+    expect(isPermanentRouteError(new Error("unsupported target chain"))).toBe(true);
+    // Case-insensitive, and a raw string (no `.message`) is accepted too.
+    expect(isPermanentRouteError("ROUTEUNAVAILABLE")).toBe(true);
+  });
+
+  it("returns FALSE for a TRANSIENT failure (network blip / dynamic-import chunk 404) and for empty errors", () => {
+    expect(isPermanentRouteError(new Error("fetch failed"))).toBe(false);
+    expect(isPermanentRouteError(new Error("Failed to fetch dynamically imported module: chunk-abc.js"))).toBe(false);
+    expect(isPermanentRouteError(new Error("503 service unavailable"))).toBe(false); // NOT "unsupported"
+    expect(isPermanentRouteError(null)).toBe(false);
+    expect(isPermanentRouteError(undefined)).toBe(false);
+  });
+});
+
+describe("chainSwapNeverLocked — DEFINITIVE 'no coins locked' signal (fail-safe)", () => {
+  it("returns TRUE when Boltz resolves with NO userLock (created then abandoned)", async () => {
+    expect(await chainSwapNeverLocked("s1", async () => ({ serverLock: {} }))).toBe(true);
+    expect(await chainSwapNeverLocked("s1", async () => ({}))).toBe(true);
+    expect(await chainSwapNeverLocked("s1", async () => null)).toBe(true);
+  });
+
+  it("returns TRUE when the fetch throws the definitive 'no coins were locked up yet'", async () => {
+    expect(
+      await chainSwapNeverLocked("s1", async () => {
+        throw new Error("no coins were locked up yet");
+      })
+    ).toBe(true);
+  });
+
+  it("returns FALSE when a userLock EXISTS (coins ARE locked — must never drop such a record)", async () => {
+    expect(await chainSwapNeverLocked("s1", async () => ({ userLock: { transaction: { id: "x" } } }))).toBe(false);
+  });
+
+  it("returns FALSE (fail-safe) on an AMBIGUOUS/transient fetch error — a record that may hold funds is never cleared", async () => {
+    expect(
+      await chainSwapNeverLocked("s1", async () => {
+        throw new Error("network unreachable");
+      })
+    ).toBe(false);
+    expect(
+      await chainSwapNeverLocked("s1", async () => {
+        throw new Error("500 internal server error");
+      })
+    ).toBe(false);
+  });
+
+  it("returns FALSE for an empty swapId", async () => {
+    expect(await chainSwapNeverLocked("", async () => ({}))).toBe(false);
   });
 });
 

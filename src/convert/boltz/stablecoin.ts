@@ -26,6 +26,7 @@ import { hex } from "@scure/base";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { base58 } from "@scure/base";
 import { ConversionError } from "../../errors.js";
+import { ensureBoltzConfig } from "./client.js";
 import { randomKeypair } from "./keys.js";
 import { assertLockupAddressBindsToUser } from "./verify-lockup.js";
 
@@ -150,6 +151,66 @@ export const CHAIN_SWAP_FAILURE_STATUSES: ReadonlySet<string> = new Set([
   "transaction.failed",
   "transaction.refunded"
 ]);
+
+/**
+ * Distinguish a PERMANENT route-execution failure (the swap can NEVER settle,
+ * regardless of retries) from a TRANSIENT one (network blip, dynamic-import chunk
+ * 404). The boltz-swaps route engine throws plain Errors, so the match is on the
+ * message text. FAITHFUL mirror of the EXACT patterns in
+ * depix-frontend/wallet/swap-ui.js:2258-2261 — keep them in sync. Exported so the
+ * recovery loop (convert.ts executeStablecoin) can steer a permanently-
+ * unexecutable swap straight to refund instead of looping resume until the swap
+ * expires.
+ */
+export function isPermanentRouteError(err: unknown): boolean {
+  const msg = String((err as { message?: unknown } | null | undefined)?.message ?? err ?? "");
+  return /too small to cover bridge messaging fee|RouteUnavailable|no .*route|unsupported/i.test(msg);
+}
+
+/** The chain-swap transactions shape the never-locked probe reads (subset). */
+export interface ChainSwapTransactions {
+  userLock?: unknown;
+  serverLock?: unknown;
+}
+/** Injectable chain-swap transactions fetch (tests) — default: boltz-swaps/client. */
+export type GetChainSwapTransactions = (swapId: string) => Promise<ChainSwapTransactions | null | undefined>;
+
+/**
+ * True IFF Boltz DEFINITIVELY confirms this chain swap NEVER locked any coins
+ * on-chain (created then abandoned, or expired before the user funded it) — so
+ * there is nothing to refund and the orphan record can be safely dropped. FAIL-
+ * SAFE: a transient/unknown error returns false, so a record that MAY hold real
+ * funds is NEVER dropped — only a definitive "no coins were locked up yet" from
+ * Boltz (or a resolved response carrying no userLock) returns true.
+ * `getTransactions` is injectable for tests; the default configures the (viem-
+ * free) boltz-swaps client and calls its getChainSwapTransactions. Port of
+ * depix-frontend/wallet/boltz/stablecoin.js:186-196.
+ */
+export async function chainSwapNeverLocked(
+  swapId: string,
+  getTransactions?: GetChainSwapTransactions
+): Promise<boolean> {
+  if (!swapId) return false;
+  try {
+    const fetchTx: GetChainSwapTransactions =
+      getTransactions ??
+      (async (id: string) => {
+        // The SDK configures the boltz-swaps client lazily (the frontend does it
+        // globally at app init), so ensure the viem-free mainnet config is set
+        // before the REST probe — otherwise the request would use an unconfigured
+        // base URL and the fail-safe would degrade to "keep + re-error".
+        await ensureBoltzConfig();
+        const { getChainSwapTransactions } = (await import("boltz-swaps/client")) as unknown as {
+          getChainSwapTransactions: (id: string) => Promise<ChainSwapTransactions>;
+        };
+        return getChainSwapTransactions(id);
+      });
+    const res = await fetchTx(swapId);
+    return !res?.userLock; // resolved with no userLock = never locked
+  } catch (e) {
+    return /no coins were locked up yet/i.test(String((e as { message?: unknown } | null | undefined)?.message ?? e ?? ""));
+  }
+}
 
 // Upper bound on how far in the future the chain-swap refund timeout may sit
 // (~2 weeks at 1 L-BTC block/min). Mirrors MAX_SUBMARINE_TIMEOUT_BLOCKS.
