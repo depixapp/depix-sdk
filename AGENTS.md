@@ -249,8 +249,13 @@ deliberately **no raw PSET surface** (build/sign/broadcast): that would be a
 guardrail bypass. `wallet.convert.sideswap/.boltz/.sideshift` are deprecated
 aliases of `wallet.advanced.*` (kept through 1.x).
 
-Also on the wallet: `wallet.giftcards.list()/buy()/listOrders()` (gift cards
-paid over Lightning) and `wallet.merchant.get()/update()` (light profile).
+Also on the wallet — the gift-card discovery → buy loop (paid over Lightning):
+`wallet.giftcards.list()` (brand catalog) → `listProducts()` (a brand's
+denominations: FIXED ones carry `priceSats`; a RANGE product has `isDynamic:true`
++ `min`/`max`, priced with `price()`) → `buy()` (creates the order + pays the
+BOLT11 over Boltz) → `getOrderStatus()` (live phase + the redemption
+code/URL) / `listOrders()` (the local log, delivery included). Plus
+`wallet.merchant.get()/update()` (light profile).
 
 ## 4. Errors — always branch on `err.code`
 
@@ -335,7 +340,7 @@ owner's policy) require non-custodial, filter quotes on `custodial === false`.
 
 ## 8. Local MCP server — `depix-wallet-mcp`
 
-The package ships a stdio MCP bin exposing the SAME wallet as **23 `wallet_*`
+The package ships a stdio MCP bin exposing the SAME wallet as **27 `wallet_*`
 tools** (server name `com.depixapp/wallet`). Config is 100% environment (the
 table above) — no CLI flags, no tool ever receives a secret. **stdout is
 JSON-RPC only; every log goes to stderr, redacted.** Boots by `open()`-ing the
@@ -349,7 +354,7 @@ Catalog (`WALLET_TOOL_NAMES`, `src/mcp/server.ts`):
 
 - Reads: `wallet_status`, `wallet_get_address`, `wallet_get_balances`,
   `wallet_list_transactions`, `wallet_get_guardrails`, `wallet_pending`,
-  `wallet_diagnostics`, `wallet_list_giftcard_orders`
+  `wallet_diagnostics`
 - Pix: `wallet_create_deposit`, `wallet_wait_deposit`,
   `wallet_create_withdrawal`, `wallet_wait_withdrawal` (waits bounded: default
   300 s, hard ceiling 900 s — unlike the SDK-level waiters)
@@ -358,7 +363,11 @@ Catalog (`WALLET_TOOL_NAMES`, `src/mcp/server.ts`):
   `error.data.routes`; re-call with `route`)
 - Provider-level escape hatch: `wallet_swap_quote`, `wallet_swap_execute`,
   `wallet_pay_lightning_invoice`, `wallet_receive_lightning`,
-  `wallet_to_stablecoin`, `wallet_buy_giftcard`
+  `wallet_to_stablecoin`
+- Gift cards (browse → products → price → buy over Lightning → track/redeem):
+  `wallet_list_giftcards`, `wallet_list_giftcard_products`,
+  `wallet_giftcard_price`, `wallet_buy_giftcard` (moves money),
+  `wallet_list_giftcard_orders`, `wallet_get_giftcard_order_status`
 - Money + recovery: `wallet_send`, `wallet_shift_usdt` (the ONE custodial
   tool), `wallet_recover`
 

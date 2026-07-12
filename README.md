@@ -147,9 +147,43 @@ const quote = await stream.next();
 const swap = await stream.execute(quote);
 stream.close();
 
-// Lightning, refunds and gift cards live under wallet.advanced.* / wallet.giftcards.*.
+// Lightning + refunds live under wallet.advanced.*.
 // A documented cross-network USDt route is custodial and marked custodial: true.
 ```
+
+**Gift cards** (`wallet.giftcards.*`) — buy a gift card or mobile top-up from
+CryptoRefills, paid over Lightning via Boltz (non-custodial), with a 1% DePix
+service fee. The full agent loop is browse → pick a value → buy → poll → redeem:
+
+```ts
+// 1. Browse the catalog, then a brand's denominations.
+const { brands } = await wallet.giftcards.list({ countryCode: "BR", query: "amazon" });
+const products = await wallet.giftcards.listProducts({ brandName: "Amazon" });
+// Each product is FIXED (pass its `denomination`; `priceSats` is the cost) or a
+// RANGE product (`isDynamic: true` — pass denomination "range" + a `productValue`
+// within `min`..`max`; price a custom value first if you want):
+const custom = await wallet.giftcards.price({ brandName: "Amazon", faceValue: 150 }); // { priceSats, currency }
+
+// 2. Buy. Returns after the L-BTC lockup is broadcast; Boltz then pays the
+//    invoice in the background. The payment crosses the owner's guardrails first.
+const order = await wallet.giftcards.buy({
+  brandName: "Amazon",
+  denomination: "50 BRL",         // or "range" + productValue for a dynamic product
+  email: "agent@example.com",     // delivery target + the allowlisted beneficiary
+});
+
+// 3. Poll until terminal, then read the redemption code/URL.
+const status = await wallet.giftcards.getOrderStatus(order.orderId);
+if (status.terminal && status.delivery) {
+  // status.delivery = { kind: "code" | "url" | "none", value }
+}
+```
+
+The whole flow is gated on the operator's `giftcardEnabled` toggle
+(`GIFTCARDS_DISABLED` when off). Over MCP the same loop is
+`wallet_list_giftcards` → `wallet_list_giftcard_products` /
+`wallet_giftcard_price` → `wallet_buy_giftcard` →
+`wallet_get_giftcard_order_status`.
 
 Guardrails run on **every** signature. Over the per-tx or daily ceiling, or (with
 the allowlist on) to a destination that isn't allow-listed, the call throws a

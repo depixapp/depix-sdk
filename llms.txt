@@ -4,8 +4,9 @@
 > its own seed and signs locally to pay/receive over Pix (DePix), swap the three
 > Liquid assets (DePix, L-BTC, USDt), and bridge to Lightning, BTC and EVM/Tron —
 > behind an intent-first `convert()`/`quote()` surface with owner-set,
-> runtime-immutable guardrails. Ships a local stdio MCP server
-> (`depix-wallet-mcp`, 23 `wallet_*` tools).
+> runtime-immutable guardrails. Also buys gift cards / mobile top-ups
+> (CryptoRefills, paid over Lightning). Ships a local stdio MCP server
+> (`depix-wallet-mcp`, 27 `wallet_*` tools).
 
 Key facts: all amounts are bigint 8-decimal base units ("sats"); DePix is
 pegged 1:1 to BRL (1 BRL cent = 1_000_000 sats); Pix flows use integer BRL
@@ -40,6 +41,13 @@ custodial path (SideShift USDt cross-network) is always flagged
 - [advanced.*](./AGENTS.md#advanced--the-power-user-escape-hatch):
   `listUtxos`/`selectCoins`/`sendMany` + per-provider namespaces; no raw PSET
   surface by design.
+- [Gift cards](./AGENTS.md#3-the-full-api-surface): `wallet.giftcards` — the
+  full agent loop: `list()` (browse brands) → `listProducts()` (a brand's
+  denominations; FIXED carry `priceSats`, a RANGE product is `isDynamic:true`
+  with `min`/`max`, priced via `price()`) → `buy()` (returns `orderId` +
+  `invoice`, pays it automatically over Lightning) → poll `getOrderStatus()`
+  until terminal → read `delivery` (the redemption code/URL). Gated on the
+  operator's `giftcardEnabled` toggle.
 - [Errors](./AGENTS.md#4-errors--always-branch-on-errcode): guardrail limits,
   `QUOTES_UNAVAILABLE` (fail-closed), `MULTIPLE_ROUTES_AVAILABLE`,
   `INSUFFICIENT_FUNDS`, `POLL_TIMEOUT`, `API_KEY_REQUIRED`…
@@ -50,9 +58,11 @@ custodial path (SideShift USDt cross-network) is always flagged
   `DEPIX_API_BASE`, `DEPIX_GUARDRAIL_*`; `SIDESHIFT_AFFILIATE_ID` is
   baked at build time only.
 - [Local MCP](./AGENTS.md#8-local-mcp-server--depix-wallet-mcp):
-  `npx -p @depixapp/sdk depix-wallet-mcp` — 23 tools incl. `wallet_quote` /
-  `wallet_convert`; stdout = JSON-RPC, stderr = redacted logs; no seed-export
-  or guardrail-mutation tool exists.
+  `npx -p @depixapp/sdk depix-wallet-mcp` — 27 tools incl. `wallet_quote` /
+  `wallet_convert` and the gift-card set (`wallet_list_giftcards`,
+  `wallet_list_giftcard_products`, `wallet_giftcard_price`,
+  `wallet_buy_giftcard`, `wallet_get_giftcard_order_status`); stdout = JSON-RPC,
+  stderr = redacted logs; no seed-export or guardrail-mutation tool exists.
 
 ## Optional
 
