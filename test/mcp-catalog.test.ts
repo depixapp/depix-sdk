@@ -57,15 +57,24 @@ const FAST_FOLLOW = [
   "wallet_shift_usdt",
 ];
 
+// Gift-card discovery reads (agent selection flow): catalog / products /
+// range-price / live order status — read-only, gated on giftcardEnabled.
+const GIFTCARD_DISCOVERY = [
+  "wallet_list_giftcards",
+  "wallet_list_giftcard_products",
+  "wallet_giftcard_price",
+  "wallet_get_giftcard_order_status",
+];
+
 // Recovery wiring (fund-safety): re-drive every rail + unified pending view.
 const RECOVERY = ["wallet_recover", "wallet_pending"];
 
 // Maintenance/support (PR-D): read-only health snapshot, never key material.
 const MAINTENANCE = ["wallet_diagnostics"];
 
-const EXPECTED = [...MVP, ...INTENT, ...FAST_FOLLOW, ...RECOVERY, ...MAINTENANCE].sort();
+const EXPECTED = [...MVP, ...INTENT, ...FAST_FOLLOW, ...GIFTCARD_DISCOVERY, ...RECOVERY, ...MAINTENANCE].sort();
 
-describe("wallet MCP catalog (§6.2 — 10 MVP + 2 intent + 8 fast-follow + 2 recovery + 1 maintenance wallet_* tools)", () => {
+describe("wallet MCP catalog (§6.2 — 10 MVP + 2 intent + 8 fast-follow + 4 gift-card discovery + 2 recovery + 1 maintenance wallet_* tools)", () => {
   it("initialize handshake succeeds and lists the MVP catalog PLUS intent + fast-follows", async () => {
     const { client } = await connectWallet({ wallet: new FakeWallet() });
     // The connect above already ran initialize; capability read confirms the handshake.
@@ -73,9 +82,10 @@ describe("wallet MCP catalog (§6.2 — 10 MVP + 2 intent + 8 fast-follow + 2 re
     const { tools } = await client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(EXPECTED);
-    expect(names.length).toBe(23);
-    // All 10 MVP tools survive; every intent + fast-follow + recovery + maintenance tool is present.
-    for (const n of [...MVP, ...INTENT, ...FAST_FOLLOW, ...RECOVERY, ...MAINTENANCE]) expect(names).toContain(n);
+    expect(names.length).toBe(27);
+    // All 10 MVP tools survive; every intent + fast-follow + discovery + recovery + maintenance tool is present.
+    for (const n of [...MVP, ...INTENT, ...FAST_FOLLOW, ...GIFTCARD_DISCOVERY, ...RECOVERY, ...MAINTENANCE])
+      expect(names).toContain(n);
   });
 
   it("wallet_convert is the described PRIMARY conversion surface; wallet_quote feeds it route ids (unit-explicit)", async () => {

@@ -36,7 +36,17 @@ import type { ConvertParams, ConvertResult, RouteQuote } from "../../src/convert
 import type { ConvertIntent, Route } from "../../src/convert/routes.js";
 import type { SideSwapQuote, SwapExecuteResult, SwapQuoteParams } from "../../src/convert/sideswap.js";
 import type { SideShiftSendResult } from "../../src/convert/sideshift.js";
-import type { BuyGiftcardParams, BuyGiftcardResult } from "../../src/giftcards/namespace.js";
+import type {
+  BuyGiftcardParams,
+  BuyGiftcardResult,
+  GiftcardCatalog,
+  GiftcardPrice,
+  GiftcardPriceParams,
+  GiftcardProduct,
+  ListGiftcardsParams,
+  ListProductsParams
+} from "../../src/giftcards/namespace.js";
+import type { OrderPhase } from "../../src/giftcards/cryptorefills.js";
 import type { StoredGiftcardOrder } from "../../src/giftcards/store.js";
 
 export interface RecordedCall {
@@ -212,11 +222,32 @@ export class FakeGiftcards implements McpGiftcardsFacade {
       expectedAmountSats: 26_000,
       swapId: "gc_sub_1",
       lockupTxid: "gclk".padEnd(64, "0"),
-      phase: "pending",
+      phase: "delivered",
+      delivery: { kind: "code", value: "PIN-1234" },
       createdAt: 1_720_000_000_000,
       updatedAt: 1_720_000_050_000,
     },
   ];
+  listCalls: (ListGiftcardsParams | undefined)[] = [];
+  catalog: GiftcardCatalog = {
+    countryCode: "BR",
+    brands: [
+      { brand: "Amazon", family: "Amazon", kind: "giftcard", category: "e-commerce", is_out_of_stock: false },
+    ],
+    popularBrands: [
+      { brand: "Amazon", family: "Amazon", kind: "giftcard", category: "e-commerce", is_out_of_stock: false },
+    ],
+    categories: ["e-commerce"],
+  };
+  listProductsCalls: ListProductsParams[] = [];
+  products: GiftcardProduct[] = [
+    { denomination: "50 BRL", label: "R$ 50", isDynamic: false, priceSats: 25_000, currency: "BRL", min: null, max: null },
+    { denomination: "range", label: "range", isDynamic: true, priceSats: null, currency: "BRL", min: 10, max: 500 },
+  ];
+  priceCalls: GiftcardPriceParams[] = [];
+  priceResult: GiftcardPrice = { priceSats: 75_000, currency: "BRL" };
+  getOrderStatusCalls: string[] = [];
+  orderPhase: OrderPhase = { phase: "delivered", terminal: true, delivery: { kind: "code", value: "PIN-1234" } };
 
   async buy(params: BuyGiftcardParams): Promise<BuyGiftcardResult> {
     this.buyCalls.push(params);
@@ -225,6 +256,22 @@ export class FakeGiftcards implements McpGiftcardsFacade {
   }
   async listOrders(): Promise<StoredGiftcardOrder[]> {
     return this.orders;
+  }
+  async list(params?: ListGiftcardsParams): Promise<GiftcardCatalog> {
+    this.listCalls.push(params);
+    return this.catalog;
+  }
+  async listProducts(params: ListProductsParams): Promise<GiftcardProduct[]> {
+    this.listProductsCalls.push(params);
+    return this.products;
+  }
+  async price(params: GiftcardPriceParams): Promise<GiftcardPrice> {
+    this.priceCalls.push(params);
+    return this.priceResult;
+  }
+  async getOrderStatus(orderId: string): Promise<OrderPhase> {
+    this.getOrderStatusCalls.push(orderId);
+    return this.orderPhase;
   }
 }
 

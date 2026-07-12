@@ -29,8 +29,12 @@ import {
   diagnosticsTool,
   getAddressTool,
   getBalancesTool,
+  getGiftcardOrderStatusTool,
   getGuardrailsTool,
+  giftcardPriceTool,
   listGiftcardOrdersTool,
+  listGiftcardProductsTool,
+  listGiftcardsTool,
   listTransactionsTool,
   payLightningInvoiceTool,
   pendingTool,
@@ -63,9 +67,11 @@ export const DEFAULT_SERVER_VERSION = "1.0.0";
  * PR-B/PR-C, the PRIMARY conversion surface) plus the fast-follow conversions
  * + gift cards (PR8b) plus SideShift (PR5c) plus the recovery pair
  * (wallet_recover / wallet_pending — fund-safety wiring) plus
- * wallet_diagnostics (PR-D — read-only support snapshot) — 23 tools.
- * wallet_shift_usdt (§5.4/G4) is the ONE all-custodial tool; wallet_convert
- * FLAGS custodial routes per call (G4 = documentation-signalled, no gate).
+ * wallet_diagnostics (PR-D — read-only support snapshot) plus the gift-card
+ * discovery reads (catalog / products / range-price / live order status) — 27
+ * tools. wallet_shift_usdt (§5.4/G4) is the ONE all-custodial tool;
+ * wallet_convert FLAGS custodial routes per call (G4 = documentation-signalled,
+ * no gate).
  */
 export const WALLET_TOOL_NAMES = [
   "wallet_status",
@@ -85,8 +91,12 @@ export const WALLET_TOOL_NAMES = [
   "wallet_pay_lightning_invoice",
   "wallet_receive_lightning",
   "wallet_to_stablecoin",
+  "wallet_list_giftcards",
+  "wallet_list_giftcard_products",
+  "wallet_giftcard_price",
   "wallet_buy_giftcard",
   "wallet_list_giftcard_orders",
+  "wallet_get_giftcard_order_status",
   "wallet_shift_usdt",
   "wallet_recover",
   "wallet_pending",
@@ -548,15 +558,71 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
   );
 
   server.registerTool(
+    "wallet_list_giftcards",
+    {
+      title: "List gift-card brands (catalog)",
+      description:
+        "Browse the CryptoRefills catalog for a country: the fulfillable brands (gift cards + mobile top-ups), filtered " +
+        "by `query` (brand/family name) and/or `category`, in-stock first, plus the popular picks and the category keys. " +
+        "The first step of a purchase (brand discovery) — feed a brand into wallet_list_giftcard_products. Gated on the " +
+        "operator's giftcardEnabled toggle (GIFTCARDS_DISABLED when off). Read-only, moves no money.",
+      inputSchema: s.listGiftcardsInput,
+      outputSchema: s.listGiftcardsOutput,
+      annotations: read,
+    },
+    (args) => run(() => listGiftcardsTool(wallet, args as { country_code?: string; query?: string; category?: string })),
+  );
+
+  server.registerTool(
+    "wallet_list_giftcard_products",
+    {
+      title: "List a brand's denominations/products",
+      description:
+        "List a brand's products/denominations so you can complete the selection: each entry says whether it is a FIXED " +
+        "denomination (buy with its exact `denomination` string; `price_sats` is the BTC cost) or a DYNAMIC range " +
+        "product (is_dynamic:true — buy with denomination \"range\" + a `product_value` within `min`..`max`; quote a " +
+        "specific value with wallet_giftcard_price). Returns the FULL list (fixed AND range). Gated on giftcardEnabled. " +
+        "Read-only, moves no money.",
+      inputSchema: s.listGiftcardProductsInput,
+      outputSchema: s.listGiftcardProductsOutput,
+      annotations: read,
+    },
+    (args) => run(() => listGiftcardProductsTool(wallet, args as { brand_name: string; country_code?: string })),
+  );
+
+  server.registerTool(
+    "wallet_giftcard_price",
+    {
+      title: "Price a custom gift-card value",
+      description:
+        "Quote the BTC cost (in sats) of a CUSTOM value for a DYNAMIC (range) product before buying — GET " +
+        "/v4/products/price. Use for is_dynamic products (from wallet_list_giftcard_products) whose value you choose " +
+        "within min..max; fixed products already carry their `price_sats`. Gated on giftcardEnabled. Read-only, moves " +
+        "no money.",
+      inputSchema: s.giftcardPriceInput,
+      outputSchema: s.giftcardPriceOutput,
+      annotations: read,
+    },
+    (args) =>
+      run(() =>
+        giftcardPriceTool(wallet, args as { brand_name: string; country_code?: string; face_value: string | number }),
+      ),
+  );
+
+  server.registerTool(
     "wallet_buy_giftcard",
     {
       title: "Buy a gift card",
       description:
-        "Buy a gift card or mobile top-up from CryptoRefills and pay it over Lightning via Boltz (NON-custodial). MOVES " +
-        "MONEY: the L-BTC lockup passes through the owner's guardrails (value caps; with the allowlist on, BOTH the " +
+        "Buy a gift card or mobile top-up from CryptoRefills and pay it over Lightning via Boltz (NON-custodial). " +
+        "Discover `brand_name` with wallet_list_giftcards, then `denomination` with wallet_list_giftcard_products: " +
+        "pass the exact denomination string for a FIXED product, or \"range\" + `product_value` for a DYNAMIC one " +
+        "(wallet_list_giftcard_products tells you which, plus the min/max; wallet_giftcard_price quotes a custom value). " +
+        "MOVES MONEY: the L-BTC lockup passes through the owner's guardrails (value caps; with the allowlist on, BOTH the " +
         "Lightning payee AND the gift-card beneficiary must be opted in) BEFORE signing, plus a 1% DePix service fee. " +
-        "Delivery goes to `email` (or beneficiary_account). Returns once the lockup is broadcast; Boltz then pays the " +
-        "invoice in the background. Amounts are base units (sats).",
+        "Delivery goes to `email` (or beneficiary_account) — poll wallet_get_giftcard_order_status for the phase + " +
+        "redemption code/URL. Returns once the lockup is broadcast; Boltz then pays the invoice in the background. " +
+        "Amounts are base units (sats).",
       inputSchema: s.buyGiftcardInput,
       outputSchema: s.buyGiftcardOutput,
       annotations: money,
@@ -591,6 +657,21 @@ export function createWalletMcpServer(opts: CreateWalletMcpServerOptions): McpSe
       annotations: read,
     },
     () => run(() => listGiftcardOrdersTool(wallet)),
+  );
+
+  server.registerTool(
+    "wallet_get_giftcard_order_status",
+    {
+      title: "Get live gift-card order status",
+      description:
+        "Poll one order's LIVE status at CryptoRefills and fold it into the local log: returns the `phase`, a `terminal` " +
+        "flag (stop polling once true), and the `delivery` — the redemption code or URL once the order reaches " +
+        "'delivered'. Use after wallet_buy_giftcard to retrieve the gift card. Read-only, no config gate, moves no money.",
+      inputSchema: s.getGiftcardOrderStatusInput,
+      outputSchema: s.getGiftcardOrderStatusOutput,
+      annotations: read,
+    },
+    (args) => run(() => getGiftcardOrderStatusTool(wallet, args as { order_id: string })),
   );
 
   server.registerTool(

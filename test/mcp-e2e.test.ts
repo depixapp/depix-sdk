@@ -84,10 +84,10 @@ async function openReal(): Promise<void> {
 }
 
 describe("MCP facade e2e over a real wallet (sandbox, offline)", () => {
-  it("handshakes and lists the 10 MVP + 2 intent + 8 fast-follow + 2 recovery + 1 maintenance tools over a REAL wallet", async () => {
+  it("handshakes and lists the 10 MVP + 2 intent + 8 fast-follow + 4 gift-card discovery + 2 recovery + 1 maintenance tools over a REAL wallet", async () => {
     await openReal();
     const names = (await client.listTools()).tools.map((t) => t.name);
-    expect(names).toHaveLength(23);
+    expect(names).toHaveLength(27);
     expect(names).toContain("wallet_create_deposit");
     expect(names).toContain("wallet_create_withdrawal");
     // The intent layer (PR-B/PR-C): the PRIMARY conversion surface.

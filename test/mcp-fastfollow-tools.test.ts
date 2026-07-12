@@ -263,7 +263,7 @@ describe("wallet_buy_giftcard / wallet_list_giftcard_orders (CryptoRefills)", ()
     });
   });
 
-  it("list returns the tracked orders in the reshaped, unit-explicit shape", async () => {
+  it("list returns the tracked orders in the reshaped, unit-explicit shape (incl. delivery)", async () => {
     const wallet = new FakeWallet();
     const { client } = await connectWallet({ wallet });
     const out = sc(await client.callTool({ name: "wallet_list_giftcard_orders", arguments: {} }));
@@ -274,9 +274,68 @@ describe("wallet_buy_giftcard / wallet_list_giftcard_orders (CryptoRefills)", ()
       brand_name: "Amazon",
       denomination: "50",
       fee_sats: "250",
-      phase: "pending",
+      phase: "delivered",
       lockup_txid: "gclk".padEnd(64, "0"),
+      delivery: { kind: "code", value: "PIN-1234" },
     });
+  });
+});
+
+describe("wallet_list_giftcards / wallet_list_giftcard_products / wallet_giftcard_price / wallet_get_giftcard_order_status", () => {
+  it("wallet_list_giftcards maps args → camelCase and reshapes the catalog", async () => {
+    const wallet = new FakeWallet();
+    const { client } = await connectWallet({ wallet });
+    const out = sc(
+      await client.callTool({ name: "wallet_list_giftcards", arguments: { country_code: "BR", query: "amaz" } }),
+    );
+    expect(wallet.giftcards.listCalls).toEqual([{ countryCode: "BR", query: "amaz" }]);
+    expect(out.country_code).toBe("BR");
+    const brands = out.brands as SC[];
+    expect(brands[0]).toEqual({ brand: "Amazon", family: "Amazon", kind: "giftcard", category: "e-commerce", is_out_of_stock: false });
+    expect(out.categories).toEqual(["e-commerce"]);
+  });
+
+  it("wallet_list_giftcard_products returns fixed AND range products with is_dynamic + bounds", async () => {
+    const wallet = new FakeWallet();
+    const { client } = await connectWallet({ wallet });
+    const out = sc(
+      await client.callTool({ name: "wallet_list_giftcard_products", arguments: { brand_name: "Amazon" } }),
+    );
+    expect(wallet.giftcards.listProductsCalls).toEqual([{ brandName: "Amazon" }]);
+    const products = out.products as SC[];
+    expect(products[0]).toEqual({
+      denomination: "50 BRL",
+      label: "R$ 50",
+      is_dynamic: false,
+      price_sats: 25_000,
+      currency: "BRL",
+      min: null,
+      max: null,
+    });
+    expect(products[1]).toMatchObject({ denomination: "range", is_dynamic: true, price_sats: null, min: 10, max: 500 });
+  });
+
+  it("wallet_giftcard_price quotes a custom value in sats", async () => {
+    const wallet = new FakeWallet();
+    const { client } = await connectWallet({ wallet });
+    const out = sc(
+      await client.callTool({
+        name: "wallet_giftcard_price",
+        arguments: { brand_name: "Amazon", face_value: 150 },
+      }),
+    );
+    expect(wallet.giftcards.priceCalls).toEqual([{ brandName: "Amazon", faceValue: 150 }]);
+    expect(out).toEqual({ price_sats: 75_000, currency: "BRL" });
+  });
+
+  it("wallet_get_giftcard_order_status returns phase + terminal + delivery", async () => {
+    const wallet = new FakeWallet();
+    const { client } = await connectWallet({ wallet });
+    const out = sc(
+      await client.callTool({ name: "wallet_get_giftcard_order_status", arguments: { order_id: "ord_1" } }),
+    );
+    expect(wallet.giftcards.getOrderStatusCalls).toEqual(["ord_1"]);
+    expect(out).toEqual({ phase: "delivered", terminal: true, delivery: { kind: "code", value: "PIN-1234" } });
   });
 });
 

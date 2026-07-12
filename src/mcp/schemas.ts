@@ -483,8 +483,21 @@ export const toStablecoinOutput = {
   claim_address: z.string().describe("The FINAL recipient address the stablecoin is delivered to."),
 } as const;
 
+// Fresh zod instance per use — a shared const would be emitted as a JSON-Schema
+// $ref when referenced by more than one field (the catalog test forbids $ref).
+/** A redemption delivery (the code/URL the buyer redeems), or null until delivered. */
+const giftcardDelivery = () =>
+  z
+    .object({
+      kind: z
+        .enum(["url", "code", "none"])
+        .describe("url = visit the link; code = enter the code; none = not delivered yet."),
+      value: z.string().nullable().describe("The redemption code or URL; null until delivered."),
+    })
+    .nullable();
+
 export const buyGiftcardOutput = {
-  order_id: z.string().describe("CryptoRefills order id — pass to wallet_list_giftcard_orders to track it."),
+  order_id: z.string().describe("CryptoRefills order id — poll wallet_get_giftcard_order_status to track it + read delivery."),
   invoice: z.string().describe("The BOLT11 invoice that was paid for the order."),
   swap_id: z.string().describe("Boltz submarine swap id for the Lightning payment."),
   lockup_txid: z.string().describe("The broadcast L-BTC lockup transaction id."),
@@ -509,11 +522,95 @@ export const listGiftcardOrdersOutput = {
         swap_id: z.string(),
         lockup_txid: z.string().optional(),
         phase: z.string().describe("Last-known CryptoRefills order phase."),
+        delivery: giftcardDelivery()
+          .optional()
+          .describe("Persisted redemption code/URL (null until delivered; absent on legacy records)."),
         created_at: z.number().int(),
         updated_at: z.number().int(),
       }),
     )
     .describe("Locally tracked gift-card orders, newest first."),
+} as const;
+
+export const listGiftcardsInput = {
+  country_code: z
+    .string()
+    .min(2)
+    .max(2)
+    .optional()
+    .describe("ISO 3166-1 alpha-2 (e.g. BR). Defaults to the shop config country."),
+  query: z.string().optional().describe("Filter by brand/family name (case- + accent-insensitive)."),
+  category: z.string().optional().describe("Filter by category key (e.g. \"streaming\")."),
+} as const;
+
+const giftcardBrand = () =>
+  z.object({
+    brand: z.string().optional(),
+    family: z.string().optional(),
+    kind: z.string().optional().describe("giftcard | mobile_recharge."),
+    category: z.string().optional(),
+    is_out_of_stock: z.boolean().describe("In-stock brands sort first; out-of-stock last (kept, not removed)."),
+  });
+
+export const listGiftcardsOutput = {
+  country_code: z.string(),
+  brands: z
+    .array(giftcardBrand())
+    .describe("Fulfillable brands (gift cards + mobile recharge), filtered, in-stock first."),
+  popular_brands: z.array(giftcardBrand()).describe("The operator's popular picks for the country."),
+  categories: z.array(z.string()).describe("Distinct category keys for further filtering."),
+} as const;
+
+export const listGiftcardProductsInput = {
+  brand_name: z.string().min(1).describe("Brand/family name from wallet_list_giftcards (e.g. \"Amazon\")."),
+  country_code: z.string().min(2).max(2).optional().describe("ISO 3166-1 alpha-2. Defaults to the shop config country."),
+} as const;
+
+const giftcardProductShape = z.object({
+  denomination: z
+    .string()
+    .describe("Pass this exact string to wallet_buy_giftcard for a FIXED product; \"range\" for a dynamic one."),
+  label: z.string().describe("Human label (localized denomination)."),
+  is_dynamic: z
+    .boolean()
+    .describe("true = custom-value (range) product: buy with denomination \"range\" + product_value within min..max."),
+  price_sats: z
+    .number()
+    .int()
+    .nullable()
+    .describe("BTC cost in sats for a FIXED product; null for a range product (quote it with wallet_giftcard_price)."),
+  currency: z.string().nullable().describe("Fiat currency code of the face value (e.g. BRL)."),
+  min: z.number().nullable().describe("Range lower bound (fiat) for a dynamic product."),
+  max: z.number().nullable().describe("Range upper bound (fiat) for a dynamic product."),
+});
+
+export const listGiftcardProductsOutput = {
+  products: z
+    .array(giftcardProductShape)
+    .describe("The brand's products/denominations — FIXED (pick a denomination) AND range (pick a value in min..max)."),
+} as const;
+
+export const giftcardPriceInput = {
+  brand_name: z.string().min(1).describe("Brand/family name of a RANGE (dynamic) product."),
+  country_code: z.string().min(2).max(2).optional().describe("ISO 3166-1 alpha-2. Defaults to the shop config country."),
+  face_value: z
+    .union([z.string(), z.number()])
+    .describe("The custom face value to quote (within the product's min..max), in the product's fiat currency."),
+} as const;
+
+export const giftcardPriceOutput = {
+  price_sats: z.number().int().describe("BTC cost in sats for the requested custom value."),
+  currency: z.string().nullable().describe("Fiat currency code, when the price response carries it (else null)."),
+} as const;
+
+export const getGiftcardOrderStatusInput = {
+  order_id: z.string().min(1).describe("The CryptoRefills order id (from wallet_buy_giftcard)."),
+} as const;
+
+export const getGiftcardOrderStatusOutput = {
+  phase: z.string().describe("delivered | expired | canceled | manual | paid | awaiting_payment."),
+  terminal: z.boolean().describe("true when the order reached a final state (stop polling)."),
+  delivery: giftcardDelivery().describe("The redemption code/URL once delivered; null otherwise."),
 } as const;
 
 // ── intent layer: wallet_quote + wallet_convert (PR-B/PR-C — the PRIMARY

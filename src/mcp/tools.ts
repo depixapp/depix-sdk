@@ -44,7 +44,17 @@ import type {
 import type { ConvertIntent, IntentAsset, IntentNetwork } from "../convert/routes.js";
 import type { SwapQuoteParams } from "../convert/sideswap.js";
 import type { SideShiftSendResult } from "../convert/sideshift.js";
-import type { BuyGiftcardParams, BuyGiftcardResult } from "../giftcards/namespace.js";
+import type {
+  BuyGiftcardParams,
+  BuyGiftcardResult,
+  GiftcardCatalog,
+  GiftcardPrice,
+  GiftcardPriceParams,
+  GiftcardProduct,
+  ListGiftcardsParams,
+  ListProductsParams
+} from "../giftcards/namespace.js";
+import type { CryptorefillsBrand, OrderDelivery, OrderPhase } from "../giftcards/cryptorefills.js";
 import type { StoredGiftcardOrder } from "../giftcards/store.js";
 import type { McpSwapFacade, SwapStreamRegistry } from "./swap-streams.js";
 import {
@@ -93,6 +103,10 @@ export interface McpConvertFacade {
 export interface McpGiftcardsFacade {
   buy(params: BuyGiftcardParams): Promise<BuyGiftcardResult>;
   listOrders(): Promise<StoredGiftcardOrder[]>;
+  list(params?: ListGiftcardsParams): Promise<GiftcardCatalog>;
+  listProducts(params: ListProductsParams): Promise<GiftcardProduct[]>;
+  price(params: GiftcardPriceParams): Promise<GiftcardPrice>;
+  getOrderStatus(orderId: string): Promise<OrderPhase>;
 }
 
 /**
@@ -515,6 +529,12 @@ export async function buyGiftcardTool(
   };
 }
 
+/** Map a delivery (code/URL) to the JSON output shape, or null when undelivered. */
+function deliveryToOutput(d: OrderDelivery | null | undefined): { kind: string; value: string | null } | null {
+  if (!d) return null;
+  return { kind: d.kind, value: d.value };
+}
+
 function giftcardOrderToOutput(o: StoredGiftcardOrder) {
   const out: Record<string, unknown> = {
     order_id: o.orderId,
@@ -530,12 +550,85 @@ function giftcardOrderToOutput(o: StoredGiftcardOrder) {
     updated_at: o.updatedAt,
   };
   if (o.lockupTxid !== undefined) out.lockup_txid = o.lockupTxid;
+  // Surface the persisted redemption delivery (null until delivered; absent on
+  // legacy records written before delivery was tracked).
+  if (o.delivery !== undefined) out.delivery = deliveryToOutput(o.delivery);
   return out;
 }
 
 export async function listGiftcardOrdersTool(wallet: McpWalletFacade) {
   const orders = await wallet.giftcards.listOrders();
   return { orders: orders.map(giftcardOrderToOutput) };
+}
+
+/** Pick just the catalog-relevant fields off a (large, evolving) raw brand. */
+function giftcardBrandToOutput(b: CryptorefillsBrand) {
+  const out: Record<string, unknown> = { is_out_of_stock: Boolean(b.is_out_of_stock) };
+  if (typeof b.brand === "string") out.brand = b.brand;
+  if (typeof b.family === "string") out.family = b.family;
+  if (typeof b.kind === "string") out.kind = b.kind;
+  if (typeof b.category === "string") out.category = b.category;
+  return out;
+}
+
+export async function listGiftcardsTool(
+  wallet: McpWalletFacade,
+  args: { country_code?: string; query?: string; category?: string },
+) {
+  const params: ListGiftcardsParams = {
+    ...(args.country_code !== undefined ? { countryCode: args.country_code } : {}),
+    ...(args.query !== undefined ? { query: args.query } : {}),
+    ...(args.category !== undefined ? { category: args.category } : {}),
+  };
+  const cat = await wallet.giftcards.list(params);
+  return {
+    country_code: cat.countryCode,
+    brands: cat.brands.map(giftcardBrandToOutput),
+    popular_brands: cat.popularBrands.map(giftcardBrandToOutput),
+    categories: cat.categories,
+  };
+}
+
+function giftcardProductToOutput(p: GiftcardProduct) {
+  return {
+    denomination: p.denomination,
+    label: p.label,
+    is_dynamic: p.isDynamic,
+    price_sats: p.priceSats,
+    currency: p.currency,
+    min: p.min,
+    max: p.max,
+  };
+}
+
+export async function listGiftcardProductsTool(
+  wallet: McpWalletFacade,
+  args: { brand_name: string; country_code?: string },
+) {
+  const params: ListProductsParams = {
+    brandName: args.brand_name,
+    ...(args.country_code !== undefined ? { countryCode: args.country_code } : {}),
+  };
+  const products = await wallet.giftcards.listProducts(params);
+  return { products: products.map(giftcardProductToOutput) };
+}
+
+export async function giftcardPriceTool(
+  wallet: McpWalletFacade,
+  args: { brand_name: string; country_code?: string; face_value: string | number },
+) {
+  const params: GiftcardPriceParams = {
+    brandName: args.brand_name,
+    faceValue: args.face_value,
+    ...(args.country_code !== undefined ? { countryCode: args.country_code } : {}),
+  };
+  const quote = await wallet.giftcards.price(params);
+  return { price_sats: quote.priceSats, currency: quote.currency };
+}
+
+export async function getGiftcardOrderStatusTool(wallet: McpWalletFacade, args: { order_id: string }) {
+  const phase = await wallet.giftcards.getOrderStatus(args.order_id);
+  return { phase: phase.phase, terminal: phase.terminal, delivery: deliveryToOutput(phase.delivery) };
 }
 
 /**
