@@ -248,6 +248,7 @@ describe("quoteRoutes — enumerates ALL candidates with chained estimates", () 
       sendAmountSats: p.amountSats,
       boltzPercent: 0.1,
       minerFeesSats: 300,
+      bridgeFeeSats: null,
       minSats: 1_000,
       maxSats: null
     }));
@@ -938,6 +939,7 @@ describe("precision guards — the bigint→number boundary fails loud, never si
       sendAmountSats: p.amountSats,
       boltzPercent: 0.1,
       minerFeesSats: 300,
+      bridgeFeeSats: null,
       minSats: 1_000,
       maxSats: null
     }));

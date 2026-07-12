@@ -10,8 +10,10 @@ import { sha256 } from "@noble/hashes/sha2.js";
 import { base58, hex } from "@scure/base";
 import {
   boltzVariantKey,
+  chainSwapNeverLocked,
   checkStablecoinAmount,
   deriveStablecoinKeys,
+  isPermanentRouteError,
   isValidTronAddress,
   mapChainSwapStatus,
   loadViem,
@@ -19,6 +21,7 @@ import {
   withEphemeralEvmSigner,
   prepareStablecoinRoute,
   executeStablecoinRoute,
+  estimateStablecoinOut,
   type LoadedViem,
   type LocalEvmSigner,
   type PrepareStablecoinDeps,
@@ -138,6 +141,64 @@ describe("mapChainSwapStatus — recovery bucket", () => {
   });
 });
 
+describe("isPermanentRouteError — permanent vs transient route-execution failures", () => {
+  it("flags each PERMANENT pattern the boltz-swaps route engine throws (mirrors the frontend regex)", () => {
+    // The four patterns from depix-frontend/wallet/swap-ui.js:2258-2261.
+    expect(isPermanentRouteError(new Error("amount too small to cover bridge messaging fee"))).toBe(true);
+    expect(isPermanentRouteError(new Error("RouteUnavailable"))).toBe(true);
+    expect(isPermanentRouteError(new Error("no route found for this pair"))).toBe(true);
+    expect(isPermanentRouteError(new Error("no valid route"))).toBe(true);
+    expect(isPermanentRouteError(new Error("unsupported target chain"))).toBe(true);
+    // Case-insensitive, and a raw string (no `.message`) is accepted too.
+    expect(isPermanentRouteError("ROUTEUNAVAILABLE")).toBe(true);
+  });
+
+  it("returns FALSE for a TRANSIENT failure (network blip / dynamic-import chunk 404) and for empty errors", () => {
+    expect(isPermanentRouteError(new Error("fetch failed"))).toBe(false);
+    expect(isPermanentRouteError(new Error("Failed to fetch dynamically imported module: chunk-abc.js"))).toBe(false);
+    expect(isPermanentRouteError(new Error("503 service unavailable"))).toBe(false); // NOT "unsupported"
+    expect(isPermanentRouteError(null)).toBe(false);
+    expect(isPermanentRouteError(undefined)).toBe(false);
+  });
+});
+
+describe("chainSwapNeverLocked — DEFINITIVE 'no coins locked' signal (fail-safe)", () => {
+  it("returns TRUE when Boltz resolves with NO userLock (created then abandoned)", async () => {
+    expect(await chainSwapNeverLocked("s1", async () => ({ serverLock: {} }))).toBe(true);
+    expect(await chainSwapNeverLocked("s1", async () => ({}))).toBe(true);
+    expect(await chainSwapNeverLocked("s1", async () => null)).toBe(true);
+  });
+
+  it("returns TRUE when the fetch throws the definitive 'no coins were locked up yet'", async () => {
+    expect(
+      await chainSwapNeverLocked("s1", async () => {
+        throw new Error("no coins were locked up yet");
+      })
+    ).toBe(true);
+  });
+
+  it("returns FALSE when a userLock EXISTS (coins ARE locked — must never drop such a record)", async () => {
+    expect(await chainSwapNeverLocked("s1", async () => ({ userLock: { transaction: { id: "x" } } }))).toBe(false);
+  });
+
+  it("returns FALSE (fail-safe) on an AMBIGUOUS/transient fetch error — a record that may hold funds is never cleared", async () => {
+    expect(
+      await chainSwapNeverLocked("s1", async () => {
+        throw new Error("network unreachable");
+      })
+    ).toBe(false);
+    expect(
+      await chainSwapNeverLocked("s1", async () => {
+        throw new Error("500 internal server error");
+      })
+    ).toBe(false);
+  });
+
+  it("returns FALSE for an empty swapId", async () => {
+    expect(await chainSwapNeverLocked("", async () => ({}))).toBe(false);
+  });
+});
+
 describe("checkStablecoinAmount — economic/dust guard (pure)", () => {
   it("passes a healthy amount", () => {
     expect(checkStablecoinAmount({ amountSats: 100_000, sendUsd: 60, receiveUsd: 58 }).ok).toBe(true);
@@ -154,6 +215,90 @@ describe("checkStablecoinAmount — economic/dust guard (pure)", () => {
   it("rejects when the total fee ratio exceeds the cap", () => {
     const r = checkStablecoinAmount({ amountSats: 100_000, sendUsd: 60, receiveUsd: 40 }); // 33% fee
     expect(r).toMatchObject({ ok: false, reason: "fee_ratio" });
+  });
+});
+
+describe("estimateStablecoinOut — prices the bridge messaging fee into bridgeFeeSats (fund-safety port)", () => {
+  const PAIRS = { chain: { "L-BTC": { TBTC: { limits: { minimal: 1000, maximal: 100_000_000 } } } } };
+  const BRIDGE_FEE_SATS = 6000;
+  // quoteDexAmountOut prices the native-gas messaging fee in 18-decimal tBTC wei;
+  // estimateStablecoinOut divides by 1e10 to get L-BTC sats → 6000 sats here.
+  const feeQuoteWei = (BigInt(BRIDGE_FEE_SATS) * 10_000_000_000n).toString();
+  const MSG_FEE = 1_000_000_000_000_000n; // native gas token units (opaque to us)
+
+  it("derives bridgeFeeSats from a route WITH a bridge leg (LayerZero/OFT target like Tron)", async () => {
+    const quoteDex = vi.fn<
+      (chain: string, tokenIn: string, tokenOut: string, amountOut: bigint) => Promise<Array<{ quote: string }>>
+    >(async () => [{ quote: feeQuoteWei }]);
+    const est = await estimateStablecoinOut(
+      { asset: "USDT", networkId: "tron", amountSats: 5000 },
+      {
+        ensureConfig: async () => {},
+        getPairs: async () => PAIRS,
+        quoteRouteAmountOut: async () => ({
+          receiveAmount: 950_000n,
+          sendAmount: 5000,
+          legs: [
+            { kind: "chain-swap", receiveAmount: 4_800n, fees: { percentage: 0.1, minerFees: { server: 10, userLockup: 20, userClaim: 30 } } },
+            { kind: "dex", chain: "arbitrum", tokenIn: "0xTBTC", tokenOut: "0xUSDT" },
+            { kind: "bridge", messagingFee: { amount: MSG_FEE, token: "0x0" } }
+          ]
+        }),
+        quoteDexAmountOut: quoteDex
+      }
+    );
+    expect(est.bridgeFeeSats).toBe(BRIDGE_FEE_SATS);
+    // Priced exactly as routeExecute does: quoteDexAmountOut(dex.chain, dex.tokenIn,
+    // address(0) native gas, msgFee).
+    expect(quoteDex).toHaveBeenCalledTimes(1);
+    expect(quoteDex.mock.calls[0]![0]).toBe("arbitrum"); // dex chain
+    expect(quoteDex.mock.calls[0]![1]).toBe("0xTBTC"); // dex tokenIn
+    expect(quoteDex.mock.calls[0]![2]).toBe("0x0000000000000000000000000000000000000000"); // native gas token
+    expect(quoteDex.mock.calls[0]![3]).toBe(MSG_FEE); // the messaging fee amount
+  });
+
+  it("returns bridgeFeeSats null for an Arbitrum route (no bridge leg → nothing to price)", async () => {
+    const quoteDex = vi.fn(async () => [{ quote: feeQuoteWei }]);
+    const est = await estimateStablecoinOut(
+      { asset: "USDC", networkId: "arbitrum", amountSats: 5000 },
+      {
+        ensureConfig: async () => {},
+        getPairs: async () => PAIRS,
+        quoteRouteAmountOut: async () => ({
+          receiveAmount: 950_000n,
+          legs: [
+            { kind: "chain-swap", receiveAmount: 4_800n, fees: { percentage: 0.1, minerFees: { server: 10, userLockup: 20, userClaim: 30 } } },
+            { kind: "dex", chain: "arbitrum", tokenIn: "0xTBTC", tokenOut: "0xUSDC" }
+          ]
+        }),
+        quoteDexAmountOut: quoteDex
+      }
+    );
+    expect(est.bridgeFeeSats).toBeNull();
+    expect(quoteDex).not.toHaveBeenCalled();
+  });
+
+  it("leaves bridgeFeeSats null (best-effort) when the DEX fee quote throws — min/max/ratio guards still apply", async () => {
+    const est = await estimateStablecoinOut(
+      { asset: "USDT", networkId: "tron", amountSats: 5000 },
+      {
+        ensureConfig: async () => {},
+        getPairs: async () => PAIRS,
+        quoteRouteAmountOut: async () => ({
+          receiveAmount: 950_000n,
+          legs: [
+            { kind: "chain-swap", receiveAmount: 4_800n, fees: { percentage: 0.1, minerFees: { server: 10, userLockup: 20, userClaim: 30 } } },
+            { kind: "dex", chain: "arbitrum", tokenIn: "0xTBTC", tokenOut: "0xUSDT" },
+            { kind: "bridge", messagingFee: { amount: MSG_FEE } }
+          ]
+        }),
+        quoteDexAmountOut: async () => {
+          throw new Error("dex quote unavailable");
+        }
+      }
+    );
+    expect(est.bridgeFeeSats).toBeNull();
+    expect(est.minSats).toBe(1000);
   });
 });
 
@@ -419,6 +564,63 @@ describe("prepareStablecoinRoute — fail-closed guard cadence (§5.3)", () => {
   });
 });
 
+describe("prepareStablecoinRoute — bridge-fee pre-lockup guard (fund-safety port)", () => {
+  const PAIRS = { chain: { "L-BTC": { TBTC: { limits: { minimal: 1000, maximal: 100_000_000 } } } } };
+  // Bridge fee resolves to 6000 sats (> the 5000-sat amount) → bridge_fee reject.
+  const feeQuoteWei = (6000n * 10_000_000_000n).toString();
+  const bridgedRouteQuote = () => async () => ({
+    receiveAmount: 950_000n,
+    sendAmount: 5000,
+    legs: [
+      { kind: "chain-swap", receiveAmount: 4_800n, fees: { percentage: 0.1, minerFees: { server: 10, userLockup: 20, userClaim: 30 } } },
+      { kind: "dex", chain: "arbitrum", tokenIn: "0xTBTC", tokenOut: "0xUSDT" },
+      { kind: "bridge", messagingFee: { amount: 1_000_000_000_000_000n } }
+    ]
+  });
+
+  it("REJECTS a small BRIDGED amount whose bridge fee dominates, BEFORE creating any swap (no L-BTC locked)", async () => {
+    const { fn: createRoute } = fakeCreateRoute();
+    // estimate: undefined → prepare runs the REAL estimate, deriving bridgeFeeSats
+    // from the injected route legs + DEX fee quote (fully offline).
+    const { deps } = baseDeps({
+      createRoute,
+      estimate: undefined,
+      getPairs: async () => PAIRS,
+      quoteRouteAmountOut: bridgedRouteQuote(),
+      quoteDexAmountOut: async () => [{ quote: feeQuoteWei }]
+    });
+    await expect(
+      prepareStablecoinRoute({ asset: "USDT", networkId: "tron", amountSats: 5000, claimAddress: VALID_TRON }, deps)
+    ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "SWAP_VALIDATION_FAILED"));
+    // Fail-closed BEFORE the swap is created → no L-BTC can be locked.
+    expect(createRoute).not.toHaveBeenCalled();
+  });
+
+  it("does NOT reject an Arbitrum (no-bridge) route with the SAME small amount on bridge-fee grounds", async () => {
+    const { fn: createRoute } = fakeCreateRoute();
+    const { deps } = baseDeps({
+      createRoute,
+      estimate: undefined,
+      getPairs: async () => PAIRS,
+      quoteRouteAmountOut: async () => ({
+        receiveAmount: 950_000n,
+        sendAmount: 5000,
+        legs: [
+          { kind: "chain-swap", receiveAmount: 4_800n, fees: { percentage: 0.1, minerFees: { server: 10, userLockup: 20, userClaim: 30 } } },
+          { kind: "dex", chain: "arbitrum", tokenIn: "0xTBTC", tokenOut: "0xUSDC" }
+        ]
+      })
+      // no quoteDexAmountOut needed — no bridge leg to price
+    });
+    const prepared = await prepareStablecoinRoute(
+      { asset: "USDC", networkId: "arbitrum", amountSats: 5000, claimAddress: VALID_EVM },
+      deps
+    );
+    expect(prepared.swapId).toBe("chain-swap-1");
+    expect(createRoute).toHaveBeenCalledTimes(1); // route creation proceeds — bridge guard is a no-op here
+  });
+});
+
 describe("executeStablecoinRoute — chain claim → DEX → bridge (sponsor gas, key zeroed)", () => {
   it("waits for the server lockup, then runs executeRoute with the gas-abstraction signer", async () => {
     const originalKey = new Uint8Array(32).fill(0x55);
@@ -433,10 +635,13 @@ describe("executeStablecoinRoute — chain claim → DEX → bridge (sponsor gas
       seenSignerHex = h;
       return { address: "0xSIGNER", walletClient: { tag: "wc" }, provider: {}, rdns: "gas-abstraction" };
     });
-    const executeRoute = vi.fn(async (a: { signer: LocalEvmSigner; recipient: string; preimage: Uint8Array }) => {
+    const executeRoute = vi.fn(async (a: { signer: LocalEvmSigner; recipient: string; preimage: string }) => {
       seenRecipient = a.recipient;
       seenSignerRdns = a.signer.rdns;
-      seenPreimage = hex.encode(a.preimage);
+      // Regression: boltz-swaps' executeRoute takes preimage as a HEX STRING, not
+      // bytes (a Uint8Array throws "val.startsWith is not a function" in its EVM
+      // claim leg). Capture it verbatim — no hex.encode — and assert below.
+      seenPreimage = a.preimage;
       return { claimTransactionId: "claim-tx-1" };
     });
 
@@ -456,6 +661,7 @@ describe("executeStablecoinRoute — chain claim → DEX → bridge (sponsor gas
     expect(waitForServerLockup).toHaveBeenCalledWith("chain-swap-1");
     expect(seenRecipient).toBe(VALID_EVM); // delivered to the FINAL user address
     expect(seenSignerRdns).toBe("gas-abstraction"); // gas paid by the hosted sponsor
+    expect(typeof seenPreimage).toBe("string"); // regression: hex string, not Uint8Array
     expect(seenPreimage).toBe("ab".repeat(32));
     // The signer was built from the ephemeral key's 0x-hex …
     expect(seenSignerHex).toBe(("0x" + evmHex) as `0x${string}`);

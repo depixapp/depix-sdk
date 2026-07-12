@@ -26,6 +26,7 @@ import { hex } from "@scure/base";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { base58 } from "@scure/base";
 import { ConversionError } from "../../errors.js";
+import { ensureBoltzConfig } from "./client.js";
 import { randomKeypair } from "./keys.js";
 import { assertLockupAddressBindsToUser } from "./verify-lockup.js";
 
@@ -150,6 +151,66 @@ export const CHAIN_SWAP_FAILURE_STATUSES: ReadonlySet<string> = new Set([
   "transaction.failed",
   "transaction.refunded"
 ]);
+
+/**
+ * Distinguish a PERMANENT route-execution failure (the swap can NEVER settle,
+ * regardless of retries) from a TRANSIENT one (network blip, dynamic-import chunk
+ * 404). The boltz-swaps route engine throws plain Errors, so the match is on the
+ * message text. FAITHFUL mirror of the EXACT patterns in
+ * depix-frontend/wallet/swap-ui.js:2258-2261 — keep them in sync. Exported so the
+ * recovery loop (convert.ts executeStablecoin) can steer a permanently-
+ * unexecutable swap straight to refund instead of looping resume until the swap
+ * expires.
+ */
+export function isPermanentRouteError(err: unknown): boolean {
+  const msg = String((err as { message?: unknown } | null | undefined)?.message ?? err ?? "");
+  return /too small to cover bridge messaging fee|RouteUnavailable|no .*route|unsupported/i.test(msg);
+}
+
+/** The chain-swap transactions shape the never-locked probe reads (subset). */
+export interface ChainSwapTransactions {
+  userLock?: unknown;
+  serverLock?: unknown;
+}
+/** Injectable chain-swap transactions fetch (tests) — default: boltz-swaps/client. */
+export type GetChainSwapTransactions = (swapId: string) => Promise<ChainSwapTransactions | null | undefined>;
+
+/**
+ * True IFF Boltz DEFINITIVELY confirms this chain swap NEVER locked any coins
+ * on-chain (created then abandoned, or expired before the user funded it) — so
+ * there is nothing to refund and the orphan record can be safely dropped. FAIL-
+ * SAFE: a transient/unknown error returns false, so a record that MAY hold real
+ * funds is NEVER dropped — only a definitive "no coins were locked up yet" from
+ * Boltz (or a resolved response carrying no userLock) returns true.
+ * `getTransactions` is injectable for tests; the default configures the (viem-
+ * free) boltz-swaps client and calls its getChainSwapTransactions. Port of
+ * depix-frontend/wallet/boltz/stablecoin.js:186-196.
+ */
+export async function chainSwapNeverLocked(
+  swapId: string,
+  getTransactions?: GetChainSwapTransactions
+): Promise<boolean> {
+  if (!swapId) return false;
+  try {
+    const fetchTx: GetChainSwapTransactions =
+      getTransactions ??
+      (async (id: string) => {
+        // The SDK configures the boltz-swaps client lazily (the frontend does it
+        // globally at app init), so ensure the viem-free mainnet config is set
+        // before the REST probe — otherwise the request would use an unconfigured
+        // base URL and the fail-safe would degrade to "keep + re-error".
+        await ensureBoltzConfig();
+        const { getChainSwapTransactions } = (await import("boltz-swaps/client")) as unknown as {
+          getChainSwapTransactions: (id: string) => Promise<ChainSwapTransactions>;
+        };
+        return getChainSwapTransactions(id);
+      });
+    const res = await fetchTx(swapId);
+    return !res?.userLock; // resolved with no userLock = never locked
+  } catch (e) {
+    return /no coins were locked up yet/i.test(String((e as { message?: unknown } | null | undefined)?.message ?? e ?? ""));
+  }
+}
 
 // Upper bound on how far in the future the chain-swap refund timeout may sit
 // (~2 weeks at 1 L-BTC block/min). Mirrors MAX_SUBMARINE_TIMEOUT_BLOCKS.
@@ -399,6 +460,10 @@ export interface PrepareStablecoinDeps {
   deriveKeys?: () => StablecoinKeys;
   /** Fetch the full boltz-swaps pairs object (default: dynamic import). */
   getPairs?: () => Promise<unknown>;
+  /** Route quote for the default economic pre-check (forwarded to estimateStablecoinOut). */
+  quoteRouteAmountOut?: EstimateStablecoinDeps["quoteRouteAmountOut"];
+  /** Bridge-fee DEX quote for the default economic pre-check (forwarded to estimateStablecoinOut). */
+  quoteDexAmountOut?: EstimateStablecoinDeps["quoteDexAmountOut"];
   /** Create the chain swap route (default: boltz-swaps/routeExecute createRoute). */
   createRoute?: (args: {
     from: string;
@@ -422,14 +487,16 @@ export interface PrepareStablecoinDeps {
   rpc?: string;
   /**
    * Economic / dust pre-check source (default: estimateStablecoinOut, viem-free).
-   * Supplies the chain-swap min/max (both in L-BTC sats) that checkStablecoinAmount
-   * uses to reject an amount the route cannot settle BEFORE any L-BTC is locked.
+   * Supplies the chain-swap min/max AND the fixed bridge fee (all in L-BTC sats)
+   * that checkStablecoinAmount uses to reject an amount the route cannot settle
+   * BEFORE any L-BTC is locked. `bridgeFeeSats` is null for non-bridged (Arbitrum)
+   * routes; it is optional here so a test may inject a min/max-only estimate.
    */
   estimate?: (p: {
     asset: StablecoinAsset;
     networkId: string;
     amountSats: number;
-  }) => Promise<Pick<StablecoinEstimate, "minSats" | "maxSats">>;
+  }) => Promise<Pick<StablecoinEstimate, "minSats" | "maxSats"> & { bridgeFeeSats?: number | null }>;
 }
 
 /**
@@ -460,6 +527,13 @@ export interface PreparedStablecoinRoute {
 }
 
 const LBTC_VIA_ASSET = "L-BTC";
+
+// The native gas token sentinel (address(0)) — mirrors `zeroAddress` in boltz-swaps
+// routeExecute.claimViaRouterBridge, where the bridge messaging fee is priced against
+// the native gas token via quoteDexAmountOut(dex.chain, dex.tokenIn, zeroAddress, …).
+const ZERO_GAS_TOKEN = "0x0000000000000000000000000000000000000000";
+// tBTC is an 18-decimal ERC-20 (Arbitrum); L-BTC sats are 8-decimal. wei / 1e10 = sats.
+const TBTC_WEI_PER_LBTC_SAT = 10_000_000_000n;
 
 /**
  * Create a Boltz chain swap for `params` and run the full fail-closed guard
@@ -530,16 +604,23 @@ export async function prepareStablecoinRoute(
   // Economic / dust guard (§5.3): reject an amount the chain-swap + DEX (+ bridge)
   // route cannot settle BEFORE locking any L-BTC. A sub-minimum lock would strand
   // funds in a forced refund cycle (wasted lockup + refund fees; principal is
-  // refundable). Boltz's own chain-swap min/max already encodes the route's
-  // fixed-cost floor, and both bounds are in L-BTC sats (same unit as amountSats),
-  // so they are the reliable input; USD/bridge-fee sub-checks would need same-unit
-  // data the read-only estimate doesn't surface. Fail-closed.
+  // refundable). Boltz's own chain-swap min/max encodes the route's fixed-cost
+  // floor, and both bounds are in L-BTC sats (same unit as amountSats). On a
+  // BRIDGED destination (LayerZero/OFT — non-Arbitrum) that min/max is far too low
+  // to catch the fixed bridge messaging fee, which is NOT reflected in the quote:
+  // the estimate also surfaces `bridgeFeeSats` (null for Arbitrum), and passing it
+  // through here makes checkStablecoinAmount's bridge_fee / fee_ratio branches live
+  // so an amount that could not cover the bridge fee is rejected pre-lockup instead
+  // of locking then reverting at executeRoute ("amount too small to cover bridge
+  // messaging fee"). Fail-closed. Port of depix-frontend swap-ui.js (~L1251-1256).
   const estimate =
     deps.estimate ??
     ((p: { asset: StablecoinAsset; networkId: string; amountSats: number }) =>
       estimateStablecoinOut(p, {
         ...(deps.ensureConfig ? { ensureConfig: deps.ensureConfig } : {}),
-        ...(deps.getPairs ? { getPairs: deps.getPairs } : {})
+        ...(deps.getPairs ? { getPairs: deps.getPairs } : {}),
+        ...(deps.quoteRouteAmountOut ? { quoteRouteAmountOut: deps.quoteRouteAmountOut } : {}),
+        ...(deps.quoteDexAmountOut ? { quoteDexAmountOut: deps.quoteDexAmountOut } : {})
       }));
   const limits = await estimate({
     asset: params.asset,
@@ -549,7 +630,8 @@ export async function prepareStablecoinRoute(
   const econ = checkStablecoinAmount({
     amountSats: params.amountSats,
     ...(typeof limits.minSats === "number" ? { minSats: limits.minSats } : {}),
-    ...(typeof limits.maxSats === "number" ? { maxSats: limits.maxSats } : {})
+    ...(typeof limits.maxSats === "number" ? { maxSats: limits.maxSats } : {}),
+    ...(typeof limits.bridgeFeeSats === "number" ? { bridgeFeeSats: limits.bridgeFeeSats } : {})
   });
   if (!econ.ok) {
     const detail =
@@ -718,7 +800,7 @@ export interface ExecuteStablecoinDeps {
   executeRoute?: (args: {
     createdSwap: unknown;
     plan: unknown;
-    preimage: Uint8Array;
+    preimage: string;
     signer: LocalEvmSigner;
     recipient: string;
   }) => Promise<{ claimTransactionId: string }>;
@@ -752,7 +834,11 @@ export async function executeStablecoinRoute(
   await deps.waitForServerLockup(record.swapId);
 
   const executeRoute = deps.executeRoute ?? defaultExecuteRoute;
-  const preimage = hex.decode(record.preimageHex);
+  // boltz-swaps' executeRoute wants the preimage as a HEX STRING — its EVM claim
+  // leg calls prefix0x(val) => (val.startsWith("0x") ? …) on it, and a Uint8Array
+  // has no .startsWith (throws "val.startsWith is not a function"). record.preimageHex
+  // is already bare hex; boltz-swaps normalizes it. Same class as the preimageHash fix.
+  const preimage = record.preimageHex;
   const keyBytes = hex.decode(record.evmPrivateKeyHex);
   const { claimTransactionId } = await withEphemeralEvmSigner(
     keyBytes,
@@ -781,6 +867,15 @@ export interface StablecoinEstimate {
   sendAmountSats: number;
   boltzPercent: number | null;
   minerFeesSats: number;
+  /**
+   * Fixed bridge cost in L-BTC sats for a BRIDGED destination (LayerZero/OFT —
+   * non-Arbitrum targets like Tron/Polygon/Optimism/Ethereum, or USDC on Base),
+   * or `null` when the route has no bridge leg (Arbitrum) or the fee could not be
+   * priced. NOT reflected in `receiveAmount`, so the caller must gate on it
+   * explicitly (checkStablecoinAmount bridge_fee / fee_ratio) BEFORE locking any
+   * L-BTC — see the derivation in estimateStablecoinOut.
+   */
+  bridgeFeeSats: number | null;
   minSats: number | null;
   maxSats: number | null;
 }
@@ -793,6 +888,18 @@ export interface EstimateStablecoinDeps {
     sendAmount?: bigint | number;
     legs?: Array<Record<string, unknown>>;
   }>;
+  /**
+   * Price the bridge messaging fee (native gas token) in the DEX's input token
+   * (tBTC), used only to derive bridgeFeeSats. Injected for offline tests; the
+   * default dynamically imports boltz-swaps/client's quoteDexAmountOut — the same
+   * function routeExecute.claimViaRouterBridge uses to gate the bridge leg.
+   */
+  quoteDexAmountOut?: (
+    chain: string,
+    tokenIn: string,
+    tokenOut: string,
+    amountOut: bigint
+  ) => Promise<Array<{ quote: string | number | bigint }>>;
 }
 
 /**
@@ -829,6 +936,42 @@ export async function estimateStablecoinOut(
       if (m) minerFeesSats += Number(m.server || 0) + Number(m.userLockup || 0) + Number(m.userClaim || 0);
     }
   }
+
+  // BRIDGE messaging fee (LayerZero/OFT for non-Arbitrum targets like Tron) is a
+  // FIXED cost paid in destination-chain gas, deducted from the tBTC BEFORE the DEX
+  // leg — and it is NOT reflected in quote.receiveAmount, so the quote looks healthy
+  // for an amount that cannot actually execute ("amount too small to cover bridge
+  // messaging fee" is thrown only at executeRoute, AFTER the L-BTC is locked; see
+  // boltz-swaps routeExecute.claimViaRouterBridge). Pre-flight it here, replicating
+  // that gate with the quote's own numbers + one read-only DEX quote, so the caller
+  // (checkStablecoinAmount) can block the swap BEFORE any funds move. Best-effort:
+  // any structural surprise leaves bridgeFeeSats null and the min/max/ratio guards
+  // still apply. Arbitrum has no bridge leg → stays null (unaffected). Port of
+  // depix-frontend/wallet/boltz/stablecoin.js estimateStablecoinOut (~L132-145).
+  let bridgeFeeSats: number | null = null;
+  try {
+    const legs = (quote.legs ?? []) as Array<Record<string, unknown>>;
+    const bridgeLeg = legs.find((l) => l.kind === "bridge");
+    const dexLeg = legs.find((l) => l.kind === "dex");
+    const chainLeg = legs.find((l) => l.kind === "chain-swap");
+    const messagingFee = (bridgeLeg?.messagingFee as { amount?: bigint | number | string } | undefined)?.amount;
+    const dexChain = dexLeg?.chain as string | undefined;
+    const dexTokenIn = dexLeg?.tokenIn as string | undefined;
+    const chainReceive = chainLeg?.receiveAmount;
+    if (messagingFee && dexChain && chainReceive) {
+      const quoteDexAmountOut = deps.quoteDexAmountOut ?? defaultQuoteDexAmountOut;
+      // Price the messaging fee (native gas token, address(0)) in the DEX input
+      // token (tBTC), exactly as routeExecute does: quoteDexAmountOut(dex.chain,
+      // dex.tokenIn, zeroAddress, msgFee).
+      const [feeQuote] = await quoteDexAmountOut(dexChain, dexTokenIn ?? "", ZERO_GAS_TOKEN, BigInt(messagingFee));
+      // tBTC (18-decimal ERC-20 on Arbitrum) → L-BTC sats (8-decimal): divide by 1e10.
+      const feeTbtcWei = BigInt(feeQuote!.quote);
+      bridgeFeeSats = Number(feeTbtcWei / TBTC_WEI_PER_LBTC_SAT);
+    }
+  } catch {
+    /* leave null — the min/max/ratio guards still apply */
+  }
+
   const chainLimits = pairs?.chain?.[LBTC_VIA_ASSET]?.["TBTC"]?.limits ?? null;
   return {
     receiveAmount: quote.receiveAmount,
@@ -836,6 +979,10 @@ export async function estimateStablecoinOut(
     sendAmountSats: Number(quote.sendAmount ?? params.amountSats),
     boltzPercent,
     minerFeesSats,
+    // Fixed bridge cost in L-BTC sats (null when the route has no bridge or it
+    // couldn't be priced). The caller blocks the swap when this is not comfortably
+    // covered — see checkStablecoinAmount's bridge_fee / fee_ratio branches.
+    bridgeFeeSats,
     minSats: typeof chainLimits?.minimal === "number" ? chainLimits.minimal : null,
     maxSats: typeof chainLimits?.maximal === "number" ? chainLimits.maximal : null
   };
@@ -890,6 +1037,18 @@ async function defaultQuoteRouteAmountOut(args: {
   return quoteRouteAmountOut(args);
 }
 
+async function defaultQuoteDexAmountOut(
+  chain: string,
+  tokenIn: string,
+  tokenOut: string,
+  amountOut: bigint
+): Promise<Array<{ quote: string }>> {
+  const { quoteDexAmountOut } = (await import("boltz-swaps/client")) as unknown as {
+    quoteDexAmountOut: (c: string, ti: string, to: string, a: bigint) => Promise<Array<{ quote: string }>>;
+  };
+  return quoteDexAmountOut(chain, tokenIn, tokenOut, amountOut);
+}
+
 async function defaultCreateRoute(args: {
   from: string;
   to: string;
@@ -908,12 +1067,12 @@ async function defaultCreateRoute(args: {
 async function defaultExecuteRoute(args: {
   createdSwap: unknown;
   plan: unknown;
-  preimage: Uint8Array;
+  preimage: string;
   signer: LocalEvmSigner;
   recipient: string;
 }): Promise<{ claimTransactionId: string }> {
   const { executeRoute } = (await import("boltz-swaps/routeExecute")) as unknown as {
-    executeRoute: (a: { createdSwap: unknown; plan: unknown; preimage: Uint8Array; signer: unknown; recipient: string }) => Promise<{ claimTransactionId: string }>;
+    executeRoute: (a: { createdSwap: unknown; plan: unknown; preimage: string; signer: unknown; recipient: string }) => Promise<{ claimTransactionId: string }>;
   };
   return executeRoute({ ...args, signer: args.signer.walletClient });
 }

@@ -25,6 +25,7 @@ import {
 import type { BoltzClient } from "../src/convert/boltz/client.js";
 import type { CreatedStablecoinRoute, LocalEvmSigner, LoadedViem } from "../src/convert/boltz/stablecoin.js";
 import { BoltzSwapStore, type StoredStablecoinSwap } from "../src/convert/boltz/store.js";
+import { RefundPendingError } from "../src/convert/boltz/refund.js";
 import type { ChainRefundDeps, ChainRefundRecord, RefundResult } from "../src/convert/boltz/refund.js";
 import type { QuotesSource } from "../src/guardrails/quotes.js";
 import type { GuardrailConfig } from "../src/guardrails/guardrails.js";
@@ -121,6 +122,32 @@ function stablecoinDeps(over: Partial<NonNullable<BoltzConvertDeps["stablecoin"]
     }
   };
   return { deps, evmKey };
+}
+
+/** A funded (locked_up) chain-swap record, ready for execute/resume. */
+function baseStablecoinRecord(over: Partial<StoredStablecoinSwap> = {}): StoredStablecoinSwap {
+  return {
+    type: "stablecoin",
+    swapId: "chain-swap-1",
+    asset: "USDC",
+    networkId: "arbitrum",
+    claimAddress: VALID_EVM,
+    lockupAddress: LOCKUP_ADDRESS,
+    lockAmountSats: 10_000,
+    serverPublicKey: "03" + "cc".repeat(32),
+    swapTree: { chainLeaf: {} },
+    blindingKey: "dd".repeat(32),
+    timeoutBlockHeight: 1_000_050,
+    refundPrivateKeyHex: "aa".repeat(32),
+    refundPublicKeyHex: "02" + "bb".repeat(32),
+    preimageHex: "ee".repeat(32),
+    evmPrivateKeyHex: "ff".repeat(32),
+    createdSwap: { id: "chain-swap-1" },
+    plan: { legs: [] },
+    state: "locked_up",
+    createdAt: 0,
+    ...over
+  };
 }
 
 function fakeClient(over: Partial<Record<keyof BoltzClient, unknown>> = {}): BoltzClient {
@@ -367,6 +394,205 @@ describe("toStablecoin — funded happy path: chain → DEX → bridge, sponsor 
   });
 });
 
+describe("toStablecoin — bridge-fee guard blocks an uneconomical BRIDGED amount BEFORE any lockup (fund-safety port)", () => {
+  const PAIRS = { chain: { "L-BTC": { TBTC: { limits: { minimal: 1000, maximal: 100_000_000 } } } } };
+  // Bridge fee resolves to 6000 sats (> the 5000-sat amount) → bridge_fee reject.
+  const feeQuoteWei = (6000n * 10_000_000_000n).toString();
+  const bridgedRouteQuote = () => async () => ({
+    receiveAmount: 950_000n,
+    sendAmount: 5000,
+    legs: [
+      { kind: "chain-swap", receiveAmount: 4_800n, fees: { percentage: 0.1, minerFees: { server: 10, userLockup: 20, userClaim: 30 } } },
+      { kind: "dex", chain: "arbitrum", tokenIn: "0xTBTC", tokenOut: "0xUSDT" },
+      { kind: "bridge", messagingFee: { amount: 1_000_000_000_000_000n } }
+    ]
+  });
+
+  it("THROWS SWAP_VALIDATION_FAILED and NEVER calls lockupLbtc (no L-BTC locked, nothing persisted)", async () => {
+    const { deps } = stablecoinDeps();
+    const prepare = deps.stablecoin!.prepare!;
+    // Drive the REAL estimate so bridgeFeeSats is derived from the route legs.
+    delete prepare.estimate;
+    prepare.getPairs = async () => PAIRS;
+    prepare.quoteRouteAmountOut = bridgedRouteQuote();
+    prepare.quoteDexAmountOut = async () => [{ quote: feeQuoteWei }];
+
+    dataDir = await mkdtemp(join(tmpdir(), "depix-sdk-stable-"));
+    const store = new BoltzSwapStore({ dataDir, passphrase: PASSPHRASE, saltB64: SALT_B64 });
+    const lockupLbtc = vi.fn(async () => ({ txid: "should-not-be-called" }));
+    const ctx: BoltzWalletContext = {
+      store,
+      logger: SILENT_LOGGER,
+      lockupLbtc,
+      getReceiveAddress: async () => LOCKUP_ADDRESS
+    };
+    const convert = new BoltzConvert(ctx, deps);
+
+    await expect(
+      convert.toStablecoin({ asset: "USDT", networkId: "tron", amountSats: 5000, claimAddress: VALID_TRON })
+    ).rejects.toSatisfy((e: unknown) => isDepixSdkError(e, "SWAP_VALIDATION_FAILED"));
+    // The guard fired pre-lockup: no L-BTC ever moved, no crash-safe record written.
+    expect(lockupLbtc).not.toHaveBeenCalled();
+    await expect(store.get("chain-swap-1")).resolves.toBeNull();
+  });
+});
+
+describe("resume() — a PERMANENT execute failure steers the record to refund; a TRANSIENT one re-executes (FIX A)", () => {
+  async function setupExecuteResume(executeImpl: () => Promise<{ claimTransactionId: string }>): Promise<{
+    convert: BoltzConvert;
+    store: BoltzSwapStore;
+    executeRoute: ReturnType<typeof vi.fn>;
+    refundChain: ReturnType<typeof vi.fn>;
+  }> {
+    dataDir = await mkdtemp(join(tmpdir(), "depix-sdk-stable-"));
+    const store = new BoltzSwapStore({ dataDir, passphrase: PASSPHRASE, saltB64: SALT_B64 });
+    await store.put(baseStablecoinRecord());
+
+    const executeRoute = vi.fn(executeImpl);
+    const buildSigner = vi.fn(async (): Promise<LocalEvmSigner> => ({
+      address: "0xSIGNER",
+      walletClient: {},
+      provider: {},
+      rdns: "gas-abstraction"
+    }));
+    const refundChain = vi.fn(async (): Promise<RefundResult> => ({ refundTxId: "refund-tx", cooperative: true }));
+
+    const deps: BoltzConvertDeps = {
+      client: fakeClient({
+        // The destination lockup confirms as soon as we subscribe → execution runs.
+        subscribeSwap: (_id: string, onStatus: (raw: string) => void) => {
+          queueMicrotask(() => onStatus("transaction.server.confirmed"));
+          return () => {};
+        },
+        // Bucket null → falls through to the state==="locked_up" execute branch.
+        getSwapStatus: async () => ({ status: "swap.created" })
+      }),
+      stablecoin: {
+        execute: { executeRoute, buildSigner, ensureConfig: async () => {} },
+        refundChain: refundChain as unknown as NonNullable<BoltzConvertDeps["stablecoin"]>["refundChain"],
+        // The L-BTC DID land (userLock present) — NOT a never-locked orphan, so the
+        // refund path sweeps it rather than dropping (isolates the FIX A behavior).
+        getChainSwapTransactions: async () => ({ userLock: { transaction: { id: "lock-tx" } } })
+      }
+    };
+    const ctx: BoltzWalletContext = {
+      store,
+      logger: SILENT_LOGGER,
+      lockupLbtc: async () => ({ txid: "x" }),
+      getReceiveAddress: async () => LOCKUP_ADDRESS
+    };
+    return { convert: new BoltzConvert(ctx, deps), store, executeRoute, refundChain };
+  }
+
+  it("a PERMANENT execute error sets outcome:refund, and the NEXT resume refunds WITHOUT re-executing", async () => {
+    const { convert, store, executeRoute, refundChain } = await setupExecuteResume(async () => {
+      throw new Error("amount too small to cover bridge messaging fee");
+    });
+
+    // First resume drives execution in the background; it fails permanently.
+    await convert.resume();
+    await vi.waitFor(async () => {
+      const r = (await store.get("chain-swap-1")) as StoredStablecoinSwap | null;
+      expect(r?.outcome).toBe("refund"); // steered to the refund path
+    });
+    expect(executeRoute).toHaveBeenCalledTimes(1);
+    expect(refundChain).not.toHaveBeenCalled(); // the first resume did not refund
+
+    // Second resume sees outcome:refund → straight to refundStablecoin, no re-execute.
+    const summary = await convert.resume();
+    expect(refundChain).toHaveBeenCalledTimes(1);
+    expect(executeRoute).toHaveBeenCalledTimes(1); // NOT re-executed
+    expect(summary.stablecoinRefunded).toBe(1);
+    expect(await store.get("chain-swap-1")).toBeNull();
+  });
+
+  it("a TRANSIENT execute error leaves the record untouched and RE-RUNS execute on the next resume", async () => {
+    const { convert, store, executeRoute, refundChain } = await setupExecuteResume(async () => {
+      throw new Error("fetch failed");
+    });
+
+    await convert.resume();
+    await vi.waitFor(() => expect(executeRoute).toHaveBeenCalledTimes(1));
+    // Transient → record untouched: no outcome, still locked_up, still present.
+    const r1 = (await store.get("chain-swap-1")) as StoredStablecoinSwap | null;
+    expect(r1).not.toBeNull();
+    expect(r1?.outcome).toBeUndefined();
+    expect(r1?.state).toBe("locked_up");
+
+    // The next resume RE-RUNS execute (retry) and still drives no refund.
+    await convert.resume();
+    await vi.waitFor(() => expect(executeRoute).toHaveBeenCalledTimes(2));
+    expect(refundChain).not.toHaveBeenCalled();
+    const r2 = (await store.get("chain-swap-1")) as StoredStablecoinSwap | null;
+    expect(r2?.outcome).toBeUndefined();
+  });
+});
+
+describe("resume() — a never-locked orphan chain record is DROPPED, not re-errored forever (FIX B)", () => {
+  const ORPHAN_ID = "chain-orphan-1";
+
+  async function seedOrphan(over: Partial<NonNullable<BoltzConvertDeps["stablecoin"]>>): Promise<{
+    convert: BoltzConvert;
+    store: BoltzSwapStore;
+    refundChain: ReturnType<typeof vi.fn>;
+  }> {
+    dataDir = await mkdtemp(join(tmpdir(), "depix-sdk-stable-"));
+    const store = new BoltzSwapStore({ dataDir, passphrase: PASSPHRASE, saltB64: SALT_B64 });
+    await store.put(baseStablecoinRecord({ swapId: ORPHAN_ID, state: "prepared" }));
+
+    const refundChain = vi.fn(async (): Promise<RefundResult> => ({ refundTxId: null, cooperative: true }));
+    const deps: BoltzConvertDeps = {
+      client: fakeClient({ getSwapStatus: async () => ({ status: "swap.expired" }) }), // bucket → refund
+      stablecoin: {
+        refundChain: refundChain as unknown as NonNullable<BoltzConvertDeps["stablecoin"]>["refundChain"],
+        ...over
+      }
+    };
+    const ctx: BoltzWalletContext = {
+      store,
+      logger: SILENT_LOGGER,
+      lockupLbtc: async () => ({ txid: "x" }),
+      getReceiveAddress: async () => LOCKUP_ADDRESS
+    };
+    return { convert: new BoltzConvert(ctx, deps), store, refundChain };
+  }
+
+  it("DROPS the record (removed++, not failed++) when Boltz confirms nothing was ever locked", async () => {
+    const { convert, store, refundChain } = await seedOrphan({
+      // DEFINITIVE: Boltz resolves with NO userLock → nothing on-chain to sweep.
+      getChainSwapTransactions: async () => ({})
+    });
+
+    const summary = await convert.resume();
+    expect(refundChain).not.toHaveBeenCalled(); // dropped BEFORE attempting a refund
+    expect(await store.get(ORPHAN_ID)).toBeNull(); // orphan gone
+    expect(summary.removed).toBe(1);
+    expect(summary.failed).toBe(0);
+    expect(summary.stablecoinRefunded).toBe(0);
+  });
+
+  it("KEEPS the record on an AMBIGUOUS never-locked probe (fund-safety fail-safe — never drop a maybe-funded record)", async () => {
+    const { convert, store } = await seedOrphan({
+      // The probe fails ambiguously (transient) → NOT a definitive "never locked".
+      getChainSwapTransactions: async () => {
+        throw new Error("boltz temporarily unavailable");
+      },
+      // The refund can't complete yet → RefundPendingError keeps the record.
+      refundChain: (async () => {
+        throw new RefundPendingError("cooperative failed and the timeout has not been reached yet");
+      }) as unknown as NonNullable<BoltzConvertDeps["stablecoin"]>["refundChain"]
+    });
+
+    const summary = await convert.resume();
+    const kept = (await store.get(ORPHAN_ID)) as StoredStablecoinSwap | null;
+    expect(kept).not.toBeNull(); // NOT dropped — it may still guard funds
+    expect(kept?.state).toBe("refund_pending");
+    expect(summary.removed).toBe(0);
+    expect(summary.failed).toBe(0);
+    expect(summary.stablecoinResumed).toBe(1); // refund_pending → retry next resume
+  });
+});
+
 describe("resume() — refunds an expired stablecoin (chain) lockup from boltz-swaps.json (§5.3)", () => {
   it("drives refundChainSwap for an expired chain lockup and drops the record", async () => {
     const refundSpy = vi.fn<(record: ChainRefundRecord, deps: ChainRefundDeps) => Promise<RefundResult>>(async () => ({
@@ -375,7 +601,12 @@ describe("resume() — refunds an expired stablecoin (chain) lockup from boltz-s
     }));
     const boltz: BoltzConvertDeps = {
       client: fakeClient({ getSwapStatus: async () => ({ status: "swap.expired" }) }),
-      stablecoin: { refundChain: refundSpy as unknown as NonNullable<BoltzConvertDeps["stablecoin"]>["refundChain"] }
+      stablecoin: {
+        refundChain: refundSpy as unknown as NonNullable<BoltzConvertDeps["stablecoin"]>["refundChain"],
+        // The lockup DID land on-chain (Boltz reports a userLock) → this is NOT a
+        // never-locked orphan, so refundStablecoin sweeps it instead of dropping it.
+        getChainSwapTransactions: async () => ({ userLock: { transaction: { id: "lock-tx" } } })
+      }
     };
     const w = await restore({ boltz });
 
