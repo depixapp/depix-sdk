@@ -29,7 +29,7 @@ import {
   cryptorefillsBrandUrl,
   extractLightningInvoice,
   filterBrands,
-  isLightningRailAvailable,
+  isLightningRailSuspended,
   mapOrderStatus,
   normalizeBrands,
   normalizeProducts,
@@ -267,19 +267,21 @@ export class GiftcardsNamespace {
       throw this.kycError(brand, countryCode);
     }
 
-    // Lightning-rail pre-check (parity with the frontend's isLightningRailAvailable
-    // gate, shop-ui.js): never create an order we can't pay over Lightning. The
+    // Lightning-rail pre-check (parity with the frontend's advisory gate,
+    // shop-ui.js): never create an order we can't pay over Lightning. The
     // payment_vias matrix is public + unauthenticated. Best-effort — if it can't
     // be fetched we fall through (createOrder is the backstop); a payment_vias
-    // outage must not block an otherwise-payable buy. We fail closed only on an
-    // EXPLICITLY unavailable/suspended USER_WALLET→BTC→Lightning rail.
+    // outage must not block an otherwise-payable buy. We fail closed ONLY on an
+    // EXPLICITLY suspended/unavailable USER_WALLET→BTC→Lightning rail; an empty
+    // or unrecognized matrix is treated as unknown (fall through), so a transient
+    // partial response can't hard-block every buy (isLightningRailSuspended).
     let paymentVias: unknown;
     try {
       paymentVias = await this.cryptorefills.getPaymentVias();
     } catch {
       paymentVias = undefined; // can't determine → don't block
     }
-    if (paymentVias !== undefined && !isLightningRailAvailable(paymentVias)) {
+    if (paymentVias !== undefined && isLightningRailSuspended(paymentVias)) {
       throw new ConversionError(
         "GIFTCARD_RAIL_UNAVAILABLE",
         "CryptoRefills' USER_WALLET → BTC → Lightning payment rail is currently unavailable or suspended — a " +

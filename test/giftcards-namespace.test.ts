@@ -382,6 +382,19 @@ describe("gift cards — Lightning-rail pre-check in buy() (§5.5 parity)", () =
     );
     expect(cr.createOrder).toHaveBeenCalledTimes(1);
   });
+
+  it("does NOT block on an empty/unrecognized payment_vias matrix (fail-open on ambiguity)", async () => {
+    // A transient partial response ([] or a shape the matcher doesn't recognize)
+    // must not hard-block an otherwise-payable buy — only an EXPLICIT suspension
+    // blocks. The empty wallet then fails at the lockup, proving we proceeded.
+    const cr = fakeCryptorefills({ paymentVias: [] });
+    const { wallet: w } = await restore({ cryptorefills: cr });
+    await expect(w.giftcards.buy(buyParams)).rejects.toSatisfy((e: unknown) =>
+      isDepixSdkError(e, "INSUFFICIENT_FUNDS")
+    );
+    expect(cr.getPaymentVias).toHaveBeenCalled();
+    expect(cr.createOrder).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("gift cards — product/denomination discovery (§5.5)", () => {
@@ -443,6 +456,16 @@ describe("gift cards — product/denomination discovery (§5.5)", () => {
       faceValue: 150,
       coin: "BTC"
     });
+  });
+
+  it("price() throws (not a junk quote) when the response has no usable coin_amount", async () => {
+    // Regression guard for the priceToSats==null branch: a malformed price
+    // response must surface an error, never a bogus priceSats (NaN/0).
+    const cr = fakeCryptorefills({ price: {} });
+    const { wallet: w } = await restore({ cryptorefills: cr });
+    await expect(w.giftcards.price({ brandName: "Amazon", faceValue: 150 })).rejects.toThrow(
+      /no usable coin_amount/i
+    );
   });
 
   it("listProducts + price are gated on giftcardEnabled", async () => {

@@ -381,7 +381,7 @@ export const toStablecoinInput = {
 } as const;
 
 export const buyGiftcardInput = {
-  brand_name: z.string().min(1).describe("Brand/family name from wallet_list… (e.g. \"Amazon\", \"Netflix\")."),
+  brand_name: z.string().min(1).describe("Brand/family name from wallet_list_giftcards (e.g. \"Amazon\", \"Netflix\")."),
   denomination: z
     .string()
     .min(1)

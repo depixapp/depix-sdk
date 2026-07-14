@@ -669,3 +669,36 @@ export function isLightningRailAvailable(paymentVias: unknown): boolean {
     (n) => (n as { name?: string })?.name === "Lightning" && (n as { is_suspended?: boolean })?.is_suspended !== true
   );
 }
+
+/**
+ * True ONLY when the payment_vias matrix POSITIVELY identifies the
+ * USER_WALLET → BTC → Lightning rail as unavailable/suspended (USER_WALLET
+ * `available:false`, BTC `is_suspended:true`, or the Lightning network
+ * `is_suspended:true`). An empty, absent, wrapped, or otherwise unrecognized
+ * payload is treated as UNKNOWN (returns false, do not block) — the buy flow
+ * fails open on ambiguity and lets createOrder be the backstop, matching the
+ * frontend's advisory treatment (shop-ui.js). This is the inverse-tolerant
+ * companion to isLightningRailAvailable: the latter returns false on any
+ * non-positive signal (used as an advisory boolean), while this returns true
+ * only on a positive suspension signal (used as a hard gate).
+ */
+export function isLightningRailSuspended(paymentVias: unknown): boolean {
+  if (!Array.isArray(paymentVias) || paymentVias.length === 0) return false; // unknown → don't block
+  const wallet = paymentVias.find((v) => (v as { name?: string })?.name === "USER_WALLET") as
+    | { available?: boolean; currencies?: unknown[] }
+    | undefined;
+  if (!wallet) return false; // rail not locatable → unknown
+  if (wallet.available === false) return true; // explicitly unavailable
+  if (!Array.isArray(wallet.currencies)) return false;
+  const btc = wallet.currencies.find((c) => (c as { name?: string })?.name === "BTC") as
+    | { is_suspended?: boolean; networks?: unknown[] }
+    | undefined;
+  if (!btc) return false;
+  if (btc.is_suspended === true) return true; // BTC currency suspended
+  if (!Array.isArray(btc.networks)) return false;
+  const ln = btc.networks.find((n) => (n as { name?: string })?.name === "Lightning") as
+    | { is_suspended?: boolean }
+    | undefined;
+  if (!ln) return false; // Lightning simply not listed → not a positive suspension signal
+  return ln.is_suspended === true; // block only when explicitly suspended
+}

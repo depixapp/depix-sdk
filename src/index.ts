@@ -352,6 +352,7 @@ export {
   requiresExternalCheckout,
   cryptorefillsBrandUrl,
   isLightningRailAvailable,
+  isLightningRailSuspended,
   satsFromBtcAmount,
   priceToSats,
   type CryptorefillsBrand,

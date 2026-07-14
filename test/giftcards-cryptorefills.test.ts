@@ -15,6 +15,7 @@ import {
   extractLightningInvoice,
   filterBrands,
   isLightningRailAvailable,
+  isLightningRailSuspended,
   mapOrderStatus,
   normalizeBrands,
   normalizeProduct,
@@ -241,6 +242,37 @@ describe("isLightningRailAvailable", () => {
       ])
     ).toBe(false);
     expect(isLightningRailAvailable(null)).toBe(false);
+  });
+});
+
+describe("isLightningRailSuspended", () => {
+  const suspendedLightning = [
+    { name: "USER_WALLET", currencies: [{ name: "BTC", networks: [{ name: "Lightning", is_suspended: true }] }] }
+  ];
+  const healthy = [
+    { name: "USER_WALLET", currencies: [{ name: "BTC", networks: [{ name: "Lightning", is_suspended: false }] }] }
+  ];
+
+  it("blocks ONLY on a positive suspension signal", () => {
+    expect(isLightningRailSuspended(suspendedLightning)).toBe(true);
+    expect(isLightningRailSuspended([{ name: "USER_WALLET", available: false }])).toBe(true);
+    expect(
+      isLightningRailSuspended([{ name: "USER_WALLET", currencies: [{ name: "BTC", is_suspended: true }] }])
+    ).toBe(true);
+    expect(isLightningRailSuspended(healthy)).toBe(false);
+  });
+
+  it("treats empty / absent / malformed / unrecognized payloads as UNKNOWN (does not block)", () => {
+    // The footgun this guards: a transient partial response must not hard-block
+    // every buy. Only an explicit suspension blocks; everything else falls through.
+    expect(isLightningRailSuspended([])).toBe(false);
+    expect(isLightningRailSuspended(null)).toBe(false);
+    expect(isLightningRailSuspended({ data: healthy })).toBe(false); // wrapped/renamed shape
+    expect(isLightningRailSuspended([{ name: "SOMETHING_ELSE" }])).toBe(false); // rail not locatable
+    // USER_WALLET present but Lightning simply not listed (not offered ≠ suspended)
+    expect(
+      isLightningRailSuspended([{ name: "USER_WALLET", currencies: [{ name: "BTC", networks: [{ name: "OnChain" }] }] }])
+    ).toBe(false);
   });
 });
 
