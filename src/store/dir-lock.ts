@@ -69,23 +69,27 @@ function bootId(): string {
 }
 
 /**
- * Whether two boot ids denote the same boot. Exact match for Linux UUIDs; for
- * the time-based fallback, within a 60s tolerance (absorbs derivation jitter
- * while staying far under any reboot gap). Unparseable/mismatched ⇒ treated as
- * DIFFERENT boot only when both are decisively parseable — otherwise we stay
- * conservative and never break a live lock. An UNKNOWN id (sandboxed runtime)
- * is never decisive, so it compares as SAME boot — the caller then relies on
- * PID liveness alone rather than stealing a possibly-live lock.
+ * Whether two boot ids denote the same boot. A DIFFERENT boot is only ever
+ * concluded from a decisive same-scheme comparison: two linux UUIDs that
+ * differ, or two time-derived epochs more than 60s apart (the tolerance
+ * absorbs uptime()/Date.now() jitter while staying far under any reboot gap).
+ * Everything else — an UNKNOWN id (sandboxed runtime), mixed forms (one
+ * process read /proc, the other fell back to the time derivation), or
+ * unparseable values — proves nothing about the boot, so it compares as SAME
+ * boot: the caller then relies on PID liveness alone rather than stealing a
+ * possibly-live lock.
  */
 function sameBoot(a: string, b: string): boolean {
   if (a === b) return true;
   if (a === BOOT_ID_UNKNOWN || b === BOOT_ID_UNKNOWN) return true;
-  const sa = a.startsWith("time:") ? Number.parseInt(a.slice(a.lastIndexOf(":") + 1), 10) : null;
-  const sb = b.startsWith("time:") ? Number.parseInt(b.slice(b.lastIndexOf(":") + 1), 10) : null;
-  if (sa !== null && sb !== null && Number.isFinite(sa) && Number.isFinite(sb)) {
-    return Math.abs(sa - sb) <= 60;
+  if (a.startsWith("linux:") && b.startsWith("linux:")) return false; // UUIDs differ — decisive
+  if (a.startsWith("time:") && b.startsWith("time:")) {
+    const sa = Number.parseInt(a.slice(a.lastIndexOf(":") + 1), 10);
+    const sb = Number.parseInt(b.slice(b.lastIndexOf(":") + 1), 10);
+    if (Number.isFinite(sa) && Number.isFinite(sb)) return Math.abs(sa - sb) <= 60;
   }
-  return false;
+  // Mixed or unparseable forms — no boot evidence either way; stay conservative.
+  return true;
 }
 
 async function tryCreate(lockPath: string): Promise<boolean> {

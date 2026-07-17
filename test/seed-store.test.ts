@@ -1,5 +1,6 @@
 // Seed store (spec §2.4): versioned encrypted wallet.json, durable writes,
 // 0700/0600 permissions, exclusive dataDir lock, selective wipe.
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -243,14 +244,18 @@ describe("dataDir exclusive lock (spec §2.4 — WALLET_DIR_LOCKED)", () => {
   });
 
   it("a live PID recorded under a DIFFERENT boot is stale (PID reuse hardening)", async () => {
-    // Our own (alive) PID, but the lock records a boot id that is not this boot:
-    // the original holder must be dead and the PID recycled — take the lock over
-    // instead of staying permanently WALLET_DIR_LOCKED on a false liveness match.
-    await writeFile(
-      join(dataDir, ".lock"),
-      `${process.pid}\n${Date.now()}\nlinux:00000000-0000-0000-0000-000000000000\n`,
-      { mode: 0o600 }
-    );
+    // Our own (alive) PID, but the lock records a boot id DECISIVELY different
+    // from this boot: the original holder must be dead and the PID recycled —
+    // take the lock over instead of staying permanently WALLET_DIR_LOCKED on a
+    // false liveness match. "Decisively" means same id scheme as the current
+    // host derives (mixed schemes never justify a steal — sameBoot()): a
+    // different uuid where /proc exposes one, a far-off boot epoch elsewhere.
+    const otherBoot = existsSync("/proc/sys/kernel/random/boot_id")
+      ? "linux:00000000-0000-0000-0000-000000000000"
+      : "time:some-host:1000";
+    await writeFile(join(dataDir, ".lock"), `${process.pid}\n${Date.now()}\n${otherBoot}\n`, {
+      mode: 0o600
+    });
     const lock = await acquireDirLock(dataDir);
     const content = await readFile(join(dataDir, ".lock"), "utf8");
     expect(content.split("\n")[0]).toBe(String(process.pid));

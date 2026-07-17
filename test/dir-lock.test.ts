@@ -10,12 +10,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-// os.uptime()/os.hostname() throw EPERM exactly like a sandboxed uv_* denial.
-// /proc is absent on macOS and the mock keeps readFileSync real, so the linux
-// branch also falls through on Linux CI? No — on Linux /proc exists, making the
-// fallback unreachable there; these assertions only exercise the crash path on
-// hosts without /proc. The conservative sameBoot behavior is asserted via lock
-// files, which is host-independent.
+// A fully sandboxed runtime denies EVERY boot-id source: the /proc read (absent
+// on macOS, blocked in hardened containers) AND the uv_uptime/uv_os_gethostname
+// syscalls. Mock all three so the fallback path runs identically on macOS and
+// Linux CI — on a real Linux host /proc succeeds and bootId() never reaches the
+// os calls (that branch is covered by dir-lock-linux-bootid.test.ts).
 const sandboxErr = () => {
   const err = new Error("uv_uptime returned EPERM (operation not permitted)") as NodeJS.ErrnoException;
   err.code = "ERR_SYSTEM_ERROR";
@@ -31,7 +30,20 @@ vi.mock("node:os", async (importOriginal) => {
   };
 });
 
-// Import AFTER the mock so dir-lock binds the throwing os fns.
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const readFileSync = ((path, ...rest) => {
+    if (path === "/proc/sys/kernel/random/boot_id") {
+      const err = new Error("EACCES: permission denied") as NodeJS.ErrnoException;
+      err.code = "EACCES";
+      throw err;
+    }
+    return (actual.readFileSync as (...a: unknown[]) => unknown)(path, ...rest);
+  }) as typeof actual.readFileSync;
+  return { ...actual, readFileSync };
+});
+
+// Import AFTER the mocks so dir-lock binds the throwing os/fs fns.
 const { acquireDirLock } = await import("../src/store/dir-lock.js");
 
 let dir: string;
