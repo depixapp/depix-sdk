@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "DePix API",
-    "version": "0.7.0",
+    "version": "0.14.0",
     "description": "Public API of DePix — PIX ⇄ DePix (Liquid) payments for merchants, integrators and AI agents.\n\n**Authentication**: Bearer API key (`sk_live_` production / `sk_test_` sandbox) created in the dashboard. Every operation lists its required key scope in `x-required-scope` (`merchant_read`, `merchant_write`, `wallet_read` or `wallet_write`); there is no scope hierarchy. The same endpoints also accept the first-party dashboard JWT.\n\n**Sandbox**: `sk_test_` keys exercise the full surface synthetically — deposits/withdrawals return `sandbox: true` payloads with nothing to pay and create no rows; checkouts/products are created in sandbox mode and completed via the simulate endpoints. Sandbox operations never fire deposit.*/withdraw.* webhooks.\n\n**Conventions**: all amounts are integer cents (BRL); every response carries an `X-Request-Id` header; errors use a dual envelope with a machine-readable `error.code` from a closed catalog; money-moving POSTs accept an optional `Idempotency-Key` header; 429/503 responses carry `Retry-After`. Status polling: 5–15 s intervals are recommended, stopping on the enum values marked `x-terminal: true`.\n\n**Scope of this document**: only the agent/integrator surface. JWT-only dashboard routes (auth/*, merchant create/get + rotate-webhook-secret, api-keys management, reports, uploads, webhook-logs, status, contact, …) are internal SPA contract and intentionally undocumented here. The merchant light-profile PATCH (`PATCH /api/merchants/me`, scope `merchant_write`) is the one merchant route that IS part of the agent surface.",
     "contact": {
       "name": "DePix",
@@ -44,6 +44,10 @@
     {
       "name": "public",
       "description": "Unauthenticated payer-side endpoints."
+    },
+    {
+      "name": "agents",
+      "description": "Agent self-onboarding (keypair-signed, F4). Registration requires an operator token (anti-farm anchor)."
     },
     {
       "name": "meta",
@@ -255,7 +259,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -515,7 +519,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -829,7 +833,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -1083,7 +1087,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -1665,7 +1669,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -1679,7 +1683,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -1840,7 +1844,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -1884,7 +1888,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -2096,7 +2100,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -2231,7 +2235,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -2275,7 +2279,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -2474,7 +2478,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -2728,7 +2732,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -2924,7 +2928,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -2938,7 +2942,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -3140,7 +3144,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -3184,7 +3188,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -3348,7 +3352,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -3392,7 +3396,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -3578,7 +3582,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -3652,7 +3656,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -3793,7 +3797,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -3837,7 +3841,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -3978,7 +3982,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -4022,7 +4026,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -4246,7 +4250,7 @@
                       },
                       "error": {
                         "code": "insufficient_scope",
-                        "message": "This API key does not have the scope required for this operation.",
+                        "message": "This session does not have the scope required for this operation.",
                         "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
                         "docs_url": "https://depixapp.com/docs/en/#errors",
                         "details": {
@@ -4290,7 +4294,7 @@
             }
           },
           "429": {
-            "description": "Rate limited. Even without an endpoint-specific limit, API-key calls are bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "description": "Rate limited. Beyond the endpoint's own limit when set (`rate_limited`), API-key calls are also bounded by the shared per-merchant budget (`merchant_rate_limited`, default 30 req/min across all endpoints) and by the key's own rate limit when configured (`rate_limited`). Retry after `retry_after` seconds (also in the Retry-After header).",
             "headers": {
               "X-Request-Id": {
                 "$ref": "#/components/headers/XRequestId"
@@ -4967,6 +4971,1550 @@
                         "details": {
                           "scope": "deposit"
                         }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/register": {
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "Agent self-onboarding (atomic)",
+        "description": "Creates an agent account + merchant + sandbox key + starter live key in one atomic transaction (F4 §2.4). Authentication is the §2.3 keypair scheme via signed headers (X-Agent-Public-Key / X-Agent-Timestamp / X-Agent-Nonce / X-Agent-Signature — Ed25519 over the canonical string `depix-agent-auth:v1\\napi.depixapp.com\\n{METHOD}\\n{PATH}\\n{timestamp}\\n{nonce}\\n{sha256hex(canonical-json-body)}` — the body hash is over the compact JSON serialization), NOT a Bearer key — plus the REQUIRED operator_token anti-farm anchor (§2.9). Key plaintexts and the webhook secret are returned ONLY here.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentRegisterRequest"
+              },
+              "examples": {
+                "register": {
+                  "value": {
+                    "name": "Acme Butler",
+                    "operator_token": "op_kJ9…",
+                    "operator_email": "ops@acme.com",
+                    "liquid_address": "lq1qqw508d6qejxtdg4y5r3zarvary0c5xw7k…",
+                    "default_callback_url": "https://hooks.acme.com/depix"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Agent created — store the key plaintexts and webhook secret now; they are never shown again.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRegisterResponse"
+                },
+                "examples": {
+                  "created": {
+                    "value": {
+                      "response": {
+                        "agent": {
+                          "username": "acme_butler",
+                          "public_key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                          "account_type": "agent"
+                        },
+                        "merchant": {
+                          "id": "mrc_x1",
+                          "merchant_slug": "acme_butler",
+                          "liquid_address": "lq1qq…",
+                          "webhook_secret": "whsec_…"
+                        },
+                        "keys": {
+                          "test": {
+                            "id": "k1",
+                            "key": "sk_test_…",
+                            "scopes": "merchant_read merchant_write wallet_read wallet_write"
+                          },
+                          "live_starter": {
+                            "id": "k2",
+                            "key": "sk_live_…",
+                            "scopes": "wallet_read wallet_write",
+                            "per_tx_limit_cents": 10000,
+                            "daily_limit_cents": 50000,
+                            "starter": true
+                          }
+                        },
+                        "graduation": {
+                          "required_settled_deposits": 5,
+                          "maturation_days": 15
+                        },
+                        "pacing": {
+                          "first_deposit_max_cents": 2000,
+                          "unverified_per_tx_max_cents": 10000,
+                          "unverified_lifetime_max_cents": 50000,
+                          "inter_deposit_delay_hours": 24,
+                          "payer_velocity": {
+                            "max_per_window": 2,
+                            "window_minutes": 30
+                          },
+                          "verified_per_tx_deposit_max_cents": 300000,
+                          "verified_per_tx_withdraw_max_cents": 600000
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid field (validation_error with details.field).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "bad_name": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "name deve ter entre 2 e 100 caracteres."
+                      },
+                      "error": {
+                        "code": "validation_error",
+                        "message": "Invalid request. Check the fields and try again.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "field": "name"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Signature chain failed (agent_invalid_signature / agent_signature_expired with details.server_time / agent_replay_detected) or unknown operator token (invalid_operator_token).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "expired": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Agent request timestamp is outside the allowed window. Re-sync your clock and retry."
+                      },
+                      "error": {
+                        "code": "agent_signature_expired",
+                        "message": "Agent request timestamp is outside the allowed window. Re-sync your clock and retry.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "server_time": 1784232266
+                        }
+                      }
+                    }
+                  },
+                  "bad_operator": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Operator token is missing, malformed or unknown. Connect an operator to obtain one."
+                      },
+                      "error": {
+                        "code": "invalid_operator_token",
+                        "message": "Operator token is missing, malformed or unknown. Connect an operator to obtain one.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Revoked operator token (operator_token_revoked) or a blocked public key (registration_blocked).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "revoked": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "This operator token has been revoked. Connect the operator again to obtain a new one."
+                      },
+                      "error": {
+                        "code": "operator_token_revoked",
+                        "message": "This operator token has been revoked. Connect the operator again to obtain a new one.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Public key already registered (agent_pubkey_exists) or explicit username in use (username_taken).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "pubkey": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "This public key is already registered to an agent account."
+                      },
+                      "error": {
+                        "code": "agent_pubkey_exists",
+                        "message": "This public key is already registered to an agent account.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited (per-IP, per-key or per-merchant window). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "rate_limited": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Muitas requisições. Tente novamente em 1 minuto."
+                      },
+                      "error": {
+                        "code": "rate_limited",
+                        "message": "Too many requests for this scope.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 37,
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "scope": "deposit"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Nonce anti-replay store unavailable — the signature guard fails CLOSED; retry.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "replay_store_down": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "A dependency is unavailable. Try again shortly."
+                      },
+                      "error": {
+                        "code": "service_unavailable",
+                        "message": "A dependency is unavailable. Try again shortly.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 5,
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/domain-tlds": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "TLD allowlist for domain verification",
+        "description": "Public discovery of the TLDs POST /api/agents/verify-domain accepts (F4 §2.9) — avoids trial-and-error 422s.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The current allowlist.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DomainTldsResponse"
+                },
+                "examples": {
+                  "list": {
+                    "value": {
+                      "allowed_tlds": [
+                        ".com",
+                        ".net",
+                        ".io",
+                        ".com.br"
+                      ]
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited (per-IP, per-key or per-merchant window). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "rate_limited": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Muitas requisições. Tente novamente em 1 minuto."
+                      },
+                      "error": {
+                        "code": "rate_limited",
+                        "message": "Too many requests for this scope.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 37,
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "scope": "deposit"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/verify-domain": {
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "Prove domain control (two-phase DNS TXT)",
+        "description": "Unlocks receiving from third parties (F4 §2.9). Authentication is the §2.3 agent keypair scheme (signed X-Agent-* headers), not a Bearer key. Phase 1 ({domain}) returns the TXT challenge to publish at _depix-verify.<domain>; phase 2 ({domain, confirm: true}) resolves it and records agents.verified_domain (the registrable eTLD+1). The challenge value is stable — re-fetch it any time.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VerifyDomainRequest"
+              },
+              "examples": {
+                "phase1": {
+                  "value": {
+                    "domain": "acme.com"
+                  }
+                },
+                "phase2": {
+                  "value": {
+                    "domain": "acme.com",
+                    "confirm": true
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Phase-1 challenge or phase-2 confirmation.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerifyDomainResponse"
+                },
+                "examples": {
+                  "challenge": {
+                    "value": {
+                      "record_name": "_depix-verify.acme.com",
+                      "record_value": "depix-verify=3f9a…"
+                    }
+                  },
+                  "confirmed": {
+                    "value": {
+                      "verified_domain": "acme.com"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Malformed domain.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "bad_domain": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "domain inválido."
+                      },
+                      "error": {
+                        "code": "validation_error",
+                        "message": "Invalid request. Check the fields and try again.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "field": "domain"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Signature chain failed or the public key is not a registered agent (agent_unknown_key).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "unknown": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Agent public key is not registered."
+                      },
+                      "error": {
+                        "code": "agent_unknown_key",
+                        "message": "Agent public key is not registered.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Account blocked.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "blocked": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Conta suspensa."
+                      },
+                      "error": {
+                        "code": "account_blocked",
+                        "message": "This account is suspended.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "TLD outside the allowlist (domain_tld_not_allowed with details.allowed_tlds), free-subdomain host (domain_free_host), or the TXT record is missing/mismatched (domain_txt_not_found).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "tld": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "This domain's TLD is not on the accepted list. See details.allowed_tlds or GET /api/agents/domain-tlds."
+                      },
+                      "error": {
+                        "code": "domain_tld_not_allowed",
+                        "message": "This domain's TLD is not on the accepted list. See details.allowed_tlds or GET /api/agents/domain-tlds.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  },
+                  "txt": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "The DNS TXT challenge was not found or does not match. Create the record and retry after propagation."
+                      },
+                      "error": {
+                        "code": "domain_txt_not_found",
+                        "message": "The DNS TXT challenge was not found or does not match. Create the record and retry after propagation.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited (per-IP, per-key or per-merchant window). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "rate_limited": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Muitas requisições. Tente novamente em 1 minuto."
+                      },
+                      "error": {
+                        "code": "rate_limited",
+                        "message": "Too many requests for this scope.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 37,
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "scope": "deposit"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Nonce anti-replay store unavailable — the signature guard fails CLOSED; retry.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "replay_store_down": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "A dependency is unavailable. Try again shortly."
+                      },
+                      "error": {
+                        "code": "service_unavailable",
+                        "message": "A dependency is unavailable. Try again shortly.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 5,
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/keys": {
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "Mint an agent API key",
+        "description": "Mints an API key for the agent's own merchant (F4 §3.3). Auth is the §2.3 keypair signature — the per-request proof-of-possession IS the step-up (no password). A LIVE key requires graduation (403 graduation_pending); a merchant_* scope requires a verified domain (403 domain_required); wallet_write keys get mandatory limits. Rejected when the merchant is suspended (403 account_suspended). Plaintext is returned ONCE.",
+        "security": [],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentKeyCreateRequest"
+              },
+              "examples": {
+                "live_wallet": {
+                  "value": {
+                    "live": true,
+                    "scopes": [
+                      "wallet_read",
+                      "wallet_write"
+                    ],
+                    "label": "prod payouts"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Key minted — store the plaintext now; it is never shown again.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentKeyCreateResponse"
+                },
+                "examples": {
+                  "created": {
+                    "value": {
+                      "response": {
+                        "id": "k_1",
+                        "key": "sk_live_…",
+                        "prefix": "sk_live_",
+                        "is_live": true,
+                        "scopes": "wallet_read wallet_write",
+                        "per_tx_limit_cents": 10000,
+                        "daily_limit_cents": 50000
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid scopes/label/limits, or the 5-key cap for this kind was reached.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "bad_scopes": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Campo \"scopes\" inválido."
+                      },
+                      "error": {
+                        "code": "validation_error",
+                        "message": "Invalid request. Check the fields and try again.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "field": "scopes"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Signature chain failed or unknown agent key.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "unknown": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Agent public key is not registered."
+                      },
+                      "error": {
+                        "code": "agent_unknown_key",
+                        "message": "Agent public key is not registered.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked (account_blocked), suspended (account_suspended), not graduated for a live key (graduation_pending), or missing a verified domain for a merchant_* scope (domain_required).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "graduation": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "This capability unlocks after the account graduates (settled deposits matured + clean gate)."
+                      },
+                      "error": {
+                        "code": "graduation_pending",
+                        "message": "This capability unlocks after the account graduates (settled deposits matured + clean gate).",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  },
+                  "domain": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Receiving from third parties requires a verified domain. Prove one via POST /api/agents/verify-domain."
+                      },
+                      "error": {
+                        "code": "domain_required",
+                        "message": "Receiving from third parties requires a verified domain. Prove one via POST /api/agents/verify-domain.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited (per-IP, per-key or per-merchant window). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "rate_limited": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Muitas requisições. Tente novamente em 1 minuto."
+                      },
+                      "error": {
+                        "code": "rate_limited",
+                        "message": "Too many requests for this scope.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 37,
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "scope": "deposit"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Nonce anti-replay store unavailable (fail-CLOSED) OR the global agent kill switch is on (agents_disabled, §3.5) — retry later.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "replay_store_down": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "A dependency is unavailable. Try again shortly."
+                      },
+                      "error": {
+                        "code": "service_unavailable",
+                        "message": "A dependency is unavailable. Try again shortly.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 5,
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  },
+                  "agents_frozen": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "The agent program is temporarily disabled. Try again later."
+                      },
+                      "error": {
+                        "code": "agents_disabled",
+                        "message": "The agent program is temporarily disabled. Try again later.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/keys/revoke": {
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "Revoke an agent API key",
+        "description": "Revokes one of the agent's own keys (F4 §3.3). Auth: §2.3 keypair. Rejected when the merchant is suspended.",
+        "security": [],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentKeyRevokeRequest"
+              },
+              "examples": {
+                "revoke": {
+                  "value": {
+                    "id": "k_1"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Revoked (idempotent).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentKeyRevokeResponse"
+                },
+                "examples": {
+                  "done": {
+                    "value": {
+                      "response": {
+                        "id": "k_1",
+                        "revoked": true
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Missing key id.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "bad": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "id da chave obrigatório."
+                      },
+                      "error": {
+                        "code": "validation_error",
+                        "message": "Invalid request. Check the fields and try again.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "field": "id"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Signature chain failed or unknown agent key.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "unknown": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Agent public key is not registered."
+                      },
+                      "error": {
+                        "code": "agent_unknown_key",
+                        "message": "Agent public key is not registered.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked or suspended.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "suspended": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "This agent account is currently paused."
+                      },
+                      "error": {
+                        "code": "account_suspended",
+                        "message": "This agent account is currently paused.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Key not found for this agent.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "nf": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Chave não encontrada."
+                      },
+                      "error": {
+                        "code": "not_found",
+                        "message": "Resource not found.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited (per-IP, per-key or per-merchant window). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "rate_limited": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Muitas requisições. Tente novamente em 1 minuto."
+                      },
+                      "error": {
+                        "code": "rate_limited",
+                        "message": "Too many requests for this scope.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 37,
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "scope": "deposit"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Nonce store unavailable (fail-CLOSED) OR the global agent kill switch is on (agents_disabled, §3.5).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "down": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "A dependency is unavailable. Try again shortly."
+                      },
+                      "error": {
+                        "code": "service_unavailable",
+                        "message": "A dependency is unavailable. Try again shortly.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 5,
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  },
+                  "agents_frozen": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "The agent program is temporarily disabled. Try again later."
+                      },
+                      "error": {
+                        "code": "agents_disabled",
+                        "message": "The agent program is temporarily disabled. Try again later.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/webhook-secret": {
+      "post": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "Rotate the agent merchant webhook secret",
+        "description": "Rotates merchants.webhook_secret and returns the new one ONCE (F4 §3.3, DX #2). The previous secret is invalidated immediately. Auth: §2.3 keypair; rejected when suspended.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "New secret — store it now; it is never shown again.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentWebhookSecretResponse"
+                },
+                "examples": {
+                  "rotated": {
+                    "value": {
+                      "response": {
+                        "webhook_secret": "whsec_…"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Signature chain failed or unknown agent key.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "unknown": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Agent public key is not registered."
+                      },
+                      "error": {
+                        "code": "agent_unknown_key",
+                        "message": "Agent public key is not registered.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked or suspended.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "suspended": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "This agent account is currently paused."
+                      },
+                      "error": {
+                        "code": "account_suspended",
+                        "message": "This agent account is currently paused.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited (per-IP, per-key or per-merchant window). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "rate_limited": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Muitas requisições. Tente novamente em 1 minuto."
+                      },
+                      "error": {
+                        "code": "rate_limited",
+                        "message": "Too many requests for this scope.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 37,
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "scope": "deposit"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Nonce store unavailable (fail-CLOSED) OR the global agent kill switch is on (agents_disabled, §3.5).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "down": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "A dependency is unavailable. Try again shortly."
+                      },
+                      "error": {
+                        "code": "service_unavailable",
+                        "message": "A dependency is unavailable. Try again shortly.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 5,
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  },
+                  "agents_frozen": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "The agent program is temporarily disabled. Try again later."
+                      },
+                      "error": {
+                        "code": "agents_disabled",
+                        "message": "The agent program is temporarily disabled. Try again later.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/agents/status": {
+      "get": {
+        "tags": [
+          "agents"
+        ],
+        "summary": "Agent account status + progress",
+        "description": "Minimal consumable progress (F4 §3.4): account_status, settled deposit count, graduation state, and the account's keys. Auth: §2.3 keypair. OPEN even when suspended (so the agent can read the reason). Never exposes maturation dates or gate specifics.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "Current status.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentStatusResponse"
+                },
+                "examples": {
+                  "active": {
+                    "value": {
+                      "response": {
+                        "account_status": "active",
+                        "settled_personal_deposits": 3,
+                        "graduated": false,
+                        "graduation": {
+                          "blocked_on": null
+                        },
+                        "keys": [
+                          {
+                            "id": "k_1",
+                            "prefix": "sk_live_",
+                            "is_live": true,
+                            "starter": true,
+                            "scopes": "wallet_read wallet_write",
+                            "revoked_at": null
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Signature chain failed or unknown agent key.",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "unknown": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Agent public key is not registered."
+                      },
+                      "error": {
+                        "code": "agent_unknown_key",
+                        "message": "Agent public key is not registered.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Blocked (a suspended account still gets 200 with account_status \"suspended\").",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "blocked": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Conta suspensa."
+                      },
+                      "error": {
+                        "code": "account_blocked",
+                        "message": "This account is suspended.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Rate limited (per-IP, per-key or per-merchant window). Retry after `retry_after` seconds (also in the Retry-After header).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "rate_limited": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "Muitas requisições. Tente novamente em 1 minuto."
+                      },
+                      "error": {
+                        "code": "rate_limited",
+                        "message": "Too many requests for this scope.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 37,
+                        "docs_url": "https://depixapp.com/docs/en/#errors",
+                        "details": {
+                          "scope": "deposit"
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Nonce store unavailable (fail-CLOSED) OR the global agent kill switch is on (agents_disabled, §3.5).",
+            "headers": {
+              "X-Request-Id": {
+                "$ref": "#/components/headers/XRequestId"
+              },
+              "Retry-After": {
+                "$ref": "#/components/headers/RetryAfter"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorEnvelope"
+                },
+                "examples": {
+                  "down": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "A dependency is unavailable. Try again shortly."
+                      },
+                      "error": {
+                        "code": "service_unavailable",
+                        "message": "A dependency is unavailable. Try again shortly.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "retry_after": 5,
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
+                      }
+                    }
+                  },
+                  "agents_frozen": {
+                    "value": {
+                      "response": {
+                        "errorMessage": "The agent program is temporarily disabled. Try again later."
+                      },
+                      "error": {
+                        "code": "agents_disabled",
+                        "message": "The agent program is temporarily disabled. Try again later.",
+                        "request_id": "gru1::iad1::v9x4k-1751476800000-abc123",
+                        "docs_url": "https://depixapp.com/docs/en/#errors"
                       }
                     }
                   }
@@ -6852,6 +8400,77 @@
           }
         }
       }
+    },
+    "agent.graduated": {
+      "post": {
+        "summary": "Agent account graduated to production",
+        "description": "Sent once when an agent account is promoted to full production (5 settled personal deposits, matured ≥15d, clean fraud gate). After this, the agent may mint a full `sk_live_` key. Delivered to the agent's `default_callback_url`. Outbound POST to the merchant's callback URL, signed with `X-DePix-Signature: t=<unix ts>,v1=<hex hmac-sha256>` where the HMAC is computed over `\"${t}.${raw body}\"` with the merchant webhook secret. Verify the signature and reject stale timestamps. Delivery is retried on failure: immediate → 1m → 10m → 1h → 4h → 12h (max 6 attempts); use `data.event_id` to deduplicate. Respond with any 2xx quickly to acknowledge.",
+        "parameters": [
+          {
+            "name": "X-DePix-Signature",
+            "in": "header",
+            "required": true,
+            "description": "`t=<unix ts>,v1=<hex hmac-sha256>` — HMAC-SHA256 over `\"${t}.${raw request body}\"` keyed with the merchant webhook secret.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-DePix-Event-Id",
+            "in": "header",
+            "required": true,
+            "description": "The delivery's stable event id (evt_*) — same value as `data.event_id`.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "description": "Envelope of the agent.graduated event.",
+                "required": [
+                  "event",
+                  "data"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "event": {
+                    "type": "string",
+                    "enum": [
+                      "agent.graduated"
+                    ],
+                    "description": "Event name — fixed for this webhook."
+                  },
+                  "data": {
+                    "$ref": "#/components/schemas/AgentGraduatedWebhookData"
+                  }
+                }
+              },
+              "examples": {
+                "agent_graduated": {
+                  "value": {
+                    "event": "agent.graduated",
+                    "data": {
+                      "username": "acme-butler",
+                      "graduated_at": "2026-07-16 12:34:56",
+                      "event_id": "evt_a9b8c7d6e5f4"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Any 2xx acknowledges the delivery; anything else (or a timeout) schedules a retry."
+          }
+        }
+      }
     }
   },
   "components": {
@@ -6967,8 +8586,23 @@
                   "unauthorized",
                   "invalid_api_key",
                   "invalid_token",
+                  "agent_invalid_signature",
+                  "agent_signature_expired",
+                  "agent_replay_detected",
+                  "agent_unknown_key",
+                  "invalid_operator_token",
+                  "invalid_password",
                   "insufficient_scope",
+                  "oauth_account_not_linked",
+                  "account_already_linked",
+                  "workos_identity_in_use",
                   "account_blocked",
+                  "account_suspended",
+                  "operator_token_revoked",
+                  "agent_account_no_password",
+                  "registration_blocked",
+                  "domain_required",
+                  "graduation_pending",
                   "merchant_required",
                   "live_access_required",
                   "whatsapp_verification_required",
@@ -6976,20 +8610,28 @@
                   "external_wallet_disabled",
                   "sandbox_only",
                   "validation_error",
+                  "password_required",
                   "tax_number_required",
                   "amount_out_of_range",
                   "account_limit_exceeded",
                   "key_limit_exceeded",
                   "not_found",
                   "conflict",
+                  "agent_pubkey_exists",
+                  "username_taken",
                   "idempotency_in_flight",
                   "idempotency_key_reuse",
+                  "domain_tld_not_allowed",
+                  "domain_free_host",
+                  "domain_txt_not_found",
                   "rate_limited",
                   "merchant_rate_limited",
                   "payer_velocity_limit",
                   "platform_shutdown",
                   "service_unavailable",
+                  "agents_disabled",
                   "upstream_error",
+                  "operator_oauth_failed",
                   "internal_error"
                 ]
               },
@@ -7011,9 +8653,13 @@
               },
               "details": {
                 "type": "object",
-                "description": "Optional machine-readable extras, normative per code: validation_error → {field}; insufficient_scope → {required_scope}; rate_limited → {scope}; amount_out_of_range → {min_cents, max_cents} (bounds of THIS endpoint/mode); account_limit_exceeded → {limit, limit_cents, used_cents?}; key_limit_exceeded → {limit, limit_cents, used_cents}; payer_velocity_limit → {window_minutes, max_per_window}.",
+                "description": "Optional machine-readable extras, normative per code: validation_error → {field}; insufficient_scope → {required_scope}; rate_limited → {scope}; amount_out_of_range → {min_cents, max_cents} (bounds of THIS endpoint/mode); account_limit_exceeded → {limit, limit_cents, used_cents?}; key_limit_exceeded → {limit, limit_cents, used_cents}; payer_velocity_limit → {window_minutes, max_per_window}; agent_signature_expired → {server_time}.",
                 "additionalProperties": false,
                 "properties": {
+                  "server_time": {
+                    "type": "integer",
+                    "description": "Server unix time in seconds (agent_signature_expired) — re-sync the client clock and retry."
+                  },
                   "field": {
                     "type": "string",
                     "description": "Offending request field (validation_error)."
@@ -9046,6 +10692,645 @@
           }
         }
       },
+      "AgentRegisterRequest": {
+        "type": "object",
+        "description": "Agent registration body. The request must ALSO carry the §2.3 signed headers (X-Agent-Public-Key, X-Agent-Timestamp, X-Agent-Nonce, X-Agent-Signature — Ed25519 over the canonical string; the public key becomes the account identity).",
+        "required": [
+          "name",
+          "operator_token",
+          "operator_email",
+          "liquid_address"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "name": {
+            "type": "string",
+            "description": "Display/business name (2–100 chars). Becomes the merchant business_name."
+          },
+          "username": {
+            "type": "string",
+            "description": "Optional handle (3–30 chars, [a-zA-Z0-9_]). Defaults to agent_<first 10 hex of the public key>. Taken → 409 username_taken."
+          },
+          "operator_token": {
+            "type": "string",
+            "description": "REQUIRED anti-farm anchor (§2.9): the op_… token minted when the human operator connected via OAuth or the GitHub PAT fast-path. One operator token clusters N agents."
+          },
+          "operator_email": {
+            "type": "string",
+            "description": "Operator notification email (format-validated only; never becomes the account login email)."
+          },
+          "liquid_address": {
+            "type": "string",
+            "description": "Static Liquid address for merchant receipts — produced by the agent's own wallet (the SDK derives it; not user-chosen). Immutable after registration."
+          },
+          "default_callback_url": {
+            "type": "string",
+            "description": "Optional HTTPS webhook endpoint for deposit.*/withdraw.*/checkout.* events."
+          },
+          "ref": {
+            "type": "string",
+            "description": "Optional referrer username for affiliate attribution."
+          }
+        }
+      },
+      "AgentRegisterResponse": {
+        "type": "object",
+        "description": "Agent onboarding result — the ONLY response that ever carries key plaintexts and the webhook secret.",
+        "required": [
+          "response"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "response": {
+            "type": "object",
+            "description": "Envelope (legacy contract shape).",
+            "required": [
+              "agent",
+              "merchant",
+              "keys",
+              "graduation",
+              "pacing"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "agent": {
+                "type": "object",
+                "description": "The created agent account.",
+                "required": [
+                  "username",
+                  "public_key",
+                  "account_type"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "username": {
+                    "type": "string",
+                    "description": "Account handle (also the merchant slug until graduation)."
+                  },
+                  "public_key": {
+                    "type": "string",
+                    "description": "The Ed25519 public key registered as the account identity (64 hex)."
+                  },
+                  "account_type": {
+                    "type": "string",
+                    "enum": [
+                      "agent"
+                    ],
+                    "description": "Always \"agent\" — server-set and immutable."
+                  }
+                }
+              },
+              "merchant": {
+                "type": "object",
+                "description": "The auto-created merchant profile.",
+                "required": [
+                  "id",
+                  "merchant_slug",
+                  "liquid_address",
+                  "webhook_secret"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "id": {
+                    "type": "string",
+                    "description": "Merchant id (mrc_…)."
+                  },
+                  "merchant_slug": {
+                    "type": "string",
+                    "description": "Public page slug — equals the username until graduation (anti-squat)."
+                  },
+                  "liquid_address": {
+                    "type": "string",
+                    "description": "The static receiving address from the request."
+                  },
+                  "webhook_secret": {
+                    "type": "string",
+                    "description": "ONE-TIME plaintext webhook signing secret (whsec_…). Rotatable later; never shown again."
+                  }
+                }
+              },
+              "keys": {
+                "type": "object",
+                "description": "Auto-issued API keys — plaintexts shown ONLY here.",
+                "required": [
+                  "test",
+                  "live_starter"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "test": {
+                    "type": "object",
+                    "description": "Sandbox key with the full default scopes.",
+                    "required": [
+                      "id",
+                      "key",
+                      "scopes"
+                    ],
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Key id."
+                      },
+                      "key": {
+                        "type": "string",
+                        "description": "sk_test_… plaintext (one-time)."
+                      },
+                      "scopes": {
+                        "type": "string",
+                        "description": "Space-separated scopes granted to the sandbox key."
+                      }
+                    }
+                  },
+                  "live_starter": {
+                    "type": "object",
+                    "description": "Pre-graduation production key: wallet-only scopes with mandatory low limits (§3.1).",
+                    "required": [
+                      "id",
+                      "key",
+                      "scopes",
+                      "per_tx_limit_cents",
+                      "daily_limit_cents",
+                      "starter"
+                    ],
+                    "additionalProperties": false,
+                    "properties": {
+                      "id": {
+                        "type": "string",
+                        "description": "Key id."
+                      },
+                      "key": {
+                        "type": "string",
+                        "description": "sk_live_… plaintext (one-time)."
+                      },
+                      "scopes": {
+                        "type": "string",
+                        "description": "Exactly \"wallet_read wallet_write\" — merchant scopes require graduation + a verified domain."
+                      },
+                      "per_tx_limit_cents": {
+                        "type": "integer",
+                        "description": "Mandatory per-transaction cap on this key."
+                      },
+                      "daily_limit_cents": {
+                        "type": "integer",
+                        "description": "Mandatory rolling daily cap on this key."
+                      },
+                      "starter": {
+                        "type": "boolean",
+                        "description": "Always true — marks the auto-issued starter key."
+                      }
+                    }
+                  }
+                }
+              },
+              "graduation": {
+                "type": "object",
+                "description": "What unlocks full production capability (§3.2).",
+                "required": [
+                  "required_settled_deposits",
+                  "maturation_days"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "required_settled_deposits": {
+                    "type": "integer",
+                    "description": "Settled personal deposits required to graduate."
+                  },
+                  "maturation_days": {
+                    "type": "integer",
+                    "description": "Days the 5th deposit must mature before graduation."
+                  }
+                }
+              },
+              "pacing": {
+                "type": "object",
+                "description": "Read-only account limits so the agent can pace itself without trial-and-error 4xx (DX #9).",
+                "required": [
+                  "first_deposit_max_cents",
+                  "unverified_per_tx_max_cents",
+                  "unverified_lifetime_max_cents",
+                  "inter_deposit_delay_hours",
+                  "payer_velocity",
+                  "verified_per_tx_deposit_max_cents",
+                  "verified_per_tx_withdraw_max_cents"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "first_deposit_max_cents": {
+                    "type": "integer",
+                    "description": "Cap on the account's first deposit."
+                  },
+                  "unverified_per_tx_max_cents": {
+                    "type": "integer",
+                    "description": "Per-deposit cap before verification."
+                  },
+                  "unverified_lifetime_max_cents": {
+                    "type": "integer",
+                    "description": "Cumulative deposit cap before verification."
+                  },
+                  "inter_deposit_delay_hours": {
+                    "type": "integer",
+                    "description": "Default settlement delay between deposits."
+                  },
+                  "payer_velocity": {
+                    "type": "object",
+                    "description": "Per-payer deposit velocity gate.",
+                    "required": [
+                      "max_per_window",
+                      "window_minutes"
+                    ],
+                    "additionalProperties": false,
+                    "properties": {
+                      "max_per_window": {
+                        "type": "integer",
+                        "description": "Deposits allowed per payer per window."
+                      },
+                      "window_minutes": {
+                        "type": "integer",
+                        "description": "Window length in minutes."
+                      }
+                    }
+                  },
+                  "verified_per_tx_deposit_max_cents": {
+                    "type": "integer",
+                    "description": "Per-deposit cap after verification."
+                  },
+                  "verified_per_tx_withdraw_max_cents": {
+                    "type": "integer",
+                    "description": "Per-withdrawal cap after verification."
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "DomainTldsResponse": {
+        "type": "object",
+        "description": "The current TLD allowlist for domain verification (F4 §2.9) — discover what verify-domain accepts without trial-and-error.",
+        "required": [
+          "allowed_tlds"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "allowed_tlds": {
+            "type": "array",
+            "description": "Accepted TLD suffixes (leading dot), e.g. \".com\", \".com.br\". A domain whose suffix is not listed is rejected with domain_tld_not_allowed.",
+            "items": {
+              "type": "string",
+              "description": "A TLD suffix with a leading dot."
+            }
+          }
+        }
+      },
+      "VerifyDomainRequest": {
+        "type": "object",
+        "description": "Two-phase domain proof (F4 §2.9). Phase 1 ({domain}) returns the DNS TXT challenge; phase 2 ({domain, confirm: true}) resolves the TXT and records the verified domain.",
+        "required": [
+          "domain"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "domain": {
+            "type": "string",
+            "description": "The domain to verify — normalized to its registrable eTLD+1 (\"shop.acme.com.br\" → \"acme.com.br\"). URL-ish input tolerated."
+          },
+          "confirm": {
+            "type": "boolean",
+            "description": "Set true for phase 2: resolve the TXT record and confirm. Omit/false for phase 1: obtain the challenge."
+          }
+        }
+      },
+      "VerifyDomainResponse": {
+        "description": "Phase 1 returns the challenge to publish; phase 2 returns the verified domain.",
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Phase-1 challenge: create this DNS TXT record, then call again with confirm: true.",
+            "required": [
+              "record_name",
+              "record_value"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "record_name": {
+                "type": "string",
+                "description": "TXT record name to create (_depix-verify.<domain>)."
+              },
+              "record_value": {
+                "type": "string",
+                "description": "Exact TXT record value (depix-verify=<token>). Stable across calls — safe to re-fetch."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Phase-2 confirmation: the domain is now verified for this agent.",
+            "required": [
+              "verified_domain"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "verified_domain": {
+                "type": "string",
+                "description": "The registrable domain (eTLD+1) recorded on the agent."
+              }
+            }
+          }
+        ]
+      },
+      "AgentKeyCreateRequest": {
+        "type": "object",
+        "description": "Mint an API key for the agent's own merchant. Authenticated by the §2.3 keypair signature (no password step-up — the per-request signature IS the step-up).",
+        "additionalProperties": false,
+        "properties": {
+          "live": {
+            "type": "boolean",
+            "description": "true → production sk_live_ (requires graduation); false/omitted → sandbox sk_test_."
+          },
+          "scopes": {
+            "type": "array",
+            "description": "Any subset of the scope taxonomy. merchant_* scopes require a verified domain (§2.9). Defaults to merchant_read+merchant_write.",
+            "items": {
+              "type": "string",
+              "enum": [
+                "merchant_read",
+                "merchant_write",
+                "wallet_read",
+                "wallet_write"
+              ],
+              "description": "A scope from the taxonomy."
+            }
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human label (≤100 chars)."
+          },
+          "per_tx_limit_cents": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Optional per-transaction cap. wallet_write keys get a mandatory default (10000) if unset."
+          },
+          "daily_limit_cents": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "description": "Optional rolling daily cap. wallet_write keys get a mandatory default (50000) if unset."
+          }
+        }
+      },
+      "AgentKeyCreateResponse": {
+        "type": "object",
+        "description": "The minted key — plaintext returned ONCE.",
+        "required": [
+          "response"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "response": {
+            "type": "object",
+            "description": "Envelope.",
+            "required": [
+              "id",
+              "key",
+              "prefix",
+              "is_live",
+              "scopes",
+              "per_tx_limit_cents",
+              "daily_limit_cents"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "Key id."
+              },
+              "key": {
+                "type": "string",
+                "description": "The sk_live_/sk_test_ plaintext (one-time)."
+              },
+              "prefix": {
+                "type": "string",
+                "enum": [
+                  "sk_live_",
+                  "sk_test_"
+                ],
+                "description": "Key prefix."
+              },
+              "is_live": {
+                "type": "boolean",
+                "description": "true for a production key."
+              },
+              "scopes": {
+                "type": "string",
+                "description": "Space-separated granted scopes."
+              },
+              "per_tx_limit_cents": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Per-transaction cap (null if unbounded and not wallet_write)."
+              },
+              "daily_limit_cents": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "description": "Rolling daily cap (null if unbounded and not wallet_write)."
+              }
+            }
+          }
+        }
+      },
+      "AgentKeyRevokeRequest": {
+        "type": "object",
+        "description": "Revoke one of the agent's own keys.",
+        "required": [
+          "id"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string",
+            "description": "Id of the key to revoke."
+          }
+        }
+      },
+      "AgentKeyRevokeResponse": {
+        "type": "object",
+        "description": "Revocation result.",
+        "required": [
+          "response"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "response": {
+            "type": "object",
+            "description": "Envelope.",
+            "required": [
+              "id",
+              "revoked"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string",
+                "description": "The revoked key id."
+              },
+              "revoked": {
+                "type": "boolean",
+                "description": "Always true."
+              }
+            }
+          }
+        }
+      },
+      "AgentWebhookSecretResponse": {
+        "type": "object",
+        "description": "Rotated webhook secret — returned ONCE; the previous secret is invalidated immediately.",
+        "required": [
+          "response"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "response": {
+            "type": "object",
+            "description": "Envelope.",
+            "required": [
+              "webhook_secret"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "webhook_secret": {
+                "type": "string",
+                "description": "The new whsec_… secret (one-time)."
+              }
+            }
+          }
+        }
+      },
+      "AgentStatusResponse": {
+        "type": "object",
+        "description": "Minimal consumable progress (§3.4). Never exposes maturation dates or gate details.",
+        "required": [
+          "response"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "response": {
+            "type": "object",
+            "description": "Envelope.",
+            "required": [
+              "account_status",
+              "settled_personal_deposits",
+              "graduated",
+              "graduation",
+              "keys"
+            ],
+            "additionalProperties": false,
+            "properties": {
+              "account_status": {
+                "type": "string",
+                "enum": [
+                  "active",
+                  "suspended"
+                ],
+                "description": "Account state — \"suspended\" when the merchant is paused (kill switch §3.5)."
+              },
+              "reason": {
+                "type": "string",
+                "description": "Human-readable suspension reason — present only when account_status is \"suspended\"."
+              },
+              "settled_personal_deposits": {
+                "type": "integer",
+                "description": "Count of settled personal deposits (progress toward graduation)."
+              },
+              "graduated": {
+                "type": "boolean",
+                "description": "true once the account has graduated to full production."
+              },
+              "graduation": {
+                "type": "object",
+                "description": "Coarse graduation state — never the hidden maturation window or gate specifics.",
+                "required": [
+                  "blocked_on"
+                ],
+                "additionalProperties": false,
+                "properties": {
+                  "blocked_on": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "enum": [
+                      "gate_review",
+                      null
+                    ],
+                    "description": "\"gate_review\" when the deposit count is met but graduation hasn't fired; otherwise null."
+                  }
+                }
+              },
+              "keys": {
+                "type": "array",
+                "description": "The account's API keys (no plaintext — that is shown only at creation).",
+                "items": {
+                  "type": "object",
+                  "description": "One API key.",
+                  "required": [
+                    "id",
+                    "prefix",
+                    "is_live",
+                    "starter",
+                    "scopes",
+                    "revoked_at"
+                  ],
+                  "additionalProperties": false,
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "Key id."
+                    },
+                    "prefix": {
+                      "type": "string",
+                      "enum": [
+                        "sk_live_",
+                        "sk_test_"
+                      ],
+                      "description": "Key prefix."
+                    },
+                    "is_live": {
+                      "type": "boolean",
+                      "description": "true for a production key."
+                    },
+                    "starter": {
+                      "type": "boolean",
+                      "description": "true for the auto-issued starter key (§3.1)."
+                    },
+                    "scopes": {
+                      "type": "string",
+                      "description": "Space-separated scopes."
+                    },
+                    "revoked_at": {
+                      "type": [
+                        "string",
+                        "null"
+                      ],
+                      "description": "Revocation timestamp, or null if active."
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
       "DepositWebhookData": {
         "type": "object",
         "description": "Deposit event payload — same EN shape as GET /api/deposits/{id}, plus the delivery id.",
@@ -9201,6 +11486,30 @@
           "blockchain_tx_id": {
             "type": "string",
             "description": "Liquid txid of the settlement — present on checkout.completed when known."
+          },
+          "event_id": {
+            "type": "string",
+            "description": "Stable delivery id (evt_*) — identical across retries of the same event; use it for deduplication. Also sent as the X-DePix-Event-Id header."
+          }
+        }
+      },
+      "AgentGraduatedWebhookData": {
+        "type": "object",
+        "description": "agent.graduated event payload. Emitted once, when an agent account is promoted to full production (5 settled deposits, matured, clean fraud gate). NEVER contains a key — a webhook is not a secret channel.",
+        "required": [
+          "username",
+          "graduated_at",
+          "event_id"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "username": {
+            "type": "string",
+            "description": "The agent account's username (also its public affiliate code)."
+          },
+          "graduated_at": {
+            "type": "string",
+            "description": "Graduation timestamp (UTC, 'YYYY-MM-DD HH:MM:SS')."
           },
           "event_id": {
             "type": "string",
