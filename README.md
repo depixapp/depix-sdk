@@ -88,6 +88,73 @@ const restored = await DepixWallet.restore({
 
 ---
 
+## Quickstart 1b — Agent self-onboarding (register the account, get keys)
+
+An agent can open its OWN DePix account — no human filling a form. It proves
+identity with an Ed25519 keypair (persisted encrypted in `dataDir`), and the
+account is anchored to a human **operator**: the operator connects once via
+OAuth (or a GitHub PAT) in the DePix dashboard and hands the agent an `op_…`
+**operator token**. One operator can onboard many agents.
+
+The receive `liquid_address` is taken from the agent's wallet (Quickstart 1) and
+**fixed at registration** — the agent cannot change it later.
+
+```ts
+import { DepixWallet, DepixAgent } from "@depixapp/sdk";
+
+// 1) Wallet (Quickstart 1) → its receive address is the merchant payout address.
+const { wallet } = await DepixWallet.create({ passphrase: process.env.DEPIX_WALLET_PASSPHRASE, mnemonicSecured: true });
+await wallet.confirmBackup();
+const liquidAddress = await wallet.getReceiveAddress();
+
+// 2) Create the agent identity keypair (encrypted in DEPIX_AGENT_DIR).
+const agent = await DepixAgent.create({ passphrase: process.env.DEPIX_AGENT_PASSPHRASE });
+
+// 3) Register. `operatorToken` comes from the human operator's one-time connect.
+const { agent: me, keys, merchant } = await agent.register({
+  name: "Acme Butler",
+  operatorToken: process.env.DEPIX_OPERATOR_TOKEN!, // op_…
+  operatorEmail: "ops@acme.com",
+  liquidAddress
+});
+
+// Returned ONCE — persist them now:
+//   keys.test.key        → sk_test_… (sandbox, immediate)
+//   keys.liveStarter.key → sk_live_… wallet-only starter key (pre-graduation)
+//   merchant.webhookSecret → verify inbound webhooks
+console.log(me.username, keys.liveStarter.key);
+```
+
+Progress to full production is automatic: make real personal deposits with the
+starter key; once matured, the account **graduates** and you can mint a full
+`sk_live_` key.
+
+```ts
+const status = await agent.status();
+// { accountStatus, settledPersonalDeposits, graduated, graduationBlockedOn, keys }
+
+if (status.graduated) {
+  const key = await agent.createKey({ live: true, scopes: ["wallet_write"] });
+  // key.key → full sk_live_… (returned once)
+}
+
+// Key lifecycle + webhook secret rotation, all signed by the identity keypair:
+await agent.revokeKey(oldKeyId);
+const { webhookSecret } = await agent.rotateWebhookSecret();
+```
+
+Errors branch on `err.code` (see `AgentError` for the catalog): before
+graduation a live key throws `graduation_pending`; a `merchant_*` scope without a
+verified domain throws `domain_required`; an expired signature throws
+`agent_signature_expired` (re-sign — clocks drifted). `DepixAgent.open({ ... })`
+reloads the identity in later sessions.
+
+`create()` / `open()` read `DEPIX_AGENT_DIR` (default `~/.depix-agent`),
+`DEPIX_AGENT_PASSPHRASE` (falls back to `DEPIX_WALLET_PASSPHRASE`) and
+`DEPIX_API_BASE` when the options are omitted.
+
+---
+
 ## Quickstart 2 — An agent that pays a Pix (deposit → owner pays QR → withdraw)
 
 The agent has no bank account. It receives DePix (its owner pays a Pix QR into
@@ -250,6 +317,8 @@ injected model.
 | `DEPIX_API_KEY` | **Required** for deposit/withdraw/status | — | `sk_test_…` (sandbox) or `sk_live_…` (production). |
 | `DEPIX_WALLET_DIR` | Optional | `~/.depix-wallet` | Wallet data dir (encrypted seed, sync state, pending/guardrail files). One process per dir (`WALLET_DIR_LOCKED`). |
 | `DEPIX_API_BASE` | Optional | `https://api.depixapp.com` | Canonical API base. |
+| `DEPIX_AGENT_PASSPHRASE` | Required for `DepixAgent` | `DEPIX_WALLET_PASSPHRASE` | Unlocks the encrypted agent **identity** key (Ed25519). **≥ 12 chars**. Falls back to the wallet passphrase. |
+| `DEPIX_AGENT_DIR` | Optional | `~/.depix-agent` | Where `DepixAgent` stores its encrypted identity key. |
 | `DEPIX_GUARDRAIL_PER_TX_BRL_CENTS` | Optional | `10000` (R$ 100) | Per-transaction ceiling, in BRL cents. `0`/negative is a config error; to disable, set `Number.MAX_SAFE_INTEGER` explicitly. |
 | `DEPIX_GUARDRAIL_DAILY_BRL_CENTS` | Optional | `50000` (R$ 500) | Rolling-24h ceiling, in BRL cents. |
 | `DEPIX_GUARDRAIL_ALLOWLIST` | Optional | off | JSON allowlist (`liquidAddresses`, `pixKeys`, per-rail opt-ins…). When on, any non-allow-listed / non-representable destination is fail-closed. |

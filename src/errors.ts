@@ -98,6 +98,37 @@ export class MerchantError extends DepixSdkError {
 }
 
 /**
+ * Agent self-onboarding errors (F4). Raised CLIENT-side by DepixAgent before or
+ * around a signed request. Codes:
+ *   agent_not_initialized    — DepixAgent.open() found no identity in dataDir;
+ *                              call DepixAgent.create() (or register) first.
+ *   agent_already_initialized — DepixAgent.create() refused to overwrite an
+ *                              existing identity (pass { force: true } to replace).
+ *   agent_store_corrupted    — the on-disk identity file is malformed.
+ *   agent_key_unreadable     — the identity key could not be decrypted (wrong
+ *                              passphrase or a tampered file — GCM can't tell which).
+ *
+ * SERVER-side rejections of a signed request arrive as `DepixApiError` (branch on
+ * `err.code`), NOT as AgentError. The agent-surface codes to expect:
+ *   agent_invalid_signature   — signature/headers malformed or wrong key.
+ *   agent_signature_expired   — the timestamp is outside the ±window; re-sign
+ *                               (details.server_time gives the server clock to resync).
+ *   agent_replay_detected     — the nonce was already used; every request must use a fresh one.
+ *   invalid_operator_token / operator_token_revoked — the register operator token (§2.9).
+ *   registration_blocked / agent_pubkey_exists / username_taken — register conflicts.
+ *   graduation_pending        — a live key was requested before the account graduated (§3.1).
+ *   domain_required           — a merchant_* scope was requested without a verified domain (§2.9).
+ *   agents_disabled           — the agent program kill switch is on (503).
+ *   field_immutable           — an attempt to change a register-fixed field (e.g. liquid_address).
+ */
+export class AgentError extends DepixSdkError {
+  constructor(code: string, message?: string, options?: DepixSdkErrorOptions) {
+    super(code, message, options);
+    this.name = "AgentError";
+  }
+}
+
+/**
  * Structured `details` block of a DePix API error envelope (spec §7.1).
  * Every field is optional — provider (Eulen) rejections arrive as
  * `validation_error` with NO `details` at all (only `legacyErrorMessage`),
