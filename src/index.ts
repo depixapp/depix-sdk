@@ -45,6 +45,31 @@ export {
 } from "./wallet.js";
 
 export {
+  DepixAgent,
+  type AgentCreateOptions,
+  type AgentOpenOptions,
+  type AgentStatus,
+  type CreateKeyInput,
+  type CreatedKey,
+  type IssuedKey,
+  type RegisterInput,
+  type RegisterResult,
+  type StarterKey
+} from "./agent.js";
+
+export {
+  buildCanonicalString,
+  generateAgentKeypair,
+  keypairFromSecret,
+  signAgentRequest,
+  verifyAgentSignature,
+  AGENT_AUTH_SCHEME,
+  DEFAULT_AGENT_AUTH_AUDIENCE,
+  type AgentKeypair
+} from "./agent/keypair.js";
+
+export {
+  AgentError,
   BoltzApiError,
   ConversionError,
   CryptorefillsApiError,

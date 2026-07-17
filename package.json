@@ -1,6 +1,6 @@
 {
   "name": "@depixapp/sdk",
-  "version": "1.0.7",
+  "version": "1.1.0",
   "description": "Non-custodial Liquid wallet SDK for AI agents — headless Node, local signing, Pix on/off-ramp.",
   "license": "AGPL-3.0-only",
   "type": "module",
