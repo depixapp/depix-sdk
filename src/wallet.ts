@@ -1167,6 +1167,35 @@ export class DepixWallet {
     }
   }
 
+  /**
+   * Free a wasm Wollet only after abandoned (timed-out) scans settled — a
+   * zombie scan still borrows the wollet inside wasm (Promise.race cannot
+   * cancel it), and freeing under it is the "null pointer passed to rust"
+   * crash class. The drain is BOUNDED; on timeout the wollet is deliberately
+   * LEAKED instead — a bounded leak beats a crash or an unbounded hang
+   * holding the dataDir lock.
+   */
+  private async freeWolletSafely(wollet: Wollet, context: string): Promise<void> {
+    let drained = false;
+    try {
+      drained = await this.syncEngine.drainAbandonedScans();
+    } catch {
+      // drain never rejects by contract; stay fail-safe anyway
+    }
+    if (!drained) {
+      this.logger.warn(
+        "abandoned wasm scan still running — leaking wollet instead of freeing under it",
+        { context }
+      );
+      return;
+    }
+    try {
+      wollet.free();
+    } catch {
+      // best effort
+    }
+  }
+
   /** Release the dataDir lock and free wasm resources. */
   async close(): Promise<void> {
     // Cancel any in-flight Boltz watches (status WebSocket + reconnect timer)
@@ -1179,15 +1208,7 @@ export class DepixWallet {
       // best effort
     }
     if (this.wollet) {
-      // A timed-out inline scan may still be running inside wasm and borrowing
-      // this wollet (Promise.race cannot cancel it) — freeing under it is the
-      // "null pointer passed to rust" crash class. Wait for zombies to settle.
-      await this.syncEngine.drainAbandonedScans().catch(() => {});
-      try {
-        this.wollet.free();
-      } catch {
-        // best effort
-      }
+      await this.freeWolletSafely(this.wollet, "close");
       this.wollet = null;
       this.wolletReady = false;
     }
@@ -1266,6 +1287,14 @@ export class DepixWallet {
       const next = this.file.nextReceiveIndex ?? 0;
       const idx = Math.max(lastUnused, next);
       await this.seedStore.setNextReceiveIndex(idx + 1);
+      // Raise the degraded-scan coverage floor over this handed-out address:
+      // nextReceiveIndex runs AHEAD of lwk's last-used view, so a payment to
+      // it during a waterfalls outage would otherwise be invisible to the
+      // truncated vanilla fallback (gap_limit=20). Best-effort — issuing the
+      // address must never fail on a meta write. The explicit-index path
+      // above deliberately does NOT bump: a typoed huge index would poison
+      // every degraded scan up to the clamp.
+      await this.updateStore.bumpScanHint(idx + 1).catch(() => {});
       await this.refreshFile();
       return wollet.address(idx).address().toString();
     });
@@ -1371,26 +1400,14 @@ export class DepixWallet {
         result = await this.syncEngine.rescan(fresh, () => this.updateStore.clearForRescan());
       } catch (err) {
         // A timed-out attempt may leave a zombie wasm scan still borrowing
-        // `fresh` — freeing under it is the "null pointer passed to rust"
-        // crash class. Wait for it to settle first.
-        await this.syncEngine.drainAbandonedScans().catch(() => {});
-        try {
-          fresh.free();
-        } catch {
-          // best effort
-        }
+        // `fresh` — free it only once the zombies settled (bounded).
+        await this.freeWolletSafely(fresh, "rescan-failed");
         throw err;
       }
       const stale = this.wollet;
       this.wollet = fresh;
       this.wolletReady = true;
-      if (stale) {
-        try {
-          stale.free();
-        } catch {
-          // best effort
-        }
-      }
+      if (stale) await this.freeWolletSafely(stale, "rescan-swap");
       return result;
     });
   }

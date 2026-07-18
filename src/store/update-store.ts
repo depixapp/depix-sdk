@@ -26,11 +26,13 @@ export interface SyncMeta {
   lastPersistErrorName?: string | null;
   /**
    * Coverage floor for degraded scans (frontend cba130f parity): the deepest
-   * next-unused external derivation index a successful scan ever proved.
-   * Monotone (bumpScanHint), clamped to SCAN_HINT_MAX on write AND read, and
-   * it survives a deep-rescan cache wipe (clearForRescan). Degraded vanilla
-   * scans replay it via fullScanToIndex so a gap_limit=20 walk can never miss
-   * history below proven coverage.
+   * external derivation index a successful scan ever proved used — or that
+   * the SDK handed to a payer via getReceiveAddress (nextReceiveIndex runs
+   * ahead of lwk's used view). Monotone (bumpScanHint), clamped to
+   * SCAN_HINT_MAX on write AND read, and it survives a deep-rescan cache
+   * wipe (clearForRescan). Degraded vanilla scans replay it via
+   * fullScanToIndex so a gap_limit=20 walk can never miss history below
+   * this depth.
    */
   scanToIndexHint?: number;
 }

@@ -245,11 +245,31 @@ export class SyncEngine {
     return scan;
   }
 
-  /** Wait for timed-out-but-still-running wasm scans to settle (see abandonedScans). */
-  async drainAbandonedScans(): Promise<void> {
+  /**
+   * Wait for timed-out-but-still-running wasm scans to settle (see
+   * abandonedScans). BOUNDED: a zombie whose network request never settles
+   * must not hang teardown forever (wallet.close() releases the dataDir lock
+   * after this — an unbounded wait would strand it). Returns true when fully
+   * drained; false on timeout, in which case the wollet the zombies borrow
+   * must NOT be freed (leak it — a bounded leak beats a rust abort).
+   */
+  async drainAbandonedScans(maxWaitMs: number = this.coldStartTimeoutMs): Promise<boolean> {
+    const deadline = Date.now() + maxWaitMs;
     while (this.abandonedScans.size > 0) {
-      await Promise.allSettled([...this.abandonedScans]);
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      let timer: NodeJS.Timeout | undefined;
+      const timedOut = await Promise.race([
+        Promise.allSettled([...this.abandonedScans]).then(() => false),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(true), remaining);
+        })
+      ]).finally(() => {
+        if (timer) clearTimeout(timer);
+      });
+      if (timedOut) return false;
     }
+    return true;
   }
 
   private trackAbandonedScan(scan: Promise<unknown>, client: EsploraClientLike): void {
@@ -282,7 +302,13 @@ export class SyncEngine {
       const provider = this.providers[idx]!;
       try {
         const result = await this.scanWithProvider(wollet, provider, baseTimeoutMs, scanToIndex);
-        this.lastGoodProviderIndex = idx;
+        // Pin only FULL-COVERAGE providers as preferred (frontend parity):
+        // pinning the vanilla fallback would keep every later sync on the
+        // truncating gap-limit path for the life of the engine — history
+        // beyond hint+gap would stay invisible even after waterfalls
+        // recovers. Not pinning costs one failed waterfalls probe per sync
+        // during an outage; self-healing coverage is worth it.
+        if (provider.waterfalls) this.lastGoodProviderIndex = idx;
         return result;
       } catch (err) {
         const message = String((err as Error)?.message ?? err);
@@ -329,11 +355,15 @@ export class SyncEngine {
   private async recordScanCoverage(wollet: Wollet): Promise<void> {
     try {
       const addressResult = wollet.address(null);
-      const nextUnused = addressResult?.index?.();
+      let nextUnused: number | undefined;
       try {
-        addressResult?.free?.();
-      } catch {
-        // best effort
+        nextUnused = addressResult?.index?.();
+      } finally {
+        try {
+          addressResult?.free?.();
+        } catch {
+          // best effort
+        }
       }
       if (!Number.isInteger(nextUnused) || (nextUnused as number) <= 0) return;
       await this.updateStore.bumpScanHint(nextUnused as number);
@@ -356,7 +386,9 @@ export class SyncEngine {
     // thousands of per-address requests, and the warm budget would
     // systematically time out exactly the wallets the floor protects.
     const useToIndex =
-      !provider.waterfalls && scanToIndex > 0 && typeof client.fullScanToIndex === "function";
+      provider.waterfalls === false &&
+      scanToIndex > 0 &&
+      typeof client.fullScanToIndex === "function";
     const timeoutMs = useToIndex ? Math.max(baseTimeoutMs, this.coldStartTimeoutMs) : baseTimeoutMs;
     const kind = useToIndex ? "fullScanToIndex" : "fullScan";
     let deferredFree = false;
@@ -412,7 +444,7 @@ export class SyncEngine {
     // Same floor-replay rule as scanInline; the worker's real EsploraClient
     // always exposes fullScanToIndex. Timeout enforcement stays on this side
     // (worker.terminate() — no zombie scan survives a worker timeout).
-    const useToIndex = !provider.waterfalls && scanToIndex > 0;
+    const useToIndex = provider.waterfalls === false && scanToIndex > 0;
     const timeoutMs = useToIndex ? Math.max(baseTimeoutMs, this.coldStartTimeoutMs) : baseTimeoutMs;
     const bytes = await this.runWorkerScan(provider, timeoutMs, useToIndex ? scanToIndex : 0);
     if (!bytes) {

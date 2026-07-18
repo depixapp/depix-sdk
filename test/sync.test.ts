@@ -69,7 +69,7 @@ describe("provider chain (spec §2.6)", () => {
     ]);
   });
 
-  it("falls through to the next provider and pins lastGoodProviderIndex", async () => {
+  it("falls through to the next provider and pins a FULL-COVERAGE provider as preferred", async () => {
     const calls: string[] = [];
     const factory = (provider: { name: string }): EsploraClientLike => ({
       fullScan: async () => {
@@ -82,13 +82,49 @@ describe("provider chain (spec §2.6)", () => {
       },
       free: () => {}
     });
-    const engine = makeEngine({ factory });
+    const engine = makeEngine({
+      factory,
+      providers: [
+        { name: "p0", url: "http://localhost:1", waterfalls: true },
+        { name: "p1", url: "http://localhost:1", waterfalls: true }
+      ]
+    });
     await engine.sync(wollet);
     expect(calls).toEqual(["p0", "p1"]);
-    // Next sync starts at the last good provider (p1) — no retry of p0.
+    // Next sync starts at the last good FULL-COVERAGE provider (p1) — no retry of p0.
     calls.length = 0;
     await engine.sync(wollet);
     expect(calls).toEqual(["p1"]);
+  });
+
+  it("a degraded vanilla success does NOT pin — the next sync re-probes waterfalls (self-heal after an outage)", async () => {
+    // Pinning the gap_limit=20 fallback would keep every later sync on the
+    // truncating path for the life of the engine: history beyond hint+gap
+    // would stay invisible even after waterfalls recovers (frontend cba130f
+    // context — 'Pin only full-coverage providers as preferred').
+    const calls: string[] = [];
+    let waterfallsDown = true;
+    const factory = (provider: { name: string }): EsploraClientLike => ({
+      fullScan: async () => {
+        calls.push(provider.name);
+        if (provider.name === "p0" && waterfallsDown) throw new Error("waterfalls outage");
+        return undefined;
+      },
+      broadcast: async () => {
+        throw new Error("not used");
+      },
+      free: () => {}
+    });
+    const engine = makeEngine({ factory }); // default: p0 waterfalls, p1 vanilla
+    await engine.sync(wollet);
+    expect(calls).toEqual(["p0", "p1"]); // outage → degraded fallback succeeded
+    calls.length = 0;
+    await engine.sync(wollet);
+    expect(calls).toEqual(["p0", "p1"]); // vanilla was NOT pinned — waterfalls re-probed
+    waterfallsDown = false;
+    calls.length = 0;
+    await engine.sync(wollet);
+    expect(calls).toEqual(["p0"]); // recovery → full coverage restored in-session
   });
 
   it("throws ESPLORA_UNAVAILABLE only when ALL providers fail", async () => {
@@ -410,12 +446,16 @@ describe("abandoned inline scans (real clients): deferred free + drain", () => {
       await expect(engine.sync(wollet)).rejects.toSatisfy((err: unknown) =>
         isDepixSdkError(err, "ESPLORA_UNAVAILABLE")
       );
-      // The timed-out wasm scan is still running on the held fetch. Release it
-      // so the zombie settles, then drain — after this, freeing the wollet
-      // (afterEach) must not hit freed-client/wollet memory.
+      // The timed-out wasm scan is still running on the held fetch — a BOUNDED
+      // drain reports failure instead of hanging forever (a wedged zombie must
+      // not strand wallet.close() or the dataDir lock).
+      expect(await engine.drainAbandonedScans(50)).toBe(false);
+      // Release the held fetches so the zombie settles, then drain for real —
+      // after this, freeing the wollet (afterEach) must not hit freed
+      // client/wollet memory.
       released = true;
       for (const reject of held) reject(new Error("released (mocked fetch)"));
-      await engine.drainAbandonedScans();
+      expect(await engine.drainAbandonedScans()).toBe(true);
       expect(wollet.neverScanned()).toBe(true); // the zombie's failure applied nothing
     } finally {
       globalThis.fetch = realFetch;

@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { DepixWallet } from "../src/wallet.js";
+import { UpdateStore } from "../src/store/update-store.js";
 import { isDepixSdkError } from "../src/errors.js";
 
 const PASSPHRASE = "correct-horse-battery-staple";
@@ -249,6 +250,24 @@ describe("fresh receive address per call (spec §3.1, decision 2026-07-10)", () 
     // Default path still starts at 0 — explicit lookups didn't burn indexes.
     expect(await wallet.getReceiveAddress()).toBe(GOLDEN_ADDR_0);
     expect(await wallet.getReceiveAddress()).toBe(GOLDEN_ADDR_1);
+  });
+
+  it("handing out an address raises the degraded-scan coverage floor (cba130f follow-up)", async () => {
+    // The SDK's nextReceiveIndex runs AHEAD of lwk's last-used view — a payer
+    // may hold an address no scan has proven used yet. A payment to it during
+    // a waterfalls outage must not be invisible to the truncated vanilla
+    // fallback, so issuing the address bumps meta.scanToIndexHint too.
+    const wallet = track(
+      await DepixWallet.restore({ dataDir, passphrase: PASSPHRASE, mnemonic: KNOWN_MNEMONIC })
+    );
+    const store = new UpdateStore(dataDir);
+    await wallet.getReceiveAddress(); // index 0 → floor 1
+    await wallet.getReceiveAddress(); // index 1 → floor 2
+    expect(await store.readScanHint()).toBe(2);
+    // Explicit-index derivation deliberately does NOT move the floor — a
+    // typoed huge index would poison every degraded scan up to the clamp.
+    await wallet.getReceiveAddress({ index: 7 });
+    expect(await store.readScanHint()).toBe(2);
   });
 
   it("concurrent getReceiveAddress() calls never collide (per-instance mutex)", async () => {
