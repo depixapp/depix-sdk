@@ -3,7 +3,7 @@ import { mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { UpdateStore } from "../src/store/update-store.js";
+import { SCAN_HINT_MAX, UpdateStore } from "../src/store/update-store.js";
 
 let dataDir: string;
 let store: UpdateStore;
@@ -60,6 +60,68 @@ describe("UpdateStore", () => {
     await store.writeMeta({ lastScanAt: 1 });
     await store.clearAll();
     expect(await store.getUpdate("1")).toBeNull();
+    expect(await store.readMeta()).toEqual({});
+  });
+});
+
+// Coverage floor for degraded scans (frontend cba130f parity): the deepest
+// next-unused external index a successful scan proved. Monotone, clamped, and
+// it must survive a deep-rescan cache wipe — deleting it is exactly what turned
+// the 2026-07-18 deep sync during the waterfalls outage into a wrong-balance
+// rebuild (vanilla fallback re-scanned from zero with gap_limit=20).
+describe("scan-coverage floor (meta.scanToIndexHint)", () => {
+  it("bumpScanHint is monotone — a lower value never regresses the floor", async () => {
+    await store.bumpScanHint(40);
+    expect(await store.readScanHint()).toBe(40);
+    await store.bumpScanHint(25);
+    expect(await store.readScanHint()).toBe(40);
+    await store.bumpScanHint(90);
+    expect(await store.readScanHint()).toBe(90);
+  });
+
+  it("ignores garbage bumps and clamps writes at SCAN_HINT_MAX", async () => {
+    await store.bumpScanHint(0);
+    await store.bumpScanHint(-5);
+    await store.bumpScanHint(3.7);
+    await store.bumpScanHint(Number.NaN);
+    expect(await store.readScanHint()).toBe(0);
+    await store.bumpScanHint(SCAN_HINT_MAX + 123);
+    expect(await store.readScanHint()).toBe(SCAN_HINT_MAX);
+  });
+
+  it("clamps a corrupt stored value on READ too — a poisoned meta.json must not drive an unbounded scan", async () => {
+    await writeFile(
+      join(dataDir, "meta.json"),
+      JSON.stringify({ scanToIndexHint: SCAN_HINT_MAX * 5 }),
+      "utf8"
+    );
+    expect(await store.readScanHint()).toBe(SCAN_HINT_MAX);
+    await writeFile(join(dataDir, "meta.json"), JSON.stringify({ scanToIndexHint: "9999" }), "utf8");
+    expect(await store.readScanHint()).toBe(0);
+  });
+
+  it("bumping merges with existing meta instead of clobbering it", async () => {
+    await store.writeMeta({ lastScanAt: 111 });
+    await store.bumpScanHint(7);
+    expect(await store.readMeta()).toMatchObject({ lastScanAt: 111, scanToIndexHint: 7 });
+  });
+
+  it("clearForRescan wipes chain + meta but PRESERVES the floor", async () => {
+    await store.putUpdate("1", Uint8Array.from([1]));
+    await store.writeMeta({ lastScanAt: 1, lastSuccessAt: 2 });
+    await store.bumpScanHint(64);
+    await store.clearForRescan();
+    expect(await store.getUpdate("1")).toBeNull();
+    const meta = await store.readMeta();
+    expect(meta.scanToIndexHint).toBe(64);
+    expect(meta.lastScanAt).toBeUndefined();
+    expect(meta.lastSuccessAt).toBeUndefined();
+  });
+
+  it("clearForRescan with no floor behaves like clearAll", async () => {
+    await store.putUpdate("1", Uint8Array.from([1]));
+    await store.writeMeta({ lastScanAt: 1 });
+    await store.clearForRescan();
     expect(await store.readMeta()).toEqual({});
   });
 });

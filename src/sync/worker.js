@@ -15,9 +15,12 @@
 // +1 wasm init (1-2 ms) and ~+90 MB RSS during the scan (SPIKE measurements).
 //
 // Protocol (workerData in): { descriptor, dataDir, provider: { url,
-// waterfalls, concurrency } }
-// (postMessage out): { ok: true, bytes: Uint8Array|null } | { ok: false,
-// error: string }
+// waterfalls, concurrency }, scanToIndex }
+// scanToIndex > 0 → degraded coverage-floor replay: scan via
+// fullScanToIndex(scanToIndex) instead of the plain gap_limit=20 fullScan
+// (the main thread only passes a non-zero value on the vanilla fallback —
+// see scanInWorker). (postMessage out): { ok: true, bytes: Uint8Array|null }
+// | { ok: false, error: string }
 // Timeout/termination is enforced by the main thread (worker.terminate()).
 
 import { readFile } from "node:fs/promises";
@@ -52,7 +55,7 @@ async function replayChain(wollet, dataDir) {
 }
 
 async function main() {
-  const { descriptor, dataDir, provider } = /** @type {{ descriptor: string, dataDir: string, provider: { url: string, waterfalls: boolean, concurrency: number } }} */ (
+  const { descriptor, dataDir, provider, scanToIndex } = /** @type {{ descriptor: string, dataDir: string, provider: { url: string, waterfalls: boolean, concurrency: number }, scanToIndex?: number }} */ (
     workerData
   );
   const network = Network.mainnet();
@@ -65,7 +68,17 @@ async function main() {
     provider.concurrency,
     false
   );
-  const update = await client.fullScan(wollet);
+  // Degraded coverage-floor replay: a vanilla fullScan truncates at
+  // gap_limit=20; scanning to the proven floor prevents a wrong-balance
+  // rebuild during a waterfalls outage (main thread decides the value).
+  const useToIndex =
+    provider.waterfalls === false &&
+    typeof scanToIndex === "number" &&
+    Number.isInteger(scanToIndex) &&
+    scanToIndex > 0;
+  const update = useToIndex
+    ? await client.fullScanToIndex(wollet, scanToIndex)
+    : await client.fullScan(wollet);
   if (!update) {
     parentPort?.postMessage({ ok: true, bytes: null });
     return;

@@ -7,7 +7,8 @@
 // UTXO-drift fix — wallet.js:1272-1317). Layout:
 //   <dataDir>/updates/<status>.bin   Update.serialize() bytes, post-prune
 //   <dataDir>/meta.json              { lastScanAt, lastSuccessAt,
-//                                      lastPersistFailedAt, lastPersistErrorName }
+//                                      lastPersistFailedAt, lastPersistErrorName,
+//                                      scanToIndexHint }
 //
 // Blobs are written with tmp+rename only (recoverable by re-scan) and read
 // TOLERANTLY: a missing/corrupt file simply terminates the chain — the next
@@ -23,6 +24,27 @@ export interface SyncMeta {
   lastSuccessAt?: number;
   lastPersistFailedAt?: number;
   lastPersistErrorName?: string | null;
+  /**
+   * Coverage floor for degraded scans (frontend cba130f parity): the deepest
+   * next-unused external derivation index a successful scan ever proved.
+   * Monotone (bumpScanHint), clamped to SCAN_HINT_MAX on write AND read, and
+   * it survives a deep-rescan cache wipe (clearForRescan). Degraded vanilla
+   * scans replay it via fullScanToIndex so a gap_limit=20 walk can never miss
+   * history below proven coverage.
+   */
+  scanToIndexHint?: number;
+}
+
+// Upper sanity bound for meta.scanToIndexHint. The hint is monotone by design
+// and survives deep rescans, so a corrupt oversized value would be permanent
+// and turn every degraded scan into a guaranteed timeout. One million indices
+// is far beyond any real wallet and still bounded.
+export const SCAN_HINT_MAX = 1_000_000;
+
+function sanitizeScanHint(value: unknown): number {
+  return typeof value === "number" && Number.isInteger(value) && value > 0
+    ? Math.min(value, SCAN_HINT_MAX)
+    : 0;
 }
 
 const STATUS_RE = /^\d+$/;
@@ -82,10 +104,42 @@ export class UpdateStore {
     await writeFileAtomic(this.metaPath, `${JSON.stringify(next)}\n`);
   }
 
+  /** The stored coverage floor, sanitized + clamped on read (0 = none). */
+  async readScanHint(): Promise<number> {
+    return sanitizeScanHint((await this.readMeta()).scanToIndexHint);
+  }
+
+  /**
+   * Monotone bump of the coverage floor — a lower (truncated) view can never
+   * regress it. Read-compute-write is safe here without a transaction: the
+   * dataDir is single-process (dir-lock) and the SyncEngine serializes scans,
+   * so unlike the frontend's multi-tab IDB there is no concurrent writer.
+   */
+  async bumpScanHint(value: number): Promise<void> {
+    const bump = sanitizeScanHint(value);
+    if (bump <= 0) return;
+    if (bump <= (await this.readScanHint())) return;
+    await this.writeMeta({ scanToIndexHint: bump });
+  }
+
   /** Wipe the whole scan cache (chain + meta). Never touches wallet.json. */
   async clearAll(): Promise<void> {
     await rm(this.updatesDir, { recursive: true, force: true });
     await rm(this.metaPath, { force: true });
+  }
+
+  /**
+   * Deep-rescan cache wipe that PRESERVES the coverage floor. The floor is not
+   * derived view-state but the deepest index a successful scan ever proved;
+   * deleting it is exactly what turned the frontend's 2026-07-18 deep sync
+   * during the waterfalls outage into a wrong-balance rebuild (the vanilla
+   * fallback re-scanned from zero with gap_limit=20 and missed all high-index
+   * history).
+   */
+  async clearForRescan(): Promise<void> {
+    const hint = await this.readScanHint();
+    await this.clearAll();
+    if (hint > 0) await this.writeMeta({ scanToIndexHint: hint });
   }
 
   /** List persisted status keys (diagnostics). */

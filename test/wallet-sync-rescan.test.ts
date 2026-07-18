@@ -135,6 +135,48 @@ describe("wallet.sync({ rescan: true }) — deep re-scan from zero", () => {
   });
 });
 
+// Incident parity (frontend cba130f, 2026-07-18): a deep rescan during a
+// waterfalls outage wiped the full-coverage cache and rebuilt it with the
+// vanilla fallback's gap_limit=20 walk → wrong (lower) balance. The coverage
+// floor (meta.scanToIndexHint) must survive the rescan's cache wipe and be
+// replayed on the degraded provider via fullScanToIndex.
+describe("wallet.sync({ rescan: true }) preserves + replays the coverage floor", () => {
+  it("the cache wipe keeps scanToIndexHint and the virgin cold-scan on a degraded provider scans to it", async () => {
+    const calls: Array<{ kind: string; index?: number; neverScanned: boolean }> = [];
+    const factory = (): EsploraClientLike => ({
+      fullScan: async (w: Wollet) => {
+        calls.push({ kind: "fullScan", neverScanned: w.neverScanned() });
+        return undefined;
+      },
+      fullScanToIndex: async (w: Wollet, index: number) => {
+        calls.push({ kind: "fullScanToIndex", index, neverScanned: w.neverScanned() });
+        return undefined;
+      },
+      broadcast: async () => {
+        throw new Error("not used");
+      },
+      free: () => {}
+    });
+    // openWallet's only provider is waterfalls:false — the outage shape.
+    wallet = await openWallet(factory);
+    const store = new UpdateStore(dataDir);
+    await store.bumpScanHint(300); // floor proven by an earlier full-coverage scan
+    await store.putUpdate("1", new Uint8Array([1, 2, 3]));
+
+    await wallet.sync({ rescan: true });
+
+    // The deep rescan wiped the chain but kept the floor…
+    expect(await store.listStatuses()).not.toContain("1");
+    expect(await store.readScanHint()).toBe(300);
+    // …and the virgin cold-scan on the degraded provider replayed it.
+    expect(calls[calls.length - 1]).toMatchObject({
+      kind: "fullScanToIndex",
+      index: 300,
+      neverScanned: true
+    });
+  });
+});
+
 describe("wallet sync options — timeout bounds are plumbed to the sync engine", () => {
   it("honors a custom coldStartTimeoutMs — a hung deep/cold scan fails at that bound, not the 10min default", async () => {
     // A scan that never resolves: the timeout is the ONLY way out. A freshly

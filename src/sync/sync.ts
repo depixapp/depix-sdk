@@ -8,9 +8,20 @@
 // ESPLORA_UNAVAILABLE is only thrown when ALL providers fail (parity with
 // the frontend's syncWalletInner/broadcastFinalized).
 //
-// One single fullScan for cold and warm (fullScanToIndex deliberately absent
-// — wallet.js:1024-1031); timeouts 600s cold (neverScanned) / 60s warm;
-// concurrent sync() calls join the single in-flight scan.
+// One single scan call for cold and warm; timeouts 600s cold (neverScanned) /
+// 60s warm; concurrent sync() calls join the single in-flight scan.
+//
+// DEGRADED-PATH COVERAGE FLOOR (frontend cba130f parity): the vanilla
+// fallback truncates at gap_limit=20, so during a waterfalls outage a
+// from-zero scan misses high-derivation-index history and rebuilds a WRONG
+// balance (the 2026-07-18 incident). Every successful scan records the
+// next-unused external index as a monotone floor (meta.scanToIndexHint);
+// degraded vanilla scans replay it via client.fullScanToIndex(hint) under the
+// COLD budget (a deep floor means thousands of per-address requests — the
+// warm budget would time out exactly the wallets the floor protects). The
+// floor survives wallet.sync({ rescan: true }) (clearForRescan). Without a
+// floor (fresh dataDir during an outage) the fallback remains a plain
+// gap-limit walk — nothing better is knowable there.
 //
 // fullScan runs in a worker_thread by default (§2.7, opt-out via
 // sync.worker=false): the worker owns an isolated wasm, replays the same
@@ -55,6 +66,12 @@ const WARM_SYNC_TIMEOUT_MS = 60_000;
 /** Test seam — minimal client surface the engine drives. */
 export interface EsploraClientLike {
   fullScan(wollet: Wollet): Promise<LwkUpdate | undefined>;
+  /**
+   * Scan at least up to the given derivation index (coverage-floor replay on
+   * the degraded vanilla path); optional so injected doubles keep working —
+   * absent, the engine falls back to the plain gap-limit fullScan.
+   */
+  fullScanToIndex?(wollet: Wollet, index: number): Promise<LwkUpdate | undefined>;
   broadcast(pset: Pset): Promise<unknown>;
   /** Re-broadcast of a raw signed tx (§3.2.9 resume); optional on test fakes. */
   broadcastTx?(tx: LwkTransaction): Promise<unknown>;
@@ -126,6 +143,14 @@ export class SyncEngine {
 
   private lastGoodProviderIndex = 0;
   private syncPromise: Promise<SyncResult> | null = null;
+  // Timed-out inline scans keep running inside wasm (Promise.race cannot
+  // cancel them) while borrowing the client AND the wollet — freeing either
+  // under them is the "null pointer passed to rust" crash class. Tracked so
+  // the client's free defers to the zombie's settle and wollet owners can
+  // drainAbandonedScans() before freeing. Real clients only: injected test
+  // doubles hold no rust pointers, and a double that never settles must not
+  // deadlock teardown.
+  private readonly abandonedScans = new Set<Promise<unknown>>();
 
   constructor(options: SyncEngineOptions) {
     this.descriptor = options.descriptor;
@@ -207,6 +232,10 @@ export class SyncEngine {
       await this.syncPromise.catch(() => {});
     }
     const scan = (async () => {
+      // The caller frees its previous wollet right after this pass — wait for
+      // zombie scans that may still borrow it (see abandonedScans) before the
+      // cache clear.
+      await this.drainAbandonedScans();
       if (beforeScan) await beforeScan();
       return this.syncInner(wollet);
     })().finally(() => {
@@ -216,8 +245,35 @@ export class SyncEngine {
     return scan;
   }
 
+  /** Wait for timed-out-but-still-running wasm scans to settle (see abandonedScans). */
+  async drainAbandonedScans(): Promise<void> {
+    while (this.abandonedScans.size > 0) {
+      await Promise.allSettled([...this.abandonedScans]);
+    }
+  }
+
+  private trackAbandonedScan(scan: Promise<unknown>, client: EsploraClientLike): void {
+    const tracked = scan
+      .catch(() => {
+        // zombie failure is expected and irrelevant
+      })
+      .finally(() => {
+        this.abandonedScans.delete(tracked);
+        try {
+          client.free?.();
+        } catch {
+          // best effort
+        }
+      });
+    this.abandonedScans.add(tracked);
+  }
+
   private async syncInner(wollet: Wollet): Promise<SyncResult> {
-    const timeoutMs = wollet.neverScanned() ? this.coldStartTimeoutMs : this.syncTimeoutMs;
+    const baseTimeoutMs = wollet.neverScanned() ? this.coldStartTimeoutMs : this.syncTimeoutMs;
+    // Coverage floor for degraded attempts — read once per sync (it only
+    // changes when a successful scan bumps it), sanitized + clamped by the
+    // store. Read AFTER a rescan's beforeScan so a preserved floor is seen.
+    const scanToIndex = await this.updateStore.readScanHint();
     const startIndex = Math.min(this.lastGoodProviderIndex, this.providers.length - 1);
     const failures: string[] = [];
 
@@ -225,7 +281,7 @@ export class SyncEngine {
       const idx = (startIndex + step) % this.providers.length;
       const provider = this.providers[idx]!;
       try {
-        const result = await this.scanWithProvider(wollet, provider, timeoutMs);
+        const result = await this.scanWithProvider(wollet, provider, baseTimeoutMs, scanToIndex);
         this.lastGoodProviderIndex = idx;
         return result;
       } catch (err) {
@@ -244,13 +300,14 @@ export class SyncEngine {
   private async scanWithProvider(
     wollet: Wollet,
     provider: EsploraProvider,
-    timeoutMs: number
+    baseTimeoutMs: number,
+    scanToIndex: number
   ): Promise<SyncResult> {
     // Worker path only makes sense with real clients — a test factory cannot
     // cross the thread boundary.
     if (this.useWorker && !this.clientFactory) {
       try {
-        return await this.scanInWorker(wollet, provider, timeoutMs);
+        return await this.scanInWorker(wollet, provider, baseTimeoutMs, scanToIndex);
       } catch (err) {
         if (err instanceof ApplyDriftError) {
           this.logger.warn("worker update did not apply (state drift) — falling back inline");
@@ -259,29 +316,81 @@ export class SyncEngine {
         }
       }
     }
-    return this.scanInline(wollet, provider, timeoutMs);
+    return this.scanInline(wollet, provider, baseTimeoutMs, scanToIndex);
+  }
+
+  /**
+   * Record the coverage floor a scan proved — the next-unused external
+   * derivation index, bumped monotonically into meta.scanToIndexHint. Runs
+   * after EVERY successful scan (degraded ones can only raise it further).
+   * Best-effort by contract: a failure here must never fail the sync that
+   * produced it.
+   */
+  private async recordScanCoverage(wollet: Wollet): Promise<void> {
+    try {
+      const addressResult = wollet.address(null);
+      const nextUnused = addressResult?.index?.();
+      try {
+        addressResult?.free?.();
+      } catch {
+        // best effort
+      }
+      if (!Number.isInteger(nextUnused) || (nextUnused as number) <= 0) return;
+      await this.updateStore.bumpScanHint(nextUnused as number);
+    } catch {
+      // best effort
+    }
   }
 
   private async scanInline(
     wollet: Wollet,
     provider: EsploraProvider,
-    timeoutMs: number
+    baseTimeoutMs: number,
+    scanToIndex: number
   ): Promise<SyncResult> {
     const client = this.buildClient(provider);
+    // Coverage-floor replay: only the DEGRADED vanilla path (waterfalls walks
+    // the gap limit server-side with full coverage), only with a stored floor,
+    // and only when the client exposes fullScanToIndex (injected doubles may
+    // not). Hint-driven scans are sized like a cold start — a deep floor means
+    // thousands of per-address requests, and the warm budget would
+    // systematically time out exactly the wallets the floor protects.
+    const useToIndex =
+      !provider.waterfalls && scanToIndex > 0 && typeof client.fullScanToIndex === "function";
+    const timeoutMs = useToIndex ? Math.max(baseTimeoutMs, this.coldStartTimeoutMs) : baseTimeoutMs;
+    const kind = useToIndex ? "fullScanToIndex" : "fullScan";
+    let deferredFree = false;
     try {
       // withTimeout cannot cancel the wasm scan. On timeout the await below
       // rejects and we bail BEFORE applyUpdate, so a late-resolving scan is
       // never applied to a Wollet the caller now believes idle; pin a no-op
       // handler so its late settle is not an unhandledRejection either.
-      const scan = client.fullScan(wollet);
+      const scan = useToIndex
+        ? client.fullScanToIndex!(wollet, scanToIndex)
+        : client.fullScan(wollet);
       void scan.catch(() => {});
-      const update = await withTimeout(scan, timeoutMs, "fullScan");
+      let update: LwkUpdate | undefined;
+      try {
+        update = await withTimeout(scan, timeoutMs, kind);
+      } catch (err) {
+        // The scan may still be running inside wasm, borrowing client+wollet
+        // (real clients only — doubles hold no rust pointers and must not
+        // block teardown): defer the client free to the zombie's settle.
+        if (!this.clientFactory) {
+          deferredFree = true;
+          this.trackAbandonedScan(scan, client);
+        }
+        throw err;
+      }
       if (!update) {
         await this.updateStore.writeMeta({ lastScanAt: Date.now(), lastSuccessAt: Date.now() });
+        await this.recordScanCoverage(wollet);
         return { updated: false };
       }
       const statusBefore = wollet.status().toString();
       wollet.applyUpdate(update);
+      // AFTER the apply, so the floor reflects usage this Update just revealed.
+      await this.recordScanCoverage(wollet);
       try {
         update.prune(wollet);
       } catch {
@@ -290,18 +399,25 @@ export class SyncEngine {
       await this.persistUpdate(statusBefore, update.serialize());
       return { updated: true };
     } finally {
-      client.free?.();
+      if (!deferredFree) client.free?.();
     }
   }
 
   private async scanInWorker(
     wollet: Wollet,
     provider: EsploraProvider,
-    timeoutMs: number
+    baseTimeoutMs: number,
+    scanToIndex: number
   ): Promise<SyncResult> {
-    const bytes = await this.runWorkerScan(provider, timeoutMs);
+    // Same floor-replay rule as scanInline; the worker's real EsploraClient
+    // always exposes fullScanToIndex. Timeout enforcement stays on this side
+    // (worker.terminate() — no zombie scan survives a worker timeout).
+    const useToIndex = !provider.waterfalls && scanToIndex > 0;
+    const timeoutMs = useToIndex ? Math.max(baseTimeoutMs, this.coldStartTimeoutMs) : baseTimeoutMs;
+    const bytes = await this.runWorkerScan(provider, timeoutMs, useToIndex ? scanToIndex : 0);
     if (!bytes) {
       await this.updateStore.writeMeta({ lastScanAt: Date.now(), lastSuccessAt: Date.now() });
+      await this.recordScanCoverage(wollet);
       return { updated: false };
     }
     const statusBefore = wollet.status().toString();
@@ -310,11 +426,16 @@ export class SyncEngine {
     } catch (err) {
       throw new ApplyDriftError(String((err as Error)?.message ?? err));
     }
+    await this.recordScanCoverage(wollet);
     await this.persistUpdate(statusBefore, bytes);
     return { updated: true };
   }
 
-  private runWorkerScan(provider: EsploraProvider, timeoutMs: number): Promise<Uint8Array | null> {
+  private runWorkerScan(
+    provider: EsploraProvider,
+    timeoutMs: number,
+    scanToIndex: number
+  ): Promise<Uint8Array | null> {
     return new Promise<Uint8Array | null>((resolve, reject) => {
       const worker = new Worker(new URL("./worker.js", import.meta.url), {
         // Do NOT inherit the parent's execArgv: flags like --input-type or
@@ -328,7 +449,8 @@ export class SyncEngine {
             url: provider.url,
             waterfalls: provider.waterfalls,
             concurrency: providerConcurrency(provider)
-          }
+          },
+          scanToIndex
         }
       });
       let settled = false;

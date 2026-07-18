@@ -10,7 +10,7 @@ import {
   SyncEngine,
   type EsploraClientLike
 } from "../src/sync/sync.js";
-import { UpdateStore } from "../src/store/update-store.js";
+import { SCAN_HINT_MAX, UpdateStore } from "../src/store/update-store.js";
 import { buildWollet, descriptorFromMnemonic, generateMnemonic } from "../src/engine/lwk.js";
 import { isDepixSdkError } from "../src/errors.js";
 import type { Wollet } from "lwk_node";
@@ -238,6 +238,188 @@ describe("inline scan timeout (spec §2.7 — withTimeout cannot cancel the wasm
     await new Promise((r) => setTimeout(r, 130));
     expect(lateResolved).toBeGreaterThanOrEqual(1); // the scan really did resolve late
     expect(wollet.neverScanned()).toBe(true); // no late update reached the Wollet
+  });
+});
+
+// Coverage floor for degraded scans (frontend cba130f parity). A vanilla
+// (waterfalls:false) fallback truncates at gap_limit=20; during a waterfalls
+// outage a from-zero scan therefore misses high-derivation-index history and
+// rebuilds a WRONG balance. The floor (meta.scanToIndexHint — the deepest
+// next-unused external index a successful scan proved) is replayed on the
+// degraded path via client.fullScanToIndex so a truncated walk can never
+// miss history below proven coverage.
+describe("degraded-scan coverage floor (fullScanToIndex replay)", () => {
+  // Real Wollets in this suite are virgin (next-unused index 0 — never records
+  // a floor), so the hint paths are driven through a minimal fake exposing the
+  // only surface the engine touches on a no-update scan.
+  function fakeWollet(opts: { neverScanned?: boolean; nextUnusedIndex?: number } = {}): Wollet {
+    return {
+      neverScanned: () => opts.neverScanned ?? false,
+      address: () => ({ index: () => opts.nextUnusedIndex ?? 0, free: () => {} }),
+      status: () => ({ toString: () => "0" }),
+      applyUpdate: () => {
+        throw new Error("not used — fakes return no Update");
+      },
+      free: () => {}
+    } as unknown as Wollet;
+  }
+
+  type ScanCall = { provider: string; kind: "fullScan" | "fullScanToIndex"; index?: number };
+
+  function recordingFactory(
+    calls: ScanCall[],
+    opts: { withToIndex?: boolean; delayMs?: number } = {}
+  ): (provider: { name: string }) => EsploraClientLike {
+    const settle = async (): Promise<undefined> => {
+      if (opts.delayMs) await new Promise((resolve) => setTimeout(resolve, opts.delayMs));
+      return undefined;
+    };
+    return (provider) => ({
+      fullScan: async () => {
+        calls.push({ provider: provider.name, kind: "fullScan" });
+        return settle();
+      },
+      ...(opts.withToIndex === false
+        ? {}
+        : {
+            fullScanToIndex: async (_w: Wollet, index: number) => {
+              calls.push({ provider: provider.name, kind: "fullScanToIndex", index });
+              return settle();
+            }
+          }),
+      broadcast: async () => {
+        throw new Error("not used");
+      },
+      free: () => {}
+    });
+  }
+
+  const DEGRADED_ONLY = [{ name: "p-vanilla", url: "http://localhost:1", waterfalls: false }];
+  const WATERFALLS_ONLY = [{ name: "p-wf", url: "http://localhost:1", waterfalls: true }];
+
+  it("replays the stored floor on the degraded vanilla provider via fullScanToIndex", async () => {
+    await new UpdateStore(dataDir).bumpScanHint(240);
+    const calls: ScanCall[] = [];
+    const engine = makeEngine({ factory: recordingFactory(calls), providers: DEGRADED_ONLY });
+    await engine.sync(fakeWollet());
+    expect(calls).toEqual([{ provider: "p-vanilla", kind: "fullScanToIndex", index: 240 }]);
+  });
+
+  it("never uses fullScanToIndex on the full-coverage waterfalls provider", async () => {
+    await new UpdateStore(dataDir).bumpScanHint(240);
+    const calls: ScanCall[] = [];
+    const engine = makeEngine({ factory: recordingFactory(calls), providers: WATERFALLS_ONLY });
+    await engine.sync(fakeWollet());
+    expect(calls).toEqual([{ provider: "p-wf", kind: "fullScan" }]);
+  });
+
+  it("without a stored floor the degraded path stays a plain gap-limit fullScan", async () => {
+    const calls: ScanCall[] = [];
+    const engine = makeEngine({ factory: recordingFactory(calls), providers: DEGRADED_ONLY });
+    await engine.sync(fakeWollet());
+    expect(calls).toEqual([{ provider: "p-vanilla", kind: "fullScan" }]);
+  });
+
+  it("a client without fullScanToIndex falls back to plain fullScan (injected doubles keep working)", async () => {
+    await new UpdateStore(dataDir).bumpScanHint(240);
+    const calls: ScanCall[] = [];
+    const engine = makeEngine({
+      factory: recordingFactory(calls, { withToIndex: false }),
+      providers: DEGRADED_ONLY
+    });
+    await engine.sync(fakeWollet());
+    expect(calls).toEqual([{ provider: "p-vanilla", kind: "fullScan" }]);
+  });
+
+  it("a corrupt oversized stored floor is clamped to SCAN_HINT_MAX on read", async () => {
+    // writeMeta is a raw merge — this simulates a poisoned meta.json, which the
+    // READ path must clamp (a permanent oversized floor would turn every
+    // degraded scan into a guaranteed timeout).
+    await new UpdateStore(dataDir).writeMeta({ scanToIndexHint: SCAN_HINT_MAX * 7 });
+    const calls: ScanCall[] = [];
+    const engine = makeEngine({ factory: recordingFactory(calls), providers: DEGRADED_ONLY });
+    await engine.sync(fakeWollet());
+    expect(calls).toEqual([
+      { provider: "p-vanilla", kind: "fullScanToIndex", index: SCAN_HINT_MAX }
+    ]);
+  });
+
+  it("every successful scan records the next-unused index as a MONOTONE floor", async () => {
+    const store = new UpdateStore(dataDir);
+    const calls: ScanCall[] = [];
+    const engine = makeEngine({ factory: recordingFactory(calls), providers: WATERFALLS_ONLY });
+    await engine.sync(fakeWollet({ nextUnusedIndex: 42 }));
+    expect(await store.readScanHint()).toBe(42);
+    // A shallower view (e.g. a later truncated scan) can never lower the floor.
+    await engine.sync(fakeWollet({ nextUnusedIndex: 17 }));
+    expect(await store.readScanHint()).toBe(42);
+  });
+
+  it("a hint-driven degraded scan gets the COLD budget — the warm budget would time out exactly the wallets the floor protects", async () => {
+    const calls: ScanCall[] = [];
+    // Scan takes 120ms: beyond the 30ms warm budget, within the 5s cold one.
+    const factory = recordingFactory(calls, { delayMs: 120 });
+    const makeSlow = (): SyncEngine =>
+      new SyncEngine({
+        descriptor: descriptorFromMnemonic(KNOWN_MNEMONIC),
+        dataDir,
+        updateStore: new UpdateStore(dataDir),
+        providers: DEGRADED_ONLY,
+        worker: false,
+        clientFactory: factory,
+        syncTimeoutMs: 30,
+        coldStartTimeoutMs: 5_000
+      });
+    // Control: no floor → warm budget → the slow scan times out.
+    await expect(makeSlow().sync(fakeWollet())).rejects.toSatisfy((err: unknown) =>
+      isDepixSdkError(err, "ESPLORA_UNAVAILABLE")
+    );
+    // With a floor the SAME slow scan succeeds under the cold budget.
+    await new UpdateStore(dataDir).bumpScanHint(240);
+    await expect(makeSlow().sync(fakeWollet())).resolves.toEqual({ updated: false });
+    expect(calls.map((c) => c.kind)).toEqual(["fullScan", "fullScanToIndex"]);
+  });
+});
+
+// Timed-out inline scans keep running inside wasm (Promise.race cannot cancel
+// them). Freeing the EsploraClient — or the Wollet the zombie still borrows —
+// while it runs is the "null pointer passed to rust" crash class. Real clients
+// therefore get their free deferred to the zombie's settle, and
+// drainAbandonedScans() lets owners wait before freeing the wollet.
+describe("abandoned inline scans (real clients): deferred free + drain", () => {
+  it("drainAbandonedScans waits for the zombie to settle; the wollet is safe to free afterwards", async () => {
+    const realFetch = globalThis.fetch;
+    const held: Array<(reason: unknown) => void> = [];
+    let released = false;
+    globalThis.fetch = (async () => {
+      if (released) throw new Error("released (mocked fetch)");
+      return new Promise<never>((_resolve, reject) => {
+        held.push(reject);
+      });
+    }) as typeof fetch;
+    try {
+      const engine = new SyncEngine({
+        descriptor: descriptorFromMnemonic(KNOWN_MNEMONIC),
+        dataDir,
+        updateStore: new UpdateStore(dataDir),
+        providers: [{ name: "p0", url: "http://localhost:1", waterfalls: true }],
+        worker: false, // inline: the real wasm client runs in-thread on stubbed fetch
+        syncTimeoutMs: 40,
+        coldStartTimeoutMs: 40
+      });
+      await expect(engine.sync(wollet)).rejects.toSatisfy((err: unknown) =>
+        isDepixSdkError(err, "ESPLORA_UNAVAILABLE")
+      );
+      // The timed-out wasm scan is still running on the held fetch. Release it
+      // so the zombie settles, then drain — after this, freeing the wollet
+      // (afterEach) must not hit freed-client/wollet memory.
+      released = true;
+      for (const reject of held) reject(new Error("released (mocked fetch)"));
+      await engine.drainAbandonedScans();
+      expect(wollet.neverScanned()).toBe(true); // the zombie's failure applied nothing
+    } finally {
+      globalThis.fetch = realFetch;
+    }
   });
 });
 

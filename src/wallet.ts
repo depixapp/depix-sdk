@@ -1179,6 +1179,10 @@ export class DepixWallet {
       // best effort
     }
     if (this.wollet) {
+      // A timed-out inline scan may still be running inside wasm and borrowing
+      // this wollet (Promise.race cannot cancel it) — freeing under it is the
+      // "null pointer passed to rust" crash class. Wait for zombies to settle.
+      await this.syncEngine.drainAbandonedScans().catch(() => {});
       try {
         this.wollet.free();
       } catch {
@@ -1360,8 +1364,16 @@ export class DepixWallet {
       const fresh = buildWollet(this.requireDescriptor());
       let result: { updated: boolean };
       try {
-        result = await this.syncEngine.rescan(fresh, () => this.updateStore.clearAll());
+        // clearForRescan, NOT clearAll: the scan-coverage floor
+        // (meta.scanToIndexHint) must survive the wipe — deleting it is what
+        // turned the frontend's 2026-07-18 deep sync during the waterfalls
+        // outage into a wrong-balance gap_limit=20 rebuild.
+        result = await this.syncEngine.rescan(fresh, () => this.updateStore.clearForRescan());
       } catch (err) {
+        // A timed-out attempt may leave a zombie wasm scan still borrowing
+        // `fresh` — freeing under it is the "null pointer passed to rust"
+        // crash class. Wait for it to settle first.
+        await this.syncEngine.drainAbandonedScans().catch(() => {});
         try {
           fresh.free();
         } catch {
