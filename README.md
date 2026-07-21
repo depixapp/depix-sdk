@@ -13,6 +13,14 @@ Nothing custodial: the seed never leaves the agent's environment and the backend
 never signs. There is also an optional **local MCP facade** (`depix-wallet-mcp`)
 so an MCP host (Claude Desktop, Claude Code, Cursor…) can drive the same wallet.
 
+> **Companion — the payments-gateway MCP.** To *receive* Pix (checkouts,
+> products, status) without any custody, DePix runs a hosted gateway,
+> **[`@depixapp/mcp`](https://www.npmjs.com/package/@depixapp/mcp)** at
+> `https://mcp.depixapp.com/mcp` ([source](https://github.com/depixapp/depix-mcp)).
+> Don't confuse it with the local `depix-wallet-mcp` facade above: the gateway MCP
+> is the **receive** side (no keys, no signing); **this SDK** holds, signs and
+> moves the funds.
+
 - **Runtime:** Node **≥ 22.4** (the WebSocket-stable floor), **Linux + macOS**.
   Windows is not supported in 1.0 — use WSL.
 - **Install size:** ~25 MB base (+~25 MB when the EVM stablecoin route pulls in
