@@ -48,7 +48,11 @@ function safeJsonParse(text: string): unknown {
   }
 }
 
-/** Envelope every agent endpoint returns on success: `{ response: T }`. */
+/**
+ * Success envelope MOST agent endpoints return: `{ response: T }`. Not all do —
+ * verify-domain replies flat (`{ record_name, … }` / `{ verified_domain }`), so
+ * the unwrap falls back to the raw JSON body when no `response` key is present.
+ */
 interface WireEnvelope<T> {
   response?: T;
 }
@@ -107,6 +111,8 @@ export class AgentApiClient {
       throw mapApiError(res.status, json, text, res);
     }
     const envelope = (json ?? {}) as WireEnvelope<T>;
-    return (envelope.response ?? ({} as T));
+    if (envelope.response !== undefined) return envelope.response;
+    // Flat (envelope-less) endpoints — e.g. verify-domain — ARE the payload.
+    return (json ?? {}) as T;
   }
 }

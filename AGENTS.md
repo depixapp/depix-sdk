@@ -64,7 +64,12 @@ async close(): Promise<void>
 - `create()` — new 12-word wallet. `CreateResult = { mnemonic, descriptor, backupConfirmed, wallet }`;
   the mnemonic is returned in the foreground (impossible not to receive). In a
   TTY it runs an interactive backup ritual; headless, pass `mnemonicSecured: true`
-  to be born backup-confirmed (a conscious, logged decision).
+  to be born backup-confirmed (a conscious, logged decision). The flag is an
+  ATTESTATION that your code durably stores the returned `mnemonic` (secret
+  manager / the human guardian) before funds arrive — pass it only when that is
+  true. Headless WITHOUT the flag, `create()` still succeeds but the wallet is
+  born unconfirmed (receive gated, `BACKUP_REQUIRED`) until `confirmBackup()` —
+  the safer order when storing the backup can fail: store first, then confirm.
 - `open()` — opens an existing wallet; **never auto-creates a seed**
   (`WALLET_NOT_FOUND` if the dir is empty). Auto-runs crash recovery for
   withdrawals AND conversions (opt out: `resumePendingWithdrawalsOnOpen: false`,

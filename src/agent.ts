@@ -199,6 +199,22 @@ interface CreatedKeyWire {
   daily_limit_cents?: number | null;
 }
 
+// ─── verify-domain I/O ───────────────────────────────────────────────────
+
+/** Phase-1 result of verifyDomain(): the DNS TXT challenge to publish. */
+export interface DomainChallenge {
+  /** TXT record name to create, e.g. "_depix-verify.acme.com". */
+  recordName: string;
+  /** Exact TXT record value, e.g. "depix-verify=…". Stable — re-fetch any time. */
+  recordValue: string;
+}
+
+/** Phase-2 result of verifyDomain({ confirm: true }): the recorded domain. */
+export interface DomainVerification {
+  /** The registrable domain (eTLD+1) now stored as the agent's verified domain. */
+  verifiedDomain: string;
+}
+
 // ─── the class ───────────────────────────────────────────────────────────
 
 export class DepixAgent {
@@ -385,5 +401,48 @@ export class DepixAgent {
       path: "/api/agents/webhook-secret",
     });
     return { webhookSecret: wire.webhook_secret };
+  }
+
+  /**
+   * Prove control of a domain via a two-phase DNS TXT challenge (§2.9) — this
+   * unlocks receiving from third parties and lifts `domain_required` on the
+   * merchant_* scopes.
+   *
+   * Phase 1 — `verifyDomain(domain)` returns the challenge: publish a DNS TXT
+   * record named `recordName` with value `recordValue`. The challenge is
+   * server-derived and stable, so re-calling phase 1 returns the same record.
+   *
+   * Phase 2 — after DNS propagation, `verifyDomain(domain, { confirm: true })`
+   * makes the server resolve the TXT record and, on a match, record the
+   * registrable domain (eTLD+1) as verified.
+   *
+   * Server rejections arrive as `DepixApiError` (branch on `err.code`):
+   * `validation_error` (malformed domain), `domain_tld_not_allowed`
+   * (`details.allowed_tlds` lists the accepted TLDs — also discoverable via
+   * GET /api/agents/domain-tlds), `domain_free_host` (free-subdomain hosts are
+   * not accepted), and `domain_txt_not_found` on confirm (record missing or
+   * mismatched — wait for propagation and retry phase 2).
+   */
+  async verifyDomain(domain: string): Promise<DomainChallenge>;
+  async verifyDomain(domain: string, options: { confirm: true }): Promise<DomainVerification>;
+  async verifyDomain(
+    domain: string,
+    options?: { confirm?: boolean }
+  ): Promise<DomainChallenge | DomainVerification> {
+    const path = "/api/agents/verify-domain";
+    if (options?.confirm === true) {
+      const wire = await this.client.request<{ verified_domain: string }>({
+        method: "POST",
+        path,
+        body: { domain, confirm: true },
+      });
+      return { verifiedDomain: wire.verified_domain };
+    }
+    const wire = await this.client.request<{ record_name: string; record_value: string }>({
+      method: "POST",
+      path,
+      body: { domain },
+    });
+    return { recordName: wire.record_name, recordValue: wire.record_value };
   }
 }

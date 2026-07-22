@@ -94,6 +94,39 @@ const restored = await DepixWallet.restore({
 `~/.depix-wallet`), `DEPIX_WALLET_PASSPHRASE`, `DEPIX_API_KEY` and
 `DEPIX_API_BASE` from the environment when the options are omitted.
 
+### Headless creation — when (and why) to pass `mnemonicSecured: true`
+
+In an interactive terminal, `create()` runs a backup ritual: it prints the 12
+words, challenges you to re-type a few of them at random positions, and asks
+for an explicit "saved" declaration. Passing the ritual is what confirms the
+backup and unlocks receive addresses.
+
+A headless agent — CI job, daemon, MCP host, any process without a TTY — has
+no human to run that ritual. There, `create()` still succeeds, but the wallet
+is born **unconfirmed**: `getReceiveAddress()` and `deposit()` throw
+`BACKUP_REQUIRED` until someone calls `confirmBackup()`.
+
+`mnemonicSecured: true` is the non-interactive substitute for the ritual. It
+is an **attestation**: by passing it, your code declares that it captures the
+returned `mnemonic` and stores it durably (secret manager, encrypted vault,
+the human guardian's envelope — see "Fleet operators") *before* any funds can
+arrive. The wallet is then born backup-confirmed and can receive immediately.
+
+Rules of thumb:
+
+- **Pass it** when the very next lines of your code persist `mnemonic`
+  somewhere a human can recover it from. This is the normal path for headless
+  agents.
+- **Don't pass it** if your code discards the mnemonic — you would unlock
+  deposits into a wallet nobody can restore. If storing the backup can fail
+  (e.g. a network call to a vault), prefer omitting the flag and calling
+  `confirmBackup()` only after the store succeeds.
+- It must be the literal `true` — there is no env var and no silent default.
+  Skipping the ritual is a conscious, logged decision.
+
+`restore({ mnemonic })` never needs the flag: possession of the mnemonic IS
+the backup proof, so a restored wallet is always born confirmed.
+
 ---
 
 ## Quickstart 1b — Agent self-onboarding (register the account, get keys)
@@ -151,11 +184,31 @@ await agent.revokeKey(oldKeyId);
 const { webhookSecret } = await agent.rotateWebhookSecret();
 ```
 
+Receiving from third parties (and any `merchant_*`-scoped key) additionally
+requires proving control of a domain — a two-phase DNS TXT challenge:
+
+```ts
+// Phase 1 — fetch the challenge (server-derived and stable; re-fetch any time).
+const { recordName, recordValue } = await agent.verifyDomain("acme.com");
+// → publish a DNS TXT record: name recordName ("_depix-verify.acme.com"),
+//   value recordValue ("depix-verify=…").
+
+// Phase 2 — once DNS has propagated, confirm. The server resolves the TXT
+// record and stores the registrable domain (eTLD+1) as verified.
+const { verifiedDomain } = await agent.verifyDomain("acme.com", { confirm: true });
+```
+
+`domain_txt_not_found` on confirm means the record has not propagated yet (or
+mismatches) — wait and retry phase 2. `domain_tld_not_allowed` carries the
+accepted list in `details.allowed_tlds` (also public at
+`GET /api/agents/domain-tlds`), and free-subdomain hosts are rejected with
+`domain_free_host`.
+
 Errors branch on `err.code` (see `AgentError` for the catalog): before
 graduation a live key throws `graduation_pending`; a `merchant_*` scope without a
-verified domain throws `domain_required`; an expired signature throws
-`agent_signature_expired` (re-sign — clocks drifted). `DepixAgent.open({ ... })`
-reloads the identity in later sessions.
+verified domain throws `domain_required` (clear it with `verifyDomain()` above);
+an expired signature throws `agent_signature_expired` (re-sign — clocks
+drifted). `DepixAgent.open({ ... })` reloads the identity in later sessions.
 
 `create()` / `open()` read `DEPIX_AGENT_DIR` (default `~/.depix-agent`),
 `DEPIX_AGENT_PASSPHRASE` (falls back to `DEPIX_WALLET_PASSPHRASE`) and

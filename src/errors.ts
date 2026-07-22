@@ -118,6 +118,10 @@ export class MerchantError extends DepixSdkError {
  *   registration_blocked / agent_pubkey_exists / username_taken — register conflicts.
  *   graduation_pending        — a live key was requested before the account graduated (§3.1).
  *   domain_required           — a merchant_* scope was requested without a verified domain (§2.9).
+ *   domain_tld_not_allowed / domain_free_host — verifyDomain() rejected the domain
+ *                               (details.allowed_tlds lists the accepted TLDs).
+ *   domain_txt_not_found      — verifyDomain({ confirm: true }) could not resolve the
+ *                               TXT challenge; wait for DNS propagation and retry.
  *   agents_disabled           — the agent program kill switch is on (503).
  *   field_immutable           — an attempt to change a register-fixed field (e.g. liquid_address).
  */

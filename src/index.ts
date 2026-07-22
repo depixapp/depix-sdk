@@ -51,6 +51,8 @@ export {
   type AgentStatus,
   type CreateKeyInput,
   type CreatedKey,
+  type DomainChallenge,
+  type DomainVerification,
   type IssuedKey,
   type RegisterInput,
   type RegisterResult,

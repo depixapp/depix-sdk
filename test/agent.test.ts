@@ -191,3 +191,72 @@ describe("DepixAgent key + status operations", () => {
     await expect(agent.createKey({ live: true })).rejects.toSatisfy((e) => isDepixSdkError(e, "graduation_pending"));
   });
 });
+
+describe("DepixAgent.verifyDomain", () => {
+  it("phase 1: POSTs a signed {domain} body and maps the FLAT challenge response", async () => {
+    // The backend replies WITHOUT the `{ response: … }` envelope on this route
+    // (agents.js verifyDomain) — the mock mirrors that flat wire shape exactly.
+    const { agent, calls } = await makeAgent([
+      { status: 200, json: { record_name: "_depix-verify.acme.com", record_value: "depix-verify=3f9a" } },
+    ]);
+    const challenge = await agent.verifyDomain("acme.com");
+
+    const req = calls[0]!;
+    expect(req.method).toBe("POST");
+    expect(req.url).toBe("https://api.test/api/agents/verify-domain");
+    assertSigned(req);
+    // Byte-exact body: only { domain } — no `confirm` key in phase 1, so the
+    // signed hash covers exactly these bytes.
+    expect(req.body).toBe(JSON.stringify({ domain: "acme.com" }));
+
+    expect(challenge).toEqual({
+      recordName: "_depix-verify.acme.com",
+      recordValue: "depix-verify=3f9a",
+    });
+  });
+
+  it("phase 2: POSTs {domain, confirm: true} and maps the confirmation", async () => {
+    const { agent, calls } = await makeAgent([
+      { status: 200, json: { verified_domain: "acme.com" } },
+    ]);
+    const result = await agent.verifyDomain("acme.com", { confirm: true });
+
+    const req = calls[0]!;
+    expect(req.url).toBe("https://api.test/api/agents/verify-domain");
+    assertSigned(req);
+    expect(req.body).toBe(JSON.stringify({ domain: "acme.com", confirm: true }));
+    expect(result).toEqual({ verifiedDomain: "acme.com" });
+  });
+
+  it("surfaces domain_txt_not_found (TXT not propagated yet) for the retry loop", async () => {
+    const { agent } = await makeAgent([
+      {
+        status: 422,
+        json: {
+          response: { errorMessage: "TXT not found" },
+          error: { code: "domain_txt_not_found", message: "The DNS TXT challenge was not found or does not match." },
+        },
+      },
+    ]);
+    await expect(agent.verifyDomain("acme.com", { confirm: true })).rejects.toSatisfy((e) =>
+      isDepixSdkError(e, "domain_txt_not_found")
+    );
+  });
+
+  it("surfaces domain_tld_not_allowed with details.allowed_tlds", async () => {
+    const { agent } = await makeAgent([
+      {
+        status: 422,
+        json: {
+          response: { errorMessage: "TLD not allowed" },
+          error: { code: "domain_tld_not_allowed", details: { allowed_tlds: ["com", "com.br"] } },
+        },
+      },
+    ]);
+    await expect(agent.verifyDomain("acme.xyz")).rejects.toSatisfy(
+      (e) =>
+        isDepixSdkError(e, "domain_tld_not_allowed") &&
+        Array.isArray((e as { details?: { allowed_tlds?: unknown } }).details?.allowed_tlds)
+    );
+  });
+});
