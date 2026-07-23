@@ -1,0 +1,40 @@
+# Dependabot — weekly dependency + GitHub Actions update PRs.
+# Docs: https://docs.github.com/code-security/dependabot/dependabot-version-updates
+version: 2
+updates:
+  # npm packages (single package at the repo root).
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # Keep exact pins exact (.npmrc save-exact) — bump the requirement to the new
+    # version rather than widening it into a range.
+    versioning-strategy: increase
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      # Low-risk, high-noise dev-dependency minor/patch bumps ride ONE PR.
+      # Production/runtime deps get INDIVIDUAL PRs (and majors are always
+      # individual) so each is reviewed on its own before CI + a human merge.
+      # This matters here: the shipped crypto/wasm deps (lwk_node, hash-wasm,
+      # @noble/hashes, boltz-*) are exact-pinned (.npmrc save-exact) because a
+      # minor bump can change derived keys / wasm layout — each must be vetted
+      # (the ci.yml floor-smoke + offline suite gate every such PR). This grouping
+      # keys off dependency-type, so those deps MUST stay in `dependencies`;
+      # moving one to devDependencies would silently sweep it into this bundle.
+      dev-dependencies:
+        dependency-type: "development"
+        update-types: ["minor", "patch"]
+
+  # GitHub Actions pinned in .github/workflows/*.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns: ["*"]
