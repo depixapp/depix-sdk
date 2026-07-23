@@ -65,7 +65,7 @@
     "hash-wasm": "4.12.0",
     "liquidjs-lib": "6.0.2-liquid.38",
     "lwk_node": "0.18.0",
-    "viem": "2.54.1",
+    "viem": "2.55.8",
     "zod": "3.25.76"
   },
   "devDependencies": {
