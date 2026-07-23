@@ -566,7 +566,9 @@ a separate smoke-only job (`npm ci --omit=dev` + `npm run smoke` on the prebuilt
 `dist/`, because 22.4's bundled npm can't install the build's dev deps). Windows is
 out for 1.0.
 
-Release/publishing is maintainer-only — see [CONTRIBUTING.md](./CONTRIBUTING.md).
+**Releasing** is automated: bump `version` in `package.json`, then push a
+`vX.Y.Z` tag → CI publishes to npm via OIDC Trusted Publishing (no token, with
+provenance). Details in [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 ---
 
