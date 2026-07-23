@@ -1,0 +1,81 @@
+# Release @depixapp/sdk to npm via GitHub Actions OIDC (npm Trusted Publishing) —
+# no stored npm token, no passkey/2FA prompt, with build provenance.
+#
+# ONE-TIME SETUP (human): on npmjs.com, register this repo + workflow as a
+# Trusted Publisher for @depixapp/sdk (Package settings -> Trusted publishers),
+# and add the repo/org secret SIDESHIFT_AFFILIATE_ID (the real SideShift
+# affiliate id). OIDC supplies the npm auth; the secret supplies the value that
+# scripts/bake-affiliate.mjs bakes into the package at build time.
+#
+# RELEASE FLOW: bump `version` in package.json, commit, push tag `v<version>`
+# (e.g. v1.2.0). `prepublishOnly` (check-affiliate-env -> build -> offline test)
+# is the publish gate: it fails the release if the affiliate id is unset or the
+# offline suite is red, so a broken or affiliate-less package can never ship.
+# Re-pushing a tag is safe — the job SKIPS publish when that version already
+# exists on npm.
+
+name: Release (npm)
+
+on:
+  push:
+    tags: ["v*"] # version tags like v1.2.0
+  workflow_dispatch: {} # manual re-run (skips publish if already published)
+
+jobs:
+  npm:
+    name: Publish @depixapp/sdk to npm (OIDC)
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write # OIDC -> npm Trusted Publishing (mints a short-lived token)
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Node 24 bundles npm 11 (OIDC-capable) and installs the rolldown native
+      # binding cleanly (npm < 11 mis-installs it — npm/cli#4828). The engines
+      # floor (Node 22.4) is proven by ci.yml's floor-smoke, not the release.
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Ensure npm supports OIDC trusted publishing (>= 11.5.1)
+        run: npm install -g npm@11
+
+      - name: Install (npm ci)
+        run: npm ci
+
+      - name: Verify version consistency (tag == package.json)
+        id: ver
+        run: |
+          PKG=$(node -p "require('./package.json').version")
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            if [ "$TAG" != "$PKG" ]; then
+              echo "::error::git tag v$TAG != package.json version $PKG"; exit 1
+            fi
+          fi
+          echo "version=$PKG" >> "$GITHUB_OUTPUT"
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Publish to npm (skip if this version is already published)
+        env:
+          # The real SideShift affiliate id is BAKED into the package at build
+          # time (scripts/bake-affiliate.mjs), and prepublishOnly's
+          # check-affiliate-env.mjs FAILS the publish if it is unset. Trusted
+          # Publishing (OIDC) supplies npm auth; this secret supplies the value.
+          SIDESHIFT_AFFILIATE_ID: ${{ secrets.SIDESHIFT_AFFILIATE_ID }}
+        run: |
+          V="${{ steps.ver.outputs.version }}"
+          if npm view "@depixapp/sdk@$V" version >/dev/null 2>&1; then
+            echo "@depixapp/sdk@$V is already on npm — skipping publish."
+          else
+            npm publish --provenance --access public
+          fi
