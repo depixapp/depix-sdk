@@ -29,10 +29,10 @@ jobs:
         os: [ubuntu-latest, macos-latest]
         node: ["24", "latest"] # 24 (LTS) + current; 22.4 floor → floor-smoke
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Setup Node ${{ matrix.node }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
 
@@ -77,8 +77,8 @@ jobs:
     name: build dist (for floor smoke)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "latest"
       - name: Install (npm ci)
@@ -88,7 +88,7 @@ jobs:
           SIDESHIFT_AFFILIATE_ID: test-affiliate
         run: npm run build
       - name: Upload dist artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -111,15 +111,15 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Setup Node 22.4 (engines floor)
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "22.4"
       - name: Install runtime deps only (no devDeps → no rolldown)
         run: npm ci --omit=dev
       - name: Download prebuilt dist
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -135,8 +135,8 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "latest"
       - name: Diff vendored OpenAPI fixture against live

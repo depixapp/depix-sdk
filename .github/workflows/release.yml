@@ -30,13 +30,13 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       # Node 24 bundles npm 11 (OIDC-capable) and installs the rolldown native
       # binding cleanly (npm < 11 mis-installs it — npm/cli#4828). The engines
       # floor (Node 22.4) is proven by ci.yml's floor-smoke, not the release.
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
